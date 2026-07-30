@@ -37,10 +37,23 @@ const (
 )
 
 const (
-	defaultAPIPort             = "6443"
-	defaultTokenTTL            = 720 * time.Hour // 30 days
-	defaultRefreshInterval     = 24 * time.Hour
-	defaultExpiryWarnThreshold = 720 * time.Hour // 30 days
+	defaultAPIPort = "6443"
+
+	// defaultTokenTTL is the lifetime requested for ArgoCD's credential. Long
+	// enough that a prolonged control-path outage is harmless, since a refresh
+	// happens at half life.
+	defaultTokenTTL = 720 * time.Hour // 30 days
+
+	defaultRefreshInterval = 24 * time.Hour
+
+	// defaultExpiryWarnThreshold matches the window in which RKE2 itself will
+	// rotate certificates on a service restart. Warning from here means the
+	// "restart rke2-server" remedy is available for the whole warning period,
+	// and there is time to schedule a control-plane restart properly.
+	defaultExpiryWarnThreshold = 2160 * time.Hour // 90 days
+
+	// defaultRotateThreshold sits well inside the warning window, so an
+	// operator sees warnings for two months before the daemon acts on its own.
 	defaultRotateThreshold     = 720 * time.Hour // 30 days
 	defaultServiceAccountName  = "argocd-manager"
 	defaultServiceAccountNS    = "kube-system"
@@ -314,6 +327,27 @@ func (c *Config) applyFile(f *file, logger *slog.Logger) error {
 
 		if cluster.Provider == ProviderRancher {
 			needsRancher = true
+		}
+
+		// Rotating before ever warning defeats the point of the warning: the
+		// operator would learn about the expiry from the rotation itself.
+		if cluster.AutoRotate && cluster.RotateThreshold > cluster.ExpiryWarnThreshold {
+			logger.Warn("rotateThreshold exceeds expiryWarnThreshold, so rotation will happen before any warning",
+				"cluster", cluster.Name,
+				"rotate_threshold", cluster.RotateThreshold.String(),
+				"expiry_warn_threshold", cluster.ExpiryWarnThreshold.String(),
+			)
+		}
+
+		// The runtime scheduler clamps to half the granted token lifetime, so
+		// this is not fatal — but it means refreshInterval is not what governs
+		// the cadence, which is worth saying out loud.
+		if c.RefreshInterval > cluster.TokenTTL/2 {
+			logger.Warn("refreshInterval exceeds half the token lifetime; the effective cadence will be shorter",
+				"cluster", cluster.Name,
+				"refresh_interval", c.RefreshInterval.String(),
+				"token_ttl", cluster.TokenTTL.String(),
+			)
 		}
 		if cluster.AutoRotate && cluster.Provider != ProviderRancher {
 			return fmt.Errorf("clusters[%d]: autoRotate requires provider %q; standalone RKE2 exposes no rotation API", i, ProviderRancher)

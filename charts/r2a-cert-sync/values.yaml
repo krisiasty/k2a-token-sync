@@ -31,22 +31,32 @@ rancher:
   insecureSkipTLSVerify: false
 
 # Defaults applied to every cluster unless overridden per entry.
+#
+# These four measure unrelated things: the first two govern the credential the
+# daemon issues, the last two describe the downstream API server's own serving
+# certificate. Changing one does not imply changing the others.
 defaults:
   # Lifetime requested for the credential written into each ArgoCD cluster
-  # Secret. The downstream API server may cap this via
-  # --service-account-max-token-expiration; the daemon logs a warning if it does.
-  tokenTTL: 720h
+  # Secret. Reissued at half life, so 30 days means a ~15-day grace period
+  # during which the control path can be broken with no impact on ArgoCD.
+  # The downstream API server may cap this via
+  # --service-account-max-token-expiration; the daemon warns and shortens its
+  # own cadence to match if that happens.
+  tokenTTL: 720h    # 30 days
 
-  # How often every cluster is reconciled. Credentials are only reissued once
-  # past half their lifetime, so this can be frequent without churning ArgoCD.
+  # How often every cluster is reconciled. An upper bound: the daemon wakes
+  # sooner if a granted token turns out to be shorter lived than requested.
   refreshInterval: 24h
 
-  # Remaining serving-certificate lifetime below which the daemon warns.
-  expiryWarnThreshold: 720h
+  # Remaining serving-certificate lifetime below which the daemon warns. 90 days
+  # matches the window in which RKE2 itself rotates certificates on a service
+  # restart, so the documented remedy applies for the whole warning period.
+  expiryWarnThreshold: 2160h    # 90 days
 
   # Remaining serving-certificate lifetime below which rotation is triggered,
-  # for clusters with autoRotate enabled.
-  rotateThreshold: 720h
+  # for clusters with autoRotate enabled. Well inside the warning window, so
+  # warnings precede any automatic control-plane restart by about two months.
+  rotateThreshold: 720h    # 30 days
 
   # Namespace the generated ArgoCD cluster Secrets are written to.
   secretNamespace: argocd

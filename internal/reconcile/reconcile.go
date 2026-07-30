@@ -121,6 +121,25 @@ func (r Result) Failures() int {
 	return n
 }
 
+// SoonestTokenExpiry returns the earliest expiry among the credentials this pass
+// published, or the zero time if none are known.
+//
+// The scheduler needs this because the API server may cap token lifetime far
+// below what was requested. Sleeping for a fixed refreshInterval would then let
+// ArgoCD's credential die between passes.
+func (r Result) SoonestTokenExpiry() time.Time {
+	var soonest time.Time
+	for _, c := range r.Clusters {
+		if c.TokenExpiresAt.IsZero() {
+			continue
+		}
+		if soonest.IsZero() || c.TokenExpiresAt.Before(soonest) {
+			soonest = c.TokenExpiresAt
+		}
+	}
+	return soonest
+}
+
 // Run reconciles every configured cluster.
 //
 // Clusters are independent: a failure is recorded and the pass continues, so one

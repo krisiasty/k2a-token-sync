@@ -122,10 +122,10 @@ kubectl create secret generic rancher-credentials \
 | `rancher.url` | _(unset)_ | Rancher API URL; required if any cluster uses `provider: rancher` |
 | `rancher.tokenSecret.name` | `rancher-credentials` | Secret holding the Rancher token |
 | `rancher.caSecret.name` | _(unset)_ | Optional PEM bundle for a privately-signed Rancher endpoint |
-| `defaults.tokenTTL` | `720h` | Requested lifetime of ArgoCD's credential |
-| `defaults.refreshInterval` | `24h` | Reconciliation period |
-| `defaults.expiryWarnThreshold` | `720h` | Warn below this much serving-certificate lifetime |
-| `defaults.rotateThreshold` | `720h` | Rotate below this, where `autoRotate` is enabled |
+| `defaults.tokenTTL` | `720h` (30d) | Requested lifetime of ArgoCD's credential, reissued at half life |
+| `defaults.refreshInterval` | `24h` | Upper bound on the reconciliation period |
+| `defaults.expiryWarnThreshold` | `2160h` (90d) | Warn below this much serving-certificate lifetime |
+| `defaults.rotateThreshold` | `720h` (30d) | Rotate below this, where `autoRotate` is enabled |
 | `defaults.secretNamespace` | `argocd` | Where generated cluster Secrets are written |
 | `clusters` | `[]` | Cluster inventory, see below |
 | `health.port` | `8080` | Port for `/livez`, `/readyz` and `/status` |
@@ -173,10 +173,10 @@ rancher:
   # insecureSkipTLSVerify: false
 
 defaults:
-  tokenTTL: 720h
+  tokenTTL: 720h                # 30d, credential the daemon issues
   refreshInterval: 24h
-  expiryWarnThreshold: 720h
-  rotateThreshold: 720h
+  expiryWarnThreshold: 2160h    # 90d, downstream serving certificate
+  rotateThreshold: 720h         # 30d, downstream serving certificate
   secretNamespace: argocd
   serviceAccount:
     name: argocd-manager

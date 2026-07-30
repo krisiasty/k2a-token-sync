@@ -24,6 +24,10 @@ const (
 	// maxRetryInterval caps the exponential backoff.
 	maxRetryInterval = 30 * time.Minute
 
+	// minPassInterval floors the derived pass interval, so an aggressively
+	// capped token lifetime cannot turn the loop into a busy wait.
+	minPassInterval = 1 * time.Minute
+
 	// passTimeout bounds one reconciliation pass over all clusters. Generous,
 	// because a Rancher-orchestrated rotation legitimately takes many minutes.
 	passTimeout = 45 * time.Minute
@@ -44,6 +48,23 @@ func main() {
 		logger.Error("daemon failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// nextPassInterval decides how long to sleep after a clean pass.
+//
+// The configured refreshInterval is an upper bound, not the whole story: a
+// downstream API server may cap token lifetime via
+// --service-account-max-token-expiration, so a credential can be far shorter
+// lived than requested. Sleeping the full interval would then leave ArgoCD
+// holding an expired token for most of the gap. Waking at half the shortest
+// remaining lifetime keeps a margin of one whole refresh, and the floor stops a
+// pathologically short cap from turning into a busy loop.
+func nextPassInterval(refreshInterval time.Duration, soonestExpiry, now time.Time) time.Duration {
+	if soonestExpiry.IsZero() {
+		return refreshInterval
+	}
+	derived := soonestExpiry.Sub(now) / 2
+	return max(min(refreshInterval, derived), minPassInterval)
 }
 
 func newLogger() *slog.Logger {
@@ -146,7 +167,7 @@ func runDaemon(logger *slog.Logger) error {
 			)
 		} else {
 			backoff = retryInterval
-			next = cfg.RefreshInterval
+			next = nextPassInterval(cfg.RefreshInterval, result.SoonestTokenExpiry(), time.Now())
 			state.record(result, next)
 			logger.Info("reconciliation pass complete",
 				"clusters", len(result.Clusters),

@@ -18,11 +18,14 @@ data:
         name: rancher-credentials
         key: token
 
+    # The first two describe the credential the daemon issues; the last two
+    # describe the downstream API server's own serving certificate. They are
+    # unrelated measurements that happen to share units.
     defaults:
-      tokenTTL: "720h"            # credential lifetime requested for ArgoCD
-      refreshInterval: "24h"      # how often every cluster is reconciled
-      expiryWarnThreshold: "720h" # warn below this much serving-cert lifetime
-      rotateThreshold: "720h"     # rotate below this, where autoRotate is on
+      tokenTTL: "720h"             # 30d — ArgoCD's credential; reissued at half life
+      refreshInterval: "24h"       # upper bound; shortened if a token is capped
+      expiryWarnThreshold: "2160h" # 90d — matches RKE2's own rotate-on-restart window
+      rotateThreshold: "720h"      # 30d — where autoRotate is enabled
       secretNamespace: "argocd"
       serviceAccount:
         name: argocd-manager
