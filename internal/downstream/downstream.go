@@ -21,10 +21,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// ptrTo returns a pointer to v, for the optional pointer fields the Kubernetes
-// API types use to distinguish "unset" from an explicit zero.
-func ptrTo[T any](v T) *T { return &v }
-
 const (
 	// rootCAConfigMap is projected into every namespace by the kube-controller-manager
 	// and is the canonical in-cluster source of the API server's CA bundle.
@@ -166,7 +162,9 @@ func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, name
 func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name string, ttl time.Duration) (*Token, error) {
 	request := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
-			ExpirationSeconds: ptrTo(int64(ttl.Seconds())),
+			// ExpirationSeconds is a *int64 so the field can be left unset;
+			// Go 1.26's new(expr) covers that without a helper.
+			ExpirationSeconds: new(int64(ttl.Seconds())),
 		},
 	}
 
@@ -241,7 +239,10 @@ func CreateLegacyToken(ctx context.Context, client kubernetes.Interface, namespa
 // itself equivalent to cluster-admin. This grant is narrow for auditability and
 // to avoid handing out direct read access to every Secret in the cluster — not
 // because it is unprivileged.
-func agentRules(saNamespace string) []rbacv1.PolicyRule {
+//
+// These are ClusterRole rules, so they carry no namespace: the binding needs to
+// cover kube-root-ca.crt in whichever namespace the ServiceAccounts live in.
+func agentRules() []rbacv1.PolicyRule {
 	return []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{""},
@@ -276,7 +277,7 @@ func EnsureAgentIdentity(ctx context.Context, client kubernetes.Interface, names
 
 	role := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: ManagedByLabel},
-		Rules:      agentRules(namespace),
+		Rules:      agentRules(),
 	}
 	if _, err := client.RbacV1().ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
