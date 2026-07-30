@@ -8,6 +8,10 @@ metadata:
   namespace: r2a-cert-sync
 data:
   config.yaml: |
+    # Namespace of the ArgoCD instance this daemon serves. Every generated
+    # cluster Secret is written here.
+    argocdNamespace: argocd
+
     # Rancher is used on the control path only: to reach downstream clusters so
     # credentials can be provisioned, and to trigger certificate rotation.
     # ArgoCD never talks to Rancher — it connects to each endpoint directly.
@@ -26,7 +30,6 @@ data:
       refreshInterval: "24h"       # upper bound; shortened if a token is capped
       expiryWarnThreshold: "2160h" # 90d — matches RKE2's own rotate-on-restart window
       rotateThreshold: "720h"      # 30d — where autoRotate is enabled
-      secretNamespace: "argocd"
       serviceAccount:
         name: argocd-manager
         namespace: kube-system
@@ -38,7 +41,6 @@ data:
         provider: rancher
         endpoint: "10.0.0.10"     # direct API address; :6443 is the default
         secretName: cluster-downstream-1
-        secretNamespace: argocd
         autoRotate: false         # true lets the daemon restart the control plane
 
       # Standalone RKE2: bootstrap once with
@@ -53,4 +55,3 @@ data:
         provider: direct
         endpoint: "10.1.0.10"
         secretName: cluster-standalone-1
-        secretNamespace: argocd

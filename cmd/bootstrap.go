@@ -149,7 +149,6 @@ Cluster %q is ready. Add it to the daemon's ConfigMap:
     provider: direct
     endpoint: %s
     secretName: %s
-    secretNamespace: argocd
 
 No bootstrapSecret is needed — the durable credential is already stored in
 %s/%s.

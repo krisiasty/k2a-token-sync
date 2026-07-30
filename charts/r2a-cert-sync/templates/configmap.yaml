@@ -1,5 +1,4 @@
 {{- include "r2a-cert-sync.validate" . }}
-{{- $default := .Values.defaults.secretNamespace | default "argocd" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,6 +8,7 @@ metadata:
     {{- include "r2a-cert-sync.labels" . | nindent 4 }}
 data:
   config.yaml: |
+    argocdNamespace: {{ include "r2a-cert-sync.argocdNamespace" . | quote }}
     {{- if .Values.rancher.url }}
     rancher:
       url: {{ .Values.rancher.url | quote }}
@@ -29,7 +29,6 @@ data:
       refreshInterval: {{ .Values.defaults.refreshInterval | quote }}
       expiryWarnThreshold: {{ .Values.defaults.expiryWarnThreshold | quote }}
       rotateThreshold: {{ .Values.defaults.rotateThreshold | quote }}
-      secretNamespace: {{ $default | quote }}
       serviceAccount:
         name: {{ .Values.defaults.serviceAccount.name | quote }}
         namespace: {{ .Values.defaults.serviceAccount.namespace | quote }}
@@ -42,7 +41,6 @@ data:
         provider: {{ .provider | default "rancher" | quote }}
         endpoint: {{ .endpoint | quote }}
         secretName: {{ .secretName | default (printf "cluster-%s" .name) | quote }}
-        secretNamespace: {{ .secretNamespace | default $default | quote }}
         {{- if .displayName }}
         displayName: {{ .displayName | quote }}
         {{- end }}

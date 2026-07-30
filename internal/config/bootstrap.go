@@ -36,7 +36,6 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 		Endpoint:                endpoint,
 		DisplayName:             in.Name,
 		SecretName:              "cluster-" + in.Name,
-		SecretNamespace:         "argocd",
 		AgentServiceAccountName: orDefault(in.AgentServiceAccountName, defaultAgentServiceAccount),
 		ServiceAccount: ServiceAccountRef{
 			Name:      orDefault(in.ServiceAccountName, defaultServiceAccountName),

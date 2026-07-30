@@ -159,7 +159,7 @@ func (r *Reconciler) Run(ctx context.Context) Result {
 			Name:     cluster.Name,
 			Provider: string(cluster.Provider),
 			Endpoint: cluster.Endpoint,
-			Secret:   cluster.SecretNamespace + "/" + cluster.SecretName,
+			Secret:   r.cfg.ArgoCDNamespace + "/" + cluster.SecretName,
 		}
 
 		if err := r.reconcileCluster(ctx, cluster, logger, &status); err != nil {
@@ -209,7 +209,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 
 	desired := argocd.ClusterSecret{
 		Name:                 cluster.SecretName,
-		Namespace:            cluster.SecretNamespace,
+		Namespace:            r.cfg.ArgoCDNamespace,
 		DisplayName:          cluster.DisplayName,
 		Server:               cluster.ServerURL(),
 		CAData:               ca,
@@ -220,7 +220,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		ExtraAnnotations:     cluster.Annotations,
 	}
 
-	observed, err := argocd.Observe(ctx, r.local, cluster.SecretNamespace, cluster.SecretName)
+	observed, err := argocd.Observe(ctx, r.local, r.cfg.ArgoCDNamespace, cluster.SecretName)
 	if err != nil {
 		return err
 	}

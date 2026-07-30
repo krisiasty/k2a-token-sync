@@ -84,7 +84,13 @@ jobs:
             --set rancher.url=https://rancher.example.com \
             --set 'clusters[0].name=downstream-1' \
             --set 'clusters[0].endpoint=10.0.0.10' \
+            --set 'clusters[0].autoRotate=true' \
             --set 'clusters[1].name=standalone-1' \
             --set 'clusters[1].provider=direct' \
-            --set 'clusters[1].endpoint=10.1.0.10' \
-            --set 'clusters[1].secretNamespace=gitops' > /dev/null
+            --set 'clusters[1].endpoint=10.1.0.10' > /dev/null
+          # Deploying into ArgoCD's own namespace must not render a duplicate Role.
+          helm template r2a-cert-sync charts/r2a-cert-sync \
+            --namespace argocd \
+            --set 'clusters[0].name=standalone-1' \
+            --set 'clusters[0].provider=direct' \
+            --set 'clusters[0].endpoint=10.1.0.10' > /dev/null

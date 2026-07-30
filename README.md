@@ -126,7 +126,7 @@ kubectl create secret generic rancher-credentials \
 | `defaults.refreshInterval` | `24h` | Upper bound on the reconciliation period |
 | `defaults.expiryWarnThreshold` | `2160h` (90d) | Warn below this much serving-certificate lifetime |
 | `defaults.rotateThreshold` | `720h` (30d) | Rotate below this, where `autoRotate` is enabled |
-| `defaults.secretNamespace` | `argocd` | Where generated cluster Secrets are written |
+| `argocdNamespace` | `argocd` | Namespace of the ArgoCD instance served; all cluster Secrets go here |
 | `clusters` | `[]` | Cluster inventory, see below |
 | `health.port` | `8080` | Port for `/livez`, `/readyz` and `/status` |
 
@@ -164,6 +164,8 @@ target namespace is introduced.
 ### Cluster inventory
 
 ```yaml
+argocdNamespace: argocd
+
 rancher:
   url: https://rancher.example.com
   tokenSecret:
@@ -177,7 +179,6 @@ defaults:
   refreshInterval: 24h
   expiryWarnThreshold: 2160h    # 90d, downstream serving certificate
   rotateThreshold: 720h         # 30d, downstream serving certificate
-  secretNamespace: argocd
   serviceAccount:
     name: argocd-manager
     namespace: kube-system
@@ -187,7 +188,6 @@ clusters:
     provider: rancher          # default
     endpoint: 10.0.0.10        # :6443 assumed
     secretName: cluster-downstream-1   # default: cluster-<name>
-    secretNamespace: argocd
     autoRotate: false
 
   - name: standalone-1
@@ -195,10 +195,13 @@ clusters:
     endpoint: rke2.example.com:6443
 ```
 
-Per-cluster fields: `name`, `provider`, `endpoint`, `displayName`, `rancherClusterName`, `secretName`,
-`secretNamespace`, `project`, `bootstrapSecret`, `serviceAccount`, `agentServiceAccountName`, `tokenTTL`,
-`expiryWarnThreshold`, `autoRotate`, `rotateThreshold`, `labels`, `annotations`. Unknown fields are rejected, so
-typos fail at startup rather than being silently ignored.
+One daemon serves one ArgoCD instance, so `argocdNamespace` is a single top-level setting rather than a per-cluster
+one. Point a second release at a second ArgoCD if you need that.
+
+Per-cluster fields: `name`, `provider`, `endpoint`, `displayName`, `rancherClusterName`, `secretName`, `project`,
+`bootstrapSecret`, `serviceAccount`, `agentServiceAccountName`, `tokenTTL`, `expiryWarnThreshold`, `autoRotate`,
+`rotateThreshold`, `labels`, `annotations`. Unknown fields are rejected, so typos fail at startup rather than being
+silently ignored.
 
 Configuration is validated up front: duplicate cluster names, two clusters targeting one Secret, `autoRotate` on a
 standalone cluster, a Rancher-provider cluster with no Rancher section, and malformed endpoints are all startup
@@ -268,9 +271,9 @@ Logs are JSON via `log/slog`. Credential material is never logged.
 ## Security notes
 
 The daemon holds no cluster-scoped permissions on the cluster it runs in. It gets one Role in its own namespace, and
-one Role per target namespace restricted with `resourceNames` to the Secrets it generates — so it cannot read
-ArgoCD's own Secrets. Kubernetes RBAC forbids combining `resourceNames` with `create`, so `create` on secrets is
-namespace-scoped rather than name-scoped.
+one in ArgoCD's namespace restricted with `resourceNames` to the Secrets it generates — so it cannot read ArgoCD's own
+Secrets. Kubernetes RBAC forbids combining `resourceNames` with `create`, so `create` on secrets is namespace-scoped
+rather than name-scoped.
 
 Downstream, the `r2a-cert-sync` identity used for standalone clusters is granted only what it needs: get/create
 ServiceAccounts, create ServiceAccount tokens, get/create ClusterRoleBindings, and read the `kube-root-ca.crt`

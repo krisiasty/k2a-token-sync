@@ -20,16 +20,11 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Distinct namespaces the generated ArgoCD cluster Secrets land in. The daemon
-needs a Role in each one, so this drives RBAC rendering.
+Namespace of the ArgoCD instance this release serves. All generated cluster
+Secrets go here, and the daemon needs one Role there.
 */}}
-{{- define "r2a-cert-sync.secretNamespaces" -}}
-{{- $default := .Values.defaults.secretNamespace | default "argocd" }}
-{{- $namespaces := list }}
-{{- range .Values.clusters }}
-{{- $namespaces = append $namespaces (.secretNamespace | default $default) }}
-{{- end }}
-{{- $namespaces | uniq | sortAlpha | toJson }}
+{{- define "r2a-cert-sync.argocdNamespace" -}}
+{{- .Values.argocdNamespace | default "argocd" }}
 {{- end }}
 
 {{/*
@@ -38,10 +33,16 @@ the daemon's crash loop. The daemon revalidates everything itself.
 */}}
 {{- define "r2a-cert-sync.validate" -}}
 {{- $needsRancher := false }}
+{{- $secretNames := list }}
 {{- range $i, $c := .Values.clusters }}
 {{- if not $c.name }}
 {{- fail (printf "clusters[%d]: name is required" $i) }}
 {{- end }}
+{{- $secretName := $c.secretName | default (printf "cluster-%s" $c.name) }}
+{{- if has $secretName $secretNames }}
+{{- fail (printf "clusters[%d] (%s): secretName %q is already used by another cluster" $i $c.name $secretName) }}
+{{- end }}
+{{- $secretNames = append $secretNames $secretName }}
 {{- if not $c.endpoint }}
 {{- fail (printf "clusters[%d] (%s): endpoint is required" $i $c.name) }}
 {{- end }}

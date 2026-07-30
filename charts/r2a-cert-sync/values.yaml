@@ -5,6 +5,11 @@ image:
 
 imagePullSecrets: []
 
+# Namespace of the ArgoCD instance this daemon serves. Every generated cluster
+# Secret is written here, and the chart renders a Role in this namespace.
+# One daemon serves one ArgoCD instance; deploy a second release for a second.
+argocdNamespace: argocd
+
 # Rancher management API. Required only if at least one cluster below uses
 # provider "rancher". Rancher is used strictly on the control path — to reach
 # downstream clusters so credentials can be provisioned, and to trigger
@@ -58,27 +63,20 @@ defaults:
   # warnings precede any automatic control-plane restart by about two months.
   rotateThreshold: 720h    # 30 days
 
-  # Namespace the generated ArgoCD cluster Secrets are written to.
-  secretNamespace: argocd
-
   # Downstream ServiceAccount ArgoCD authenticates as. Matches what
   # `argocd cluster add` installs.
   serviceAccount:
     name: argocd-manager
     namespace: kube-system
 
-# Downstream RKE2 clusters to keep registered with ArgoCD.
-#
-# Adding a cluster is a values change only — no code or RBAC edit — except that
-# a new secretNamespace needs to appear in the rendered RBAC, which this chart
-# handles automatically.
+# Downstream RKE2 clusters to keep registered with ArgoCD. All generated Secrets
+# land in argocdNamespace above.
 #
 # clusters:
 #   - name: downstream-1          # also the Rancher cluster name unless overridden
 #     provider: rancher           # rancher (default) | direct
 #     endpoint: 10.0.0.10         # direct API address ArgoCD connects to; :6443 default
 #     secretName: cluster-downstream-1   # default: cluster-<name>
-#     secretNamespace: argocd     # default: defaults.secretNamespace
 #     autoRotate: false           # rancher provider only
 #
 #   - name: standalone-1

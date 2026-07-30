@@ -39,7 +39,8 @@ subjects:
     name: r2a-cert-sync
     namespace: r2a-cert-sync
 ---
-# ArgoCD namespace: creates and maintains the generated cluster Secrets.
+# ArgoCD's namespace: creates and maintains the generated cluster Secrets. Must
+# match argocdNamespace in configmap.yaml.
 #
 # Kubernetes RBAC forbids combining resourceNames with 'create', so 'create' is
 # namespace-wide. Read and write access is restricted to the named Secrets, so
