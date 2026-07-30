@@ -68,7 +68,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: setup helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: helm lint
         run: helm lint charts/r2a-cert-sync
