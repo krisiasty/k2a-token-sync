@@ -1,0 +1,15 @@
+apiVersion: v2
+name: r2a-cert-sync
+description: Keeps ArgoCD's registrations for downstream RKE2 clusters valid, bypassing the Rancher proxy
+type: application
+version: 0.1.0
+appVersion: "v0.1.0"
+home: https://github.com/krisiasty/r2a-cert-sync
+sources:
+  - https://github.com/krisiasty/r2a-cert-sync
+keywords:
+  - argocd
+  - rke2
+  - rancher
+  - certificates
+  - gitops

@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  schedule:
+    - cron: "0 8 * * 1"  # weekly on monday — catches new vulnerabilities
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+
+      - name: setup go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          args: -v
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: "**/*.md"
+
+      - name: typos
+        uses: crate-ci/typos@v1
+
+  chart:
+    name: chart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+
+      - name: setup helm
+        uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint charts/r2a-cert-sync
+
+      # Render both providers so template errors and bad RBAC scoping surface
+      # here rather than at deploy time.
+      - name: helm template
+        run: |
+          helm template r2a-cert-sync charts/r2a-cert-sync \
+            --namespace r2a-cert-sync > /dev/null
+          helm template r2a-cert-sync charts/r2a-cert-sync \
+            --namespace r2a-cert-sync \
+            --set rancher.url=https://rancher.example.com \
+            --set 'clusters[0].name=downstream-1' \
+            --set 'clusters[0].endpoint=10.0.0.10' \
+            --set 'clusters[1].name=standalone-1' \
+            --set 'clusters[1].provider=direct' \
+            --set 'clusters[1].endpoint=10.1.0.10' \
+            --set 'clusters[1].secretNamespace=gitops' > /dev/null

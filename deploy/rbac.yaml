@@ -1,0 +1,76 @@
+# Namespace, ServiceAccount and the two Roles the daemon needs.
+#
+# The daemon runs in its own namespace and writes ArgoCD cluster Secrets into
+# ArgoCD's. It holds no cluster-scoped permissions in this cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: r2a-cert-sync
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: r2a-cert-sync
+  namespace: r2a-cert-sync
+---
+# Own namespace: reads the Rancher token and any bootstrap credentials, and
+# stores the durable credentials provisioned for standalone clusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: r2a-cert-sync
+  namespace: r2a-cert-sync
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: r2a-cert-sync
+  namespace: r2a-cert-sync
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r2a-cert-sync
+subjects:
+  - kind: ServiceAccount
+    name: r2a-cert-sync
+    namespace: r2a-cert-sync
+---
+# ArgoCD namespace: creates and maintains the generated cluster Secrets.
+#
+# Kubernetes RBAC forbids combining resourceNames with 'create', so 'create' is
+# namespace-wide. Read and write access is restricted to the named Secrets, so
+# the daemon cannot read ArgoCD's own secrets. Keep resourceNames in step with
+# the secretName values in configmap.yaml.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: r2a-cert-sync
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - cluster-downstream-1
+      - cluster-standalone-1
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: r2a-cert-sync
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: r2a-cert-sync
+subjects:
+  - kind: ServiceAccount
+    name: r2a-cert-sync
+    namespace: r2a-cert-sync

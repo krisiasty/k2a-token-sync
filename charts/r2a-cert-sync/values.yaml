@@ -1,0 +1,100 @@
+image:
+  repository: ghcr.io/krisiasty/r2a-cert-sync
+  tag: ""  # defaults to Chart.yaml appVersion
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+# Rancher management API. Required only if at least one cluster below uses
+# provider "rancher". Rancher is used strictly on the control path — to reach
+# downstream clusters so credentials can be provisioned, and to trigger
+# certificate rotation. ArgoCD itself never talks to Rancher.
+rancher:
+  url: ""  # e.g. https://rancher.example.com
+
+  # Secret holding the Rancher API token. Creation is out of scope — provide it
+  # via kubectl, Sealed Secrets, External Secrets Operator or anything else.
+  # The token's Rancher user needs cluster-owner rights on the managed clusters,
+  # and rotateCertificates permission if autoRotate is enabled anywhere.
+  tokenSecret:
+    name: rancher-credentials
+    key: token
+
+  # Optional PEM bundle for verifying the Rancher endpoint, when it uses a
+  # private CA. Falls back to the system trust store.
+  caSecret:
+    name: ""
+    key: ca.crt
+
+  # Disables verification of the Rancher endpoint. Affects only the control
+  # path — never the credentials handed to ArgoCD. Leave false in production.
+  insecureSkipTLSVerify: false
+
+# Defaults applied to every cluster unless overridden per entry.
+defaults:
+  # Lifetime requested for the credential written into each ArgoCD cluster
+  # Secret. The downstream API server may cap this via
+  # --service-account-max-token-expiration; the daemon logs a warning if it does.
+  tokenTTL: 720h
+
+  # How often every cluster is reconciled. Credentials are only reissued once
+  # past half their lifetime, so this can be frequent without churning ArgoCD.
+  refreshInterval: 24h
+
+  # Remaining serving-certificate lifetime below which the daemon warns.
+  expiryWarnThreshold: 720h
+
+  # Remaining serving-certificate lifetime below which rotation is triggered,
+  # for clusters with autoRotate enabled.
+  rotateThreshold: 720h
+
+  # Namespace the generated ArgoCD cluster Secrets are written to.
+  secretNamespace: argocd
+
+  # Downstream ServiceAccount ArgoCD authenticates as. Matches what
+  # `argocd cluster add` installs.
+  serviceAccount:
+    name: argocd-manager
+    namespace: kube-system
+
+# Downstream RKE2 clusters to keep registered with ArgoCD.
+#
+# Adding a cluster is a values change only — no code or RBAC edit — except that
+# a new secretNamespace needs to appear in the rendered RBAC, which this chart
+# handles automatically.
+#
+# clusters:
+#   - name: downstream-1          # also the Rancher cluster name unless overridden
+#     provider: rancher           # rancher (default) | direct
+#     endpoint: 10.0.0.10         # direct API address ArgoCD connects to; :6443 default
+#     secretName: cluster-downstream-1   # default: cluster-<name>
+#     secretNamespace: argocd     # default: defaults.secretNamespace
+#     autoRotate: false           # rancher provider only
+#
+#   - name: standalone-1
+#     provider: direct
+#     endpoint: 10.1.0.10
+#     # Bootstrap once with: r2a-cert-sync bootstrap --cluster standalone-1 \
+#     #   --endpoint 10.1.0.10 --context standalone-1
+#     # If you would rather supply the credential yourself, reference it here and
+#     # the daemon will use it on the first pass:
+#     bootstrapSecret:
+#       name: standalone-1-bootstrap
+#       key: kubeconfig
+clusters: []
+
+health:
+  port: 8080
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}

@@ -1,0 +1,92 @@
+{{- include "r2a-cert-sync.validate" . }}
+{{- $default := .Values.defaults.secretNamespace | default "argocd" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "r2a-cert-sync.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- if .Values.rancher.url }}
+    rancher:
+      url: {{ .Values.rancher.url | quote }}
+      tokenSecret:
+        name: {{ .Values.rancher.tokenSecret.name | quote }}
+        key: {{ .Values.rancher.tokenSecret.key | default "token" | quote }}
+      {{- if .Values.rancher.caSecret.name }}
+      caSecret:
+        name: {{ .Values.rancher.caSecret.name | quote }}
+        key: {{ .Values.rancher.caSecret.key | default "ca.crt" | quote }}
+      {{- end }}
+      {{- if .Values.rancher.insecureSkipTLSVerify }}
+      insecureSkipTLSVerify: true
+      {{- end }}
+    {{- end }}
+    defaults:
+      tokenTTL: {{ .Values.defaults.tokenTTL | quote }}
+      refreshInterval: {{ .Values.defaults.refreshInterval | quote }}
+      expiryWarnThreshold: {{ .Values.defaults.expiryWarnThreshold | quote }}
+      rotateThreshold: {{ .Values.defaults.rotateThreshold | quote }}
+      secretNamespace: {{ $default | quote }}
+      serviceAccount:
+        name: {{ .Values.defaults.serviceAccount.name | quote }}
+        namespace: {{ .Values.defaults.serviceAccount.namespace | quote }}
+    clusters:
+    {{- if not .Values.clusters }}
+      []
+    {{- end }}
+    {{- range .Values.clusters }}
+      - name: {{ .name | quote }}
+        provider: {{ .provider | default "rancher" | quote }}
+        endpoint: {{ .endpoint | quote }}
+        secretName: {{ .secretName | default (printf "cluster-%s" .name) | quote }}
+        secretNamespace: {{ .secretNamespace | default $default | quote }}
+        {{- if .displayName }}
+        displayName: {{ .displayName | quote }}
+        {{- end }}
+        {{- if .rancherClusterName }}
+        rancherClusterName: {{ .rancherClusterName | quote }}
+        {{- end }}
+        {{- if .project }}
+        project: {{ .project | quote }}
+        {{- end }}
+        {{- if .bootstrapSecret }}
+        bootstrapSecret:
+          name: {{ .bootstrapSecret.name | quote }}
+          key: {{ .bootstrapSecret.key | default "kubeconfig" | quote }}
+        {{- end }}
+        {{- if .serviceAccount }}
+        serviceAccount:
+          {{- if .serviceAccount.name }}
+          name: {{ .serviceAccount.name | quote }}
+          {{- end }}
+          {{- if .serviceAccount.namespace }}
+          namespace: {{ .serviceAccount.namespace | quote }}
+          {{- end }}
+        {{- end }}
+        {{- if .agentServiceAccountName }}
+        agentServiceAccountName: {{ .agentServiceAccountName | quote }}
+        {{- end }}
+        {{- if .tokenTTL }}
+        tokenTTL: {{ .tokenTTL | quote }}
+        {{- end }}
+        {{- if .expiryWarnThreshold }}
+        expiryWarnThreshold: {{ .expiryWarnThreshold | quote }}
+        {{- end }}
+        {{- if .autoRotate }}
+        autoRotate: true
+        {{- end }}
+        {{- if .rotateThreshold }}
+        rotateThreshold: {{ .rotateThreshold | quote }}
+        {{- end }}
+        {{- with .labels }}
+        labels:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+    {{- end }}

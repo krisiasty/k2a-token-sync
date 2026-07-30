@@ -1,0 +1,76 @@
+version: 2
+
+project_name: r2a-cert-sync
+
+builds:
+  - id: r2a-cert-sync
+    main: ./cmd
+    binary: r2a-cert-sync
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+dockers:
+  - id: amd64
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/r2a-cert-sync"
+
+  - id: arm64
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    image_templates:
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/r2a-cert-sync"
+
+docker_manifests:
+  - name_template: "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}"
+    image_templates:
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
+  - name_template: "ghcr.io/krisiasty/r2a-cert-sync:latest"
+    image_templates:
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
+      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

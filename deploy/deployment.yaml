@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: r2a-cert-sync
+  namespace: r2a-cert-sync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: r2a-cert-sync
+  # Recreate, not RollingUpdate: two instances reconciling the same clusters
+  # would race to mint and publish credentials.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: r2a-cert-sync
+    spec:
+      serviceAccountName: r2a-cert-sync
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: r2a-cert-sync
+          image: ghcr.io/krisiasty/r2a-cert-sync:latest
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CONFIG_PATH
+              value: /etc/r2a-cert-sync/config.yaml
+            # HEALTH_PORT defaults to "8080"
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/r2a-cert-sync
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: r2a-cert-sync

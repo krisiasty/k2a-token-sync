@@ -1,0 +1,91 @@
+{{- $name := include "r2a-cert-sync.name" . }}
+{{- $namespaces := include "r2a-cert-sync.secretNamespaces" . | fromJsonArray }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+---
+# In its own namespace the daemon reads the Rancher token and any bootstrap
+# credentials, and stores the durable credentials it provisions for standalone
+# clusters. Kubernetes RBAC forbids combining resourceNames with 'create', so
+# 'create' is namespace-wide while everything else is unrestricted only in the
+# sense that this namespace holds nothing but the daemon's own secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- range $namespace := $namespaces }}
+{{- if ne $namespace $.Release.Namespace }}
+---
+# Target namespace for generated ArgoCD cluster Secrets. 'create' cannot be
+# scoped with resourceNames, so it is granted namespace-wide; read and write
+# access is restricted to the Secrets this release actually manages.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      {{- $default := $.Values.defaults.secretNamespace | default "argocd" }}
+      {{- range $.Values.clusters }}
+      {{- if eq (.secretNamespace | default $default) $namespace }}
+      - {{ .secretName | default (printf "cluster-%s" .name) }}
+      {{- end }}
+      {{- end }}
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "r2a-cert-sync.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
