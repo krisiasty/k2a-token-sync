@@ -321,9 +321,9 @@ func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*Serving
 	dialCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 
-	// Verification is performed manually below so that an untrusted or
-	// mis-SAN'd certificate still yields a usable expiry reading instead of a
-	// bare handshake failure.
+	// Verification is performed manually below so that a certificate which is
+	// untrusted, or whose SANs do not cover the endpoint, still yields a usable
+	// expiry reading instead of a bare handshake failure.
 	dialer := &tls.Dialer{
 		NetDialer: &net.Dialer{},
 		Config: &tls.Config{
