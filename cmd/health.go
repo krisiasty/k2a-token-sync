@@ -116,11 +116,14 @@ func runHealthServer(ctx context.Context, logger *slog.Logger, port string, stat
 
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
-	go func() { //nolint:gosec // a fresh context is required once ctx is cancelled
+	// The shutdown context is deliberately not derived from ctx: ctx is already
+	// cancelled by the time this runs, so an inherited context would abort the
+	// graceful shutdown immediately instead of letting in-flight probes finish.
+	go func() { //nolint:gosec // detached shutdown context is intended, see above
 		<-ctx.Done()
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutCancel()
-		_ = srv.Shutdown(shutCtx)
+		_ = srv.Shutdown(shutCtx) //nolint:contextcheck // detached by design, see above
 	}()
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

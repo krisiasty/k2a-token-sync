@@ -216,6 +216,8 @@ func Observe(ctx context.Context, client kubernetes.Interface, namespace, name s
 // means the registration is current and no write is required.
 type RefreshReason string
 
+// The reasons a credential is reissued. They are surfaced in logs and in
+// /status, so they read as explanations rather than codes.
 const (
 	ReasonMissing       RefreshReason = "cluster secret does not exist"
 	ReasonNoToken       RefreshReason = "cluster secret has no bearer token"
