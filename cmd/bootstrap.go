@@ -143,16 +143,32 @@ Flags:
 	)
 
 	fmt.Fprintf(os.Stderr, `
-Cluster %q is ready. Add it to the daemon's ConfigMap:
+Cluster %q is ready. Add it to the daemon's cluster inventory:
 
   - name: %s
     provider: direct
     endpoint: %s
     secretName: %s
 
+Where that entry goes depends on how the daemon was deployed:
+
+  Helm chart      append it to the 'clusters' list in your values file and run
+                  'helm upgrade'. Do not edit the ConfigMap directly: the chart
+                  renders both the ConfigMap and the Role in the ArgoCD
+                  namespace from that one list, and the Role scopes access to
+                  the cluster Secrets it names. A ConfigMap-only edit leaves
+                  the Secret above out of the Role, so reconciliation fails
+                  with "secrets ... is forbidden", and the edit is reverted by
+                  the next upgrade.
+
+  Plain manifests add the entry to the ConfigMap and the same secretName to
+                  the resourceNames list in the Role in the ArgoCD namespace
+                  (deploy/rbac.yaml), then apply both.
+
 No bootstrapSecret is needed — the durable credential is already stored in
 %s/%s.
-`, cluster.Name, cluster.Name, cluster.Endpoint, cluster.SecretName, *namespace, cluster.CredentialsSecretName())
+`, cluster.Name, cluster.Name, cluster.Endpoint, cluster.SecretName,
+		*namespace, cluster.CredentialsSecretName())
 
 	return nil
 }

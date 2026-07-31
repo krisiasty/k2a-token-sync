@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -222,7 +223,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 
 	observed, err := argocd.Observe(ctx, r.local, r.cfg.ArgoCDNamespace, cluster.SecretName)
 	if err != nil {
-		return err
+		return r.argocdSecretError(cluster, err)
 	}
 
 	now := r.now()
@@ -238,7 +239,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		// credential, so expiry stays visible on the object.
 		desired.BearerToken = ""
 		desired.TokenExpiresAt = observed.TokenExpiresAt
-		return r.annotate(ctx, desired, now)
+		return r.argocdSecretError(cluster, r.annotate(ctx, desired, now))
 	}
 
 	created, err := downstream.EnsureArgoCDIdentity(ctx, access.client, cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
@@ -268,7 +269,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 	desired.TokenExpiresAt = token.ExpiresAt
 
 	if err := argocd.Apply(ctx, r.local, desired, now); err != nil {
-		return err
+		return r.argocdSecretError(cluster, err)
 	}
 
 	status.Action = string(reason)
@@ -279,6 +280,25 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		"serving_cert_days_left", status.ServingCertDaysLeft,
 	)
 	return nil
+}
+
+// argocdSecretError explains a permission failure on a generated cluster Secret.
+//
+// The Role in ArgoCD's namespace scopes get, update and patch to an explicit
+// resourceNames list, because the daemon must not be able to read ArgoCD's own
+// secrets. A cluster added to the inventory without that list being extended
+// therefore fails here, and the raw API error names neither the Role nor the
+// remedy — so the whole failure mode looks like a bug in the daemon.
+//
+// Passing a nil error through keeps the call sites free of extra branching.
+func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error {
+	if err == nil || !apierrors.IsForbidden(err) {
+		return err
+	}
+	return fmt.Errorf("%w; the daemon's Role in namespace %s must list %q under resourceNames — "+
+		"with the Helm chart, add this cluster to .Values.clusters and run 'helm upgrade', which renders "+
+		"the ConfigMap and the Role from the same list; with the plain manifests, add it to deploy/rbac.yaml",
+		err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 
 // annotate refreshes the bookkeeping annotations on an otherwise current Secret.

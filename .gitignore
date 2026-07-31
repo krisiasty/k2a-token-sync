@@ -32,3 +32,5 @@ go.work.sum
 # .vscode/
 
 .claude/
+dist/
+r2a-values.yaml
