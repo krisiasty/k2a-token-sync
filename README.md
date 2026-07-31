@@ -388,15 +388,42 @@ docker build -t r2a-cert-sync:latest .
 go test ./...
 golangci-lint run
 helm lint charts/r2a-cert-sync
-
-# Release build (triggered automatically on version tag push)
-git tag v0.1.0
-git push origin v0.1.0
 ```
 
 Releases are published to `ghcr.io/krisiasty/r2a-cert-sync` via GitHub Actions using GoReleaser. Multi-arch images
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
+
+### Cutting a release
+
+Push a tag; everything else follows from it.
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+The release workflow builds and publishes the images and the GitHub release. It then confirms the image really is in
+the registry and opens a pull request updating the chart's `version` and `appVersion` to the new tag. Merge that and
+the chart points at the new image.
+
+**Deploy the chart from `main`, not from the tag.** The chart update necessarily lands _after_ the tag, because the
+workflow that makes it is triggered by the tag push. So the tagged tree still carries the previous `appVersion`, and
+installing the chart at tag `v0.1.1` would deploy the `v0.0.1` image. Once the chart pull request is merged, `main` is
+the correct source. This matters for an ArgoCD Application's `targetRevision` as much as for `helm install`.
+
+If you would rather pin to a tag, override the image explicitly:
+
+```bash
+helm upgrade --install r2a-cert-sync ./charts/r2a-cert-sync --set image.tag=v0.1.1 -f r2a-values.yaml
+```
+
+Chart `version` and `appVersion` are kept in lockstep, with `version` carrying no `v` prefix. Helm chart versions must
+not go backwards, and the chart currently sits at `0.1.0` while the released app is `v0.0.1`, so the next release needs
+to be `v0.1.1` or higher.
+
+The chart pull request gets no CI run of its own — it is opened with `GITHUB_TOKEN`, and GitHub does not trigger
+workflows from that token. CI runs on `main` after the merge.
 
 ## Limitations
 

@@ -59,6 +59,11 @@ jobs:
       - name: typos
         uses: crate-ci/typos@v1
 
+      # The release workflow carries shell logic that decides whether to update
+      # the chart; actionlint shellchecks it and validates expression syntax.
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+
   chart:
     name: chart
     runs-on: ubuntu-latest

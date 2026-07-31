@@ -36,3 +36,101 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Points the chart at the image the release job just published.
+  #
+  # This runs after the release rather than before the tag, so the tagged tree
+  # still carries the previous appVersion — the chart update lands on main as a
+  # follow-up. Deploy from main (or from the chart pull request's merge commit),
+  # not from the tag, or you will get the previous image.
+  chart:
+    name: update chart
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the chart branch
+      packages: read         # confirm the published image exists
+      pull-requests: write   # open the chart pull request
+    steps:
+      # main, not the tag: this is where the chart update belongs, and it may
+      # have moved on since the tag was cut.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - uses: docker/login-action@v4.5.2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Never point the chart at an image that is not actually there. The
+      # release job succeeding is good evidence, but this is proof.
+      - name: confirm the image was published
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/r2a-cert-sync:${TAG}"
+          if ! docker manifest inspect "$image" > /dev/null; then
+            echo "::error::$image was not found; not updating the chart"
+            exit 1
+          fi
+          echo "$image is published"
+
+      - name: update chart
+        id: chart
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          chart=charts/r2a-cert-sync/Chart.yaml
+          bare="${TAG#v}"
+
+          sed -i -E "s|^version: .*|version: ${bare}|" "$chart"
+          sed -i -E "s|^appVersion: .*|appVersion: \"${TAG}\"|" "$chart"
+
+          # A silent no-op here would open an empty pull request that looks like
+          # a successful update.
+          grep -qx "version: ${bare}" "$chart" || { echo "::error::version not updated"; exit 1; }
+          grep -qx "appVersion: \"${TAG}\"" "$chart" || { echo "::error::appVersion not updated"; exit 1; }
+
+          if git diff --quiet -- "$chart"; then
+            echo "chart is already at ${TAG}; nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git diff -- "$chart"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: open pull request
+        if: steps.chart.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          branch="chart/${TAG}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "update chart to ${TAG}"
+          git push --force-with-lease -u origin "$branch"
+
+          # A pull request may already exist if this tag was released before.
+          if gh pr view "$branch" --json state --jq .state 2>/dev/null | grep -qx OPEN; then
+            echo "pull request for $branch already open"
+            exit 0
+          fi
+
+          gh pr create \
+            --title "update chart to ${TAG}" \
+            --body "$(printf '%s\n' \
+              "\`${TAG}\` is published to \`ghcr.io/${GITHUB_REPOSITORY_OWNER}/r2a-cert-sync\`; this points the chart at it." \
+              "" \
+              "Opened automatically by the release workflow after the image was built and its presence in the registry confirmed." \
+              "" \
+              "Note that tag \`${TAG}\` itself still carries the previous \`appVersion\` — the bump could not be in the tagged commit, because this workflow is triggered by the tag. Deploy the chart from \`main\` once this is merged, not from the tag." \
+              "" \
+              "CI does not run on this pull request: it was opened with \`GITHUB_TOKEN\`, and GitHub does not trigger workflows from that token. It runs on \`main\` after the merge." )"
