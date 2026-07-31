@@ -296,8 +296,8 @@ func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error 
 		return err
 	}
 	return fmt.Errorf("%w; the daemon's Role in namespace %s must list %q under resourceNames — "+
-		"with the Helm chart, add this cluster to .Values.clusters and run 'helm upgrade', which renders "+
-		"the ConfigMap and the Role from the same list; with the plain manifests, add it to deploy/rbac.yaml",
+		"add this cluster to .Values.clusters and run 'helm upgrade', which renders the ConfigMap "+
+		"and the Role from the same list",
 		err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 

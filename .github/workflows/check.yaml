@@ -59,9 +59,18 @@ jobs:
       - name: typos
         uses: crate-ci/typos@v1
 
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+
   chart:
     name: chart
     runs-on: ubuntu-latest
+
+    # image.tag is a required value, so every render has to supply one. The
+    # value itself is irrelevant here — these steps check that the templates
+    # render, not which version is deployed.
+    env:
+      TAG: v0.0.1
 
     steps:
       - name: checkout
@@ -71,16 +80,26 @@ jobs:
         uses: azure/setup-helm@v5
 
       - name: helm lint
-        run: helm lint charts/r2a-cert-sync
+        run: helm lint charts/r2a-cert-sync --set "image.tag=${TAG}"
+
+      # image.tag is required; rendering without one must fail rather than
+      # silently produce an image reference ending in a colon.
+      - name: helm template rejects a missing image.tag
+        run: |
+          if helm template r2a-cert-sync charts/r2a-cert-sync \
+               --namespace r2a-cert-sync > /dev/null 2>&1; then
+            echo "::error::rendering succeeded without image.tag"
+            exit 1
+          fi
 
       # Render both providers so template errors and bad RBAC scoping surface
       # here rather than at deploy time.
       - name: helm template
         run: |
           helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync > /dev/null
+            --namespace r2a-cert-sync --set "image.tag=${TAG}" > /dev/null
           helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync \
+            --namespace r2a-cert-sync --set "image.tag=${TAG}" \
             --set rancher.url=https://rancher.example.com \
             --set 'clusters[0].name=downstream-1' \
             --set 'clusters[0].endpoint=10.0.0.10' \
@@ -90,7 +109,7 @@ jobs:
             --set 'clusters[1].endpoint=10.1.0.10' > /dev/null
           # Deploying into ArgoCD's own namespace must not render a duplicate Role.
           helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace argocd \
+            --namespace argocd --set "image.tag=${TAG}" \
             --set 'clusters[0].name=standalone-1' \
             --set 'clusters[0].provider=direct' \
             --set 'clusters[0].endpoint=10.1.0.10' > /dev/null

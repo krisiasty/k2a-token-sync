@@ -2,8 +2,13 @@ apiVersion: v2
 name: r2a-cert-sync
 description: Keeps ArgoCD's registrations for downstream RKE2 clusters valid, bypassing the Rancher proxy
 type: application
-version: 0.1.0
-appVersion: "v0.0.1"
+# The version of the chart, not of the application. Bump it when the chart
+# changes — a new resource, a renamed or removed value, a changed default — not
+# when a new r2a-cert-sync release is published.
+#
+# There is deliberately no appVersion: the application version is image.tag,
+# supplied in deployment values. See the image helper in templates/_helpers.tpl.
+version: 0.2.0
 home: https://github.com/krisiasty/r2a-cert-sync
 sources:
   - https://github.com/krisiasty/r2a-cert-sync
