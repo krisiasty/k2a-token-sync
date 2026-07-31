@@ -1,6 +1,14 @@
 image:
   repository: ghcr.io/krisiasty/r2a-cert-sync
-  tag: ""  # defaults to Chart.yaml appVersion
+
+  # Required. The released version to deploy, e.g. "v0.0.1" — see
+  # https://github.com/krisiasty/r2a-cert-sync/releases
+  #
+  # Not defaulted from the chart's metadata on purpose: the chart is versioned
+  # independently of the application, so the version you deploy is stated here
+  # rather than implied. Rendering fails if it is unset.
+  tag: ""
+
   pullPolicy: Always
 
 imagePullSecrets: []

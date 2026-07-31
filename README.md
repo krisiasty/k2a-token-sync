@@ -145,7 +145,7 @@ kubectl create secret generic rancher-credentials \
 | Value | Default | Description |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/krisiasty/r2a-cert-sync` | Image repository |
-| `image.tag` | Chart `appVersion` | Image tag |
+| `image.tag` | **required** | Released version to deploy, e.g. `v0.0.1`. Rendering fails if unset |
 | `rancher.url` | _(unset)_ | Rancher API URL; required if any cluster uses `provider: rancher` |
 | `rancher.tokenSecret.name` | `rancher-credentials` | Secret holding the Rancher token |
 | `rancher.caSecret.name` | _(unset)_ | Optional PEM bundle for a privately-signed Rancher endpoint |
@@ -159,23 +159,63 @@ kubectl create secret generic rancher-credentials \
 
 #### ArgoCD
 
-Use `deploy/argocd-application.yaml` as a starting point:
+Note the bootstrap ordering: ArgoCD manages the daemon on the local cluster, and the daemon in turn maintains ArgoCD's
+registrations for every downstream cluster.
 
-```bash
-kubectl apply -f deploy/argocd-application.yaml
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: r2a-cert-sync
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/krisiasty/r2a-cert-sync
+    targetRevision: HEAD
+    path: charts/r2a-cert-sync
+    helm:
+      values: |
+        image:
+          tag: "v0.0.1"      # required; the release to deploy
+
+        rancher:
+          url: "https://rancher.example.com"
+          tokenSecret:
+            name: rancher-credentials
+
+        clusters:
+          - name: downstream-1
+            provider: rancher
+            endpoint: "10.0.0.10"
+            autoRotate: false
+
+          - name: standalone-1
+            provider: direct
+            endpoint: "10.1.0.10"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: r2a-cert-sync
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
 ```
 
-### Plain manifests
+### Without Helm
+
+There is no second set of hand-maintained manifests, deliberately: the chart derives the Role's `resourceNames` from
+the same `clusters` list that builds the ConfigMap, and validates the inventory at render time. A parallel copy would
+have to reproduce both by hand, and would drift.
+
+Render the chart instead, and apply or commit the output:
 
 ```bash
-kubectl apply -f deploy/rbac.yaml       # Namespace, ServiceAccount, Roles, RoleBindings
-kubectl apply -f deploy/configmap.yaml  # cluster inventory — edit this first
-kubectl apply -f deploy/deployment.yaml
+helm template r2a-cert-sync ./charts/r2a-cert-sync \
+  --namespace r2a-cert-sync -f r2a-values.yaml > r2a-cert-sync.yaml
 ```
-
-Edit the `resourceNames` in `deploy/rbac.yaml` to match the `secretName` values you configure, and keep the two in step
-as clusters come and go — see [Adding or removing a cluster](#adding-or-removing-a-cluster). The Helm chart derives
-these automatically.
 
 ## Configuration
 
@@ -190,6 +230,10 @@ as the inventory — see [Adding or removing a cluster](#adding-or-removing-a-cl
 | `HEALTH_PORT` | no | `8080` | Port for `/livez`, `/readyz` and `/status` |
 
 ### Cluster inventory
+
+With the Helm chart you do not write this file — the chart renders it from `clusters` in your values. This is the
+resulting format, also kept as [`examples/config.yaml`](examples/config.yaml), which the test suite parses with the
+real loader so it cannot drift from the parser.
 
 ```yaml
 argocdNamespace: argocd
@@ -242,16 +286,13 @@ A cluster spans two objects, not one: the ConfigMap the daemon reads, and the Ro
 `create` is namespace-wide while `get`, `update` and `patch` are restricted to the Secrets this deployment manages —
 which is what keeps the daemon out of ArgoCD's own secrets, and what makes those two lists a matched pair.
 
-**With the Helm chart**, add the entry to `clusters` in your values file and run `helm upgrade`. The chart renders the
-ConfigMap and the Role from that single list, and the deployment's `checksum/config` annotation rolls the pod so the new
-inventory is read immediately.
+Add the entry to `clusters` in your values file and run `helm upgrade`. The chart renders the ConfigMap and the Role
+from that single list, and the deployment's `checksum/config` annotation rolls the pod so the new inventory is read
+immediately.
 
-Do not edit a chart-managed ConfigMap directly. The daemon will pick the cluster up, but the Role will not name its
-Secret, so that one cluster fails with `secrets "cluster-<name>" is forbidden` while every other cluster keeps
-reconciling normally — and the next `helm upgrade` silently reverts the edit.
-
-**With the plain manifests**, add the entry to `deploy/configmap.yaml` and its `secretName` to `resourceNames` in
-`deploy/rbac.yaml`, apply both, then `kubectl -n r2a-cert-sync rollout restart deploy/r2a-cert-sync`.
+Do not edit the ConfigMap directly. The daemon will pick the cluster up, but the Role will not name its Secret, so that
+one cluster fails with `secrets "cluster-<name>" is forbidden` while every other cluster keeps reconciling normally —
+and the next `helm upgrade` silently reverts the edit.
 
 Removing a cluster is the reverse, plus cleanup the daemon deliberately does not perform: it never deletes Secrets, so
 drop the generated `cluster-<name>` in ArgoCD's namespace and, for a standalone cluster, `<name>-credentials` in the
@@ -387,16 +428,41 @@ docker build -t r2a-cert-sync:latest .
 # Tests and linting
 go test ./...
 golangci-lint run
-helm lint charts/r2a-cert-sync
 
-# Release build (triggered automatically on version tag push)
-git tag v0.1.0
-git push origin v0.1.0
+# image.tag is required, so the chart needs one to render — any value will do
+# when you are only checking the templates
+helm lint charts/r2a-cert-sync --set image.tag=v0.0.1
 ```
 
 Releases are published to `ghcr.io/krisiasty/r2a-cert-sync` via GitHub Actions using GoReleaser. Multi-arch images
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
+
+### Cutting a release
+
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+That is the whole release. GoReleaser builds and publishes the images, archives and GitHub release. Then set
+`image.tag` to the new version where you deploy — your values file, or the ArgoCD Application — and the upgrade
+rolls out.
+
+### Versioning
+
+The chart and the application are versioned independently, which is what Helm's two fields are for:
+
+- **Chart `version`** moves only when the chart changes: a new resource, a renamed or removed value, a changed default.
+  Ship five application releases without touching the templates and it stays put.
+- **The application version is `image.tag`**, supplied in deployment values. There is deliberately no `appVersion` in
+  `Chart.yaml`.
+
+That separation is load-bearing rather than cosmetic. If `image.tag` fell back to chart metadata, the deployed version
+would live in a file inside the tagged tree — and since the tag is what triggers the build, the chart could never name
+the image that release produced. Keeping it in deployment values means it is set after the release, and the version you
+are running is stated explicitly instead of inferred. Rendering fails with an actionable message if it is missing, so
+the requirement cannot be discovered as a mystery `ImagePullBackOff`.
 
 ## Limitations
 

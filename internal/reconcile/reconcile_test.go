@@ -131,7 +131,7 @@ func TestArgoCDSecretError(t *testing.T) {
 		if !errors.Is(got, forbidden) {
 			t.Error("the original API error is no longer unwrappable")
 		}
-		for _, want := range []string{"resourceNames", "argocd", cluster.SecretName, ".Values.clusters", "deploy/rbac.yaml"} {
+		for _, want := range []string{"resourceNames", "argocd", cluster.SecretName, ".Values.clusters", "helm upgrade"} {
 			if !strings.Contains(got.Error(), want) {
 				t.Errorf("error %q does not mention %q", got, want)
 			}

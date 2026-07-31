@@ -4,41 +4,21 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"sigs.k8s.io/yaml"
 )
 
-// TestShippedExampleConfigIsValid parses the inventory embedded in
-// deploy/configmap.yaml with the real loader.
+// TestShippedExampleConfigIsValid loads examples/config.yaml with the real loader.
 //
-// The example is documentation people copy, so it must never drift out of step
-// with the parser — a stale example is worse than no example.
+// That file is documentation people copy, so it must never drift out of step
+// with the parser — a stale example is worse than no example. It has already
+// caught one: the loader rejects unknown fields, so a per-cluster key that was
+// removed from the schema failed here rather than in someone's cluster.
 func TestShippedExampleConfigIsValid(t *testing.T) {
-	path := filepath.Join("..", "..", "deploy", "configmap.yaml")
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: a fixed path inside the repository
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
+	path := filepath.Join("..", "..", "examples", "config.yaml")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the example inventory is missing: %v", err)
 	}
 
-	var manifest struct {
-		Data map[string]string `json:"data"`
-	}
-	if err := yaml.Unmarshal(raw, &manifest); err != nil {
-		t.Fatalf("parsing %s: %v", path, err)
-	}
-
-	inventory, ok := manifest.Data["config.yaml"]
-	if !ok {
-		t.Fatalf("%s has no data[\"config.yaml\"] entry", path)
-	}
-
-	dir := t.TempDir()
-	inventoryPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(inventoryPath, []byte(inventory), 0o600); err != nil {
-		t.Fatalf("writing extracted inventory: %v", err)
-	}
-
-	t.Setenv("CONFIG_PATH", inventoryPath)
+	t.Setenv("CONFIG_PATH", path)
 	t.Setenv("POD_NAMESPACE", "r2a-cert-sync")
 
 	cfg, err := Load(discardLogger())
