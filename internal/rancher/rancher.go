@@ -15,6 +15,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -68,7 +69,7 @@ func New(opts Options) (*Client, error) {
 	case len(opts.CA) > 0:
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(opts.CA) {
-			return nil, fmt.Errorf("rancher CA bundle contains no usable certificates")
+			return nil, errors.New("rancher CA bundle contains no usable certificates")
 		}
 		tlsConfig.RootCAs = pool
 	}

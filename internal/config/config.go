@@ -7,6 +7,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -307,7 +308,7 @@ func (c *Config) applyFile(f *file, logger *slog.Logger) error {
 	c.ArgoCDNamespace = orDefault(f.ArgoCDNamespace, defaultArgoCDNamespace)
 
 	if len(f.Clusters) == 0 {
-		return fmt.Errorf("no clusters configured")
+		return errors.New("no clusters configured")
 	}
 
 	seenNames := make(map[string]struct{}, len(f.Clusters))
@@ -365,7 +366,7 @@ func (c *Config) applyFile(f *file, logger *slog.Logger) error {
 
 	if f.Rancher != nil {
 		if f.Rancher.URL == "" {
-			return fmt.Errorf("rancher.url must not be empty")
+			return errors.New("rancher.url must not be empty")
 		}
 		url := strings.TrimRight(f.Rancher.URL, "/")
 		if !strings.HasPrefix(url, "https://") && !strings.HasPrefix(url, "http://") {
@@ -373,7 +374,7 @@ func (c *Config) applyFile(f *file, logger *slog.Logger) error {
 		}
 		token := resolveSecretRef(f.Rancher.TokenSecret, "", defaultRancherTokenKey)
 		if token.Name == "" {
-			return fmt.Errorf("rancher.tokenSecret.name must be set")
+			return errors.New("rancher.tokenSecret.name must be set")
 		}
 		if f.Rancher.InsecureSkipTLSVerify {
 			logger.Warn("rancher TLS verification disabled by configuration", "url", url)
@@ -400,7 +401,7 @@ func resolveCluster(cf clusterFile, def *defaults, defTokenTTL, defWarn, defRota
 	var out Cluster
 
 	if cf.Name == "" {
-		return out, fmt.Errorf("name must not be empty")
+		return out, errors.New("name must not be empty")
 	}
 	if len(cf.Name) > maxClusterNameLength {
 		return out, fmt.Errorf("name %q exceeds %d characters", cf.Name, maxClusterNameLength)
@@ -451,7 +452,7 @@ func resolveCluster(cf clusterFile, def *defaults, defTokenTTL, defWarn, defRota
 	if provider == ProviderDirect {
 		out.BootstrapSecret = resolveSecretRef(cf.BootstrapSecret, "", defaultBootstrapSecretKey)
 		if cf.BootstrapSecret != nil && cf.BootstrapSecret.Name == "" {
-			return out, fmt.Errorf("bootstrapSecret is present but bootstrapSecret.name is empty")
+			return out, errors.New("bootstrapSecret is present but bootstrapSecret.name is empty")
 		}
 	} else if cf.BootstrapSecret != nil {
 		return out, fmt.Errorf("bootstrapSecret is only valid for provider %q", ProviderDirect)
@@ -475,7 +476,7 @@ func resolveCluster(cf clusterFile, def *defaults, defTokenTTL, defWarn, defRota
 func normaliseEndpoint(in string) (string, error) {
 	endpoint := strings.TrimSpace(in)
 	if endpoint == "" {
-		return "", fmt.Errorf("endpoint must not be empty")
+		return "", errors.New("endpoint must not be empty")
 	}
 	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimSuffix(endpoint, "/")

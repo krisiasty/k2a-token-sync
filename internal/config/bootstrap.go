@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // BootstrapClusterInput is the subset of cluster settings the bootstrap
 // subcommand collects from flags.
@@ -19,7 +22,7 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 	var out Cluster
 
 	if in.Name == "" {
-		return out, fmt.Errorf("cluster name must not be empty")
+		return out, errors.New("cluster name must not be empty")
 	}
 	if len(in.Name) > maxClusterNameLength {
 		return out, fmt.Errorf("cluster name %q exceeds %d characters", in.Name, maxClusterNameLength)
