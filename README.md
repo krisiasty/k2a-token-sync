@@ -81,7 +81,8 @@ The cluster CA is deliberately never rotated: that would invalidate every kubeco
 
 - ArgoCD, and this daemon, running on a cluster that can reach each downstream API server directly.
 - For Rancher-managed clusters: a Rancher API token whose user holds cluster-owner rights on those clusters (and
-  permission to rotate certificates, if `autoRotate` is used anywhere).
+  permission to rotate certificates, if `autoRotate` is used anywhere). See
+  [Obtaining a Rancher API token](#obtaining-a-rancher-api-token).
 - For standalone clusters: one-time bootstrap access, see below.
 
 **Check your `tls-san` first.** An RKE2 API server's serving certificate only covers its node addresses, `127.0.0.1`,
@@ -105,7 +106,7 @@ helm install r2a-cert-sync ./charts/r2a-cert-sync \
 ```
 
 The Rancher token Secret is not managed by the chart — provide it via `kubectl`, Sealed Secrets, External Secrets
-Operator or anything else:
+Operator or anything else. See [Obtaining a Rancher API token](#obtaining-a-rancher-api-token) for how to mint one:
 
 ```bash
 kubectl create secret generic rancher-credentials \
@@ -214,6 +215,43 @@ errors.
 Rancher's cluster agent is already privileged in every cluster Rancher manages. The daemon uses the Rancher API proxy
 as its bootstrap authority, so onboarding a cluster is purely declarative: add it to the ConfigMap and it is
 registered on the next pass. Nobody needs to touch the downstream cluster.
+
+#### Obtaining a Rancher API token
+
+In the Rancher UI, open the user menu (avatar, top right) → **Account & API Keys** → **Create API Key**, then:
+
+- **Scope** — leave it at **No Scope**. A cluster-scoped key reaches only the cluster it was issued for, and the
+  daemon resolves every cluster by name through `/v3/clusters` before it can proxy anywhere, so a scoped key fails
+  even for its own cluster.
+- **Expiry** — Rancher caps this with the `auth-token-max-ttl-minutes` global setting, so the longest lifetime on
+  offer depends on your installation. The daemon cannot renew its own Rancher token, so whatever you choose is a
+  hard deadline: once it lapses, every `rancher` cluster stops reconciling.
+
+Rancher then shows **Access Key**, **Secret Key** and **Bearer Token** once and never again. Copy the **Bearer
+Token** — the `token-<id>:<secret>` pair — as that is the value the daemon expects.
+
+Prefer a dedicated Rancher local user over a personal account. A token inherits the permissions of the user that
+created it and dies with them, so a personal token stops working the moment that account is deactivated or vanishes
+from an upstream auth provider, taking every managed cluster with it. Grant the user cluster-owner on each cluster
+in the inventory; that role also covers the `rotateCertificates` action `autoRotate` depends on.
+
+Store the token under the key `token` in the Secret named by `rancher.tokenSecret.name`:
+
+```bash
+kubectl create secret generic rancher-credentials \
+  --namespace r2a-cert-sync \
+  --from-literal=token='token-abcde:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+```
+
+Verify it before deploying — this is the first call the daemon makes:
+
+```bash
+curl -fsS -H "Authorization: Bearer $RANCHER_TOKEN" \
+  'https://rancher.example.com/v3/clusters?limit=1' | jq -r '.data[].name'
+```
+
+`401` means the token is wrong or expired. An empty list means it authenticates but the user holds no cluster
+grants yet.
 
 ### `direct` — one-time bootstrap per cluster
 
