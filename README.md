@@ -105,6 +105,32 @@ helm install r2a-cert-sync ./charts/r2a-cert-sync \
   --set 'clusters[0].endpoint=10.0.0.10'
 ```
 
+Keep the inventory in a values file rather than in `--set` flags. It is the file you edit every time a cluster is added,
+and `clusters` drives both the ConfigMap and the RBAC the daemon needs — see
+[Adding or removing a cluster](#adding-or-removing-a-cluster).
+
+```yaml
+# r2a-values.yaml
+argocdNamespace: argocd
+
+rancher:
+  url: https://rancher.example.com
+
+clusters:
+  - name: downstream-1
+    endpoint: 10.0.0.10
+
+  - name: standalone-1
+    provider: direct
+    endpoint: rke2.example.com:6443
+```
+
+```bash
+helm upgrade --install r2a-cert-sync ./charts/r2a-cert-sync \
+  --namespace r2a-cert-sync --create-namespace \
+  -f r2a-values.yaml
+```
+
 The Rancher token Secret is not managed by the chart — provide it via `kubectl`, Sealed Secrets, External Secrets
 Operator or anything else. See [Obtaining a Rancher API token](#obtaining-a-rancher-api-token) for how to mint one:
 
@@ -147,14 +173,15 @@ kubectl apply -f deploy/configmap.yaml  # cluster inventory — edit this first
 kubectl apply -f deploy/deployment.yaml
 ```
 
-Edit the `resourceNames` in `deploy/rbac.yaml` to match the `secretName` values you configure. The Helm chart derives
+Edit the `resourceNames` in `deploy/rbac.yaml` to match the `secretName` values you configure, and keep the two in step
+as clusters come and go — see [Adding or removing a cluster](#adding-or-removing-a-cluster). The Helm chart derives
 these automatically.
 
 ## Configuration
 
 The daemon takes process settings from the environment and its cluster inventory from a YAML file, normally projected
-from a ConfigMap. Adding or removing a cluster is a ConfigMap edit — no code change, and no chart upgrade unless a new
-target namespace is introduced.
+from a ConfigMap. Onboarding a cluster is a configuration change and never a code change, but it does touch RBAC as well
+as the inventory — see [Adding or removing a cluster](#adding-or-removing-a-cluster).
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -207,6 +234,29 @@ silently ignored.
 Configuration is validated up front: duplicate cluster names, two clusters targeting one Secret, `autoRotate` on a
 standalone cluster, a Rancher-provider cluster with no Rancher section, and malformed endpoints are all startup
 errors.
+
+### Adding or removing a cluster
+
+A cluster spans two objects, not one: the ConfigMap the daemon reads, and the Role in `argocdNamespace` whose
+`resourceNames` list names the cluster Secrets the daemon may read and write. RBAC cannot scope `create` by name, so
+`create` is namespace-wide while `get`, `update` and `patch` are restricted to the Secrets this deployment manages —
+which is what keeps the daemon out of ArgoCD's own secrets, and what makes those two lists a matched pair.
+
+**With the Helm chart**, add the entry to `clusters` in your values file and run `helm upgrade`. The chart renders the
+ConfigMap and the Role from that single list, and the deployment's `checksum/config` annotation rolls the pod so the new
+inventory is read immediately.
+
+Do not edit a chart-managed ConfigMap directly. The daemon will pick the cluster up, but the Role will not name its
+Secret, so that one cluster fails with `secrets "cluster-<name>" is forbidden` while every other cluster keeps
+reconciling normally — and the next `helm upgrade` silently reverts the edit.
+
+**With the plain manifests**, add the entry to `deploy/configmap.yaml` and its `secretName` to `resourceNames` in
+`deploy/rbac.yaml`, apply both, then `kubectl -n r2a-cert-sync rollout restart deploy/r2a-cert-sync`.
+
+Removing a cluster is the reverse, plus cleanup the daemon deliberately does not perform: it never deletes Secrets, so
+drop the generated `cluster-<name>` in ArgoCD's namespace and, for a standalone cluster, `<name>-credentials` in the
+daemon's namespace. The downstream `argocd-manager` and `r2a-cert-sync` ServiceAccounts also outlive the entry and can
+be deleted once ArgoCD no longer needs the cluster.
 
 ## Providers
 
@@ -270,7 +320,9 @@ This installs two identities downstream — `argocd-manager` with `cluster-admin
 Nothing sensitive passes through your shell, and nothing lands in git. Use `--dry-run` first to see what it would do.
 
 After that the cluster needs no `bootstrapSecret` at all, and the annual client-certificate expiry is gone: the daemon
-maintains the registration from then on.
+maintains the registration from then on. Bootstrapping only provisions the downstream identities and stores the
+credential — the cluster is not registered until it appears in the inventory, which is a separate step and includes the
+matching RBAC entry, see [Adding or removing a cluster](#adding-or-removing-a-cluster).
 
 If you would rather not run the CLI, set `bootstrapSecret` to a Secret holding a kubeconfig (key `kubeconfig`) or a
 bearer token (key `token`, optionally with `ca.crt`). The daemon will use it once on first contact, provision its own
