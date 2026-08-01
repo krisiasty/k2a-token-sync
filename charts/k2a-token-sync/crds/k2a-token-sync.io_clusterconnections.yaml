@@ -27,10 +27,10 @@ spec:
       type: string
     - jsonPath: .status.tokenExpiresAt
       name: Token Expires
-      type: date
+      type: string
     - jsonPath: .status.selfCredentialExpiresAt
       name: Self Expires
-      type: date
+      type: string
     - jsonPath: .status.servingCertDaysRemaining
       name: Cert Days
       type: integer
@@ -47,6 +47,11 @@ spec:
           Deleting one stops maintenance. It deliberately does not delete the generated
           ArgoCD Secret: k2a-token-sync holds no delete permission in ArgoCD's namespace, so
           removing that Secret stays an explicit operator action.
+
+          A date column is rendered by kubectl as time *elapsed*, which is negative for
+          anything in the future and prints as "<invalid>". Both of these are expiries,
+          so they are strings and show the timestamp itself. Age below is a real date
+          column, and correct as one.
         properties:
           apiVersion:
             description: |-
