@@ -37,6 +37,25 @@ const (
 // so an operator can find and remove them.
 var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "k2a-token-sync"}
 
+// Repairs records what EnsureArgoCDIdentity had to put back.
+//
+// The two are reported separately because they mean different things. A
+// recreated ServiceAccount invalidates every token ever issued for it — bound
+// tokens carry the account's UID — so whatever ArgoCD is holding stopped working
+// the moment the old one was deleted, and a replacement must be minted. A
+// recreated binding restores permissions to a token that still authenticates
+// perfectly well, and needs nothing further.
+type Repairs struct {
+	ServiceAccount bool
+	Binding        bool
+}
+
+// Any reports whether anything had to be put back, which is never expected in
+// steady state: bootstrap created both, and nothing but a person removes them.
+func (r Repairs) Any() bool {
+	return r.ServiceAccount || r.Binding
+}
+
 // Token is a freshly minted ServiceAccount token.
 type Token struct {
 	Value     string
@@ -138,16 +157,22 @@ func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, 
 
 // EnsureArgoCDIdentity provisions the ServiceAccount ArgoCD authenticates as and
 // grants it cluster-admin, mirroring what `argocd cluster add` installs.
-func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) (bool, error) {
+func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) (Repairs, error) {
+	var repairs Repairs
+
 	created, err := EnsureServiceAccount(ctx, client, namespace, name)
 	if err != nil {
-		return false, err
+		return repairs, err
 	}
+	repairs.ServiceAccount = created
+
 	bound, err := EnsureClusterRoleBinding(ctx, client, name+"-role-binding", clusterAdminRole, namespace, name)
 	if err != nil {
-		return false, err
+		return repairs, err
 	}
-	return created || bound, nil
+	repairs.Binding = bound
+
+	return repairs, nil
 }
 
 // MintToken requests a bound token for a ServiceAccount.

@@ -279,14 +279,21 @@ const (
 	// does not claim the Secret is absent: holding no read permission on it, this
 	// tool cannot know that. Either the cluster has never been published or its
 	// status was lost, and the two are indistinguishable from here.
-	ReasonUnrecorded    RefreshReason = "no registration recorded in status"
-	ReasonNoToken       RefreshReason = "cluster secret has no bearer token"
-	ReasonExpiring      RefreshReason = "token is past half its lifetime"
-	ReasonServerDrift   RefreshReason = "recorded server URL does not match configuration"
-	ReasonNameDrift     RefreshReason = "recorded cluster name does not match configuration"
-	ReasonProjectDrift  RefreshReason = "recorded project does not match configuration"
-	ReasonCADrift       RefreshReason = "recorded CA bundle does not match the cluster CA"
-	ReasonUnknownExpiry RefreshReason = "token expiry is not recorded"
+	ReasonUnrecorded RefreshReason = "no registration recorded in status"
+	ReasonNoToken    RefreshReason = "cluster secret has no bearer token"
+
+	// ReasonIdentityRecreated is the one reason that does not come from comparing
+	// what was published against what is wanted. Both can match exactly while the
+	// token is dead: a bound token carries the ServiceAccount's UID, so deleting
+	// and recreating that account invalidates every token issued for it, leaving a
+	// Secret that looks perfect and authenticates to nothing.
+	ReasonIdentityRecreated RefreshReason = "downstream identity was recreated, so its tokens no longer authenticate"
+	ReasonExpiring          RefreshReason = "token is past half its lifetime"
+	ReasonServerDrift       RefreshReason = "recorded server URL does not match configuration"
+	ReasonNameDrift         RefreshReason = "recorded cluster name does not match configuration"
+	ReasonProjectDrift      RefreshReason = "recorded project does not match configuration"
+	ReasonCADrift           RefreshReason = "recorded CA bundle does not match the cluster CA"
+	ReasonUnknownExpiry     RefreshReason = "token expiry is not recorded"
 )
 
 // NeedsRefresh decides whether to mint a new credential.
