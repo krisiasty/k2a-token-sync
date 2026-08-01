@@ -338,7 +338,7 @@ Output is grouped by cluster, because "where did that happen" is the first quest
 them. Registering the cluster ArgoCD itself runs on is a normal case, and the second heading then says "the same cluster
 as above" rather than leaving you to compare two addresses.
 
-#### The bootstrap does, in order:
+**The bootstrap does, in order:**
 
 - resolve both clusters before changing anything;
 - read the cluster CA;
