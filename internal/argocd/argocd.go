@@ -102,6 +102,10 @@ type ClusterSecret struct {
 	TokenExpiresAt       time.Time
 	ServingCertExpiresAt time.Time
 
+	// TokenIssuedAt is when the credential was minted. It is recorded in status
+	// rather than on the Secret, being of no interest to ArgoCD.
+	TokenIssuedAt time.Time
+
 	// ClusterName is the configured name of the owning cluster entry.
 	ClusterName string
 
@@ -238,6 +242,7 @@ type Fingerprint struct {
 	Project        string
 	CAHash         string
 	TokenExpiresAt time.Time
+	TokenIssuedAt  time.Time
 }
 
 // Fingerprint describes what applying this ClusterSecret would publish, for
@@ -249,6 +254,7 @@ func (c ClusterSecret) Fingerprint() Fingerprint {
 		Project:        c.Project,
 		CAHash:         HashCA(c.CAData),
 		TokenExpiresAt: c.TokenExpiresAt,
+		TokenIssuedAt:  c.TokenIssuedAt,
 	}
 }
 
@@ -308,8 +314,29 @@ func NeedsRefresh(applied Fingerprint, hasCredential bool, desired ClusterSecret
 		return ReasonCADrift
 	case applied.TokenExpiresAt.IsZero():
 		return ReasonUnknownExpiry
-	case applied.TokenExpiresAt.Sub(now) < ttl/2:
+	case !now.Before(ReissueAt(applied, ttl)):
 		return ReasonExpiring
 	}
 	return ""
+}
+
+// ReissueAt is when the published credential reaches half the lifetime it was
+// actually granted.
+//
+// The requested lifetime is not always the granted one: an API server capping
+// tokens with --service-account-max-token-expiration issues something far shorter,
+// and comparing against half the request would then be true from the moment the
+// token was minted — reissuing on every pass, forever, for a cluster that is
+// merely configured conservatively.
+//
+// requested is the fallback for a credential published before the issue time was
+// recorded. Such a status is indistinguishable from one written by an older
+// release, so it keeps the old comparison until the next reissue records an issue
+// time and the question settles itself.
+func ReissueAt(applied Fingerprint, requested time.Duration) time.Time {
+	if applied.TokenIssuedAt.IsZero() {
+		return applied.TokenExpiresAt.Add(-requested / 2)
+	}
+	granted := applied.TokenExpiresAt.Sub(applied.TokenIssuedAt)
+	return applied.TokenIssuedAt.Add(granted / 2)
 }

@@ -272,6 +272,13 @@ spec:
                   so when it would lock itself out if it stopped running.
                 format: date-time
                 type: string
+              selfCredentialIssuedAt:
+                description: |-
+                  SelfCredentialIssuedAt is when k2a-token-sync's own credential was minted, and
+                  therefore how old it is — which is what decides a renewal, rather than being
+                  inferred from what is left of the requested lifetime.
+                format: date-time
+                type: string
               servingCertDaysRemaining:
                 format: int32
                 type: integer
@@ -280,6 +287,16 @@ spec:
                 type: string
               tokenExpiresAt:
                 description: TokenExpiresAt is when ArgoCD's credential expires.
+                format: date-time
+                type: string
+              tokenIssuedAt:
+                description: |-
+                  TokenIssuedAt is when ArgoCD's credential was minted.
+
+                  Recorded because the granted lifetime is not the requested one whenever an
+                  API server caps it with --service-account-max-token-expiration, and half of
+                  the granted lifetime is what a reissue is actually due at. Without this,
+                  nothing here says how long the token was ever meant to live.
                 format: date-time
                 type: string
             type: object

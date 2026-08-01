@@ -204,6 +204,12 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	passCtx, cancel := context.WithTimeout(ctx, clusterTimeout)
 	defer cancel()
 
+	// When the pass started, not when it finished. Scheduling from the end would add
+	// the pass's own duration to every interval, and since that duration always
+	// carries dueAt past the poll tick that would have caught it, each interval
+	// silently became one whole tick longer than the one configured.
+	startedAt := s.now()
+
 	status, err := s.rec.Cluster(passCtx, state.cluster, state.status, state.generation)
 	state.status = status
 
@@ -214,9 +220,11 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 			"cluster", state.cluster.Name, "error", writeErr)
 	}
 
-	now := s.now()
 	if err != nil {
-		state.dueAt = now.Add(state.backoff)
+		// Backoff is measured from the end of a failed pass on purpose: a pass that
+		// fails slowly, on a timeout say, should not be retried the instant it
+		// returns.
+		state.dueAt = s.now().Add(state.backoff)
 		s.logger.Info("retrying later", "cluster", state.cluster.Name,
 			"retry_in", state.backoff.Round(time.Second).String())
 		state.backoff = min(state.backoff*2, maxRetryInterval)
@@ -224,7 +232,16 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	}
 
 	state.backoff = retryInterval
-	state.dueAt = now.Add(nextInterval(status, now))
+	state.dueAt = dueAfterPass(startedAt, status)
+}
+
+// dueAfterPass is when a cluster whose pass just succeeded is next due.
+//
+// It takes only the moment the pass began, so the pass's own duration cannot leak
+// into the interval — which is the whole point, and why this is a function rather
+// than two lines inline reading the clock again.
+func dueAfterPass(startedAt time.Time, status v1alpha1.ClusterConnectionStatus) time.Time {
+	return startedAt.Add(nextInterval(status, startedAt))
 }
 
 // nextInterval decides when a healthy cluster is next due.

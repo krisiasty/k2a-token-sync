@@ -129,8 +129,12 @@ func (r *Reconciler) reconcile(
 	// cost k2a-token-sync its own credential's headroom: reaching this point proves
 	// the current credential works, which is the only precondition for replacing
 	// it.
-	if selfCredentialDue(cluster, access.expiresAt, now) {
-		r.renewSelfCredential(ctx, cluster, access, status, logger)
+	var selfIssuedAt time.Time
+	if status.SelfCredentialIssuedAt != nil {
+		selfIssuedAt = status.SelfCredentialIssuedAt.Time
+	}
+	if selfCredentialDue(cluster, selfIssuedAt, access.expiresAt, now) {
+		r.renewSelfCredential(ctx, cluster, access, status, logger, now)
 	}
 
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
@@ -154,6 +158,7 @@ func (r *Reconciler) reconcile(
 
 	applied := fingerprintFrom(*status)
 	desired.TokenExpiresAt = applied.TokenExpiresAt
+	desired.TokenIssuedAt = applied.TokenIssuedAt
 	first := applied == (argocd.Fingerprint{})
 
 	// Applying the registration is how k2a-token-sync observes what it published: an
@@ -171,8 +176,18 @@ func (r *Reconciler) reconcile(
 	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
 	if reason == "" {
 		status.LastAction = "up-to-date"
-		logger.Info("registration current",
+
+		// This is far and away the most repeated line in the log — one per cluster
+		// per pass, for as long as nothing is wrong — so it says what happened
+		// ("nothing") and when that will stop being true, rather than leaving a
+		// reader to subtract two timestamps to find out.
+		//
+		// Reaching here means the token is not yet past half the lifetime it was
+		// granted, so this is always positive.
+		reissueDueIn := argocd.ReissueAt(applied, cluster.TokenTTL).Sub(now)
+		logger.Info("credential still current, nothing written",
 			"token_expires_at", applied.TokenExpiresAt.UTC().Format(time.RFC3339),
+			"reissue_due_in", reissueDueIn.Round(time.Minute).String(),
 			"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 		)
 		return nil
@@ -204,6 +219,7 @@ func (r *Reconciler) reconcile(
 
 	desired.BearerToken = token.Value
 	desired.TokenExpiresAt = token.ExpiresAt
+	desired.TokenIssuedAt = now
 
 	// The credential goes on first. A Secret carrying no
 	// argocd.argoproj.io/secret-type label is invisible to ArgoCD, so writing the
@@ -241,6 +257,9 @@ func fingerprintFrom(status v1alpha1.ClusterConnectionStatus) argocd.Fingerprint
 	if status.TokenExpiresAt != nil {
 		f.TokenExpiresAt = status.TokenExpiresAt.Time
 	}
+	if status.TokenIssuedAt != nil {
+		f.TokenIssuedAt = status.TokenIssuedAt.Time
+	}
 	return f
 }
 
@@ -250,6 +269,7 @@ func recordFingerprint(status *v1alpha1.ClusterConnectionStatus, f argocd.Finger
 	status.AppliedProject = f.Project
 	status.AppliedCAHash = f.CAHash
 	status.TokenExpiresAt = &metav1.Time{Time: f.TokenExpiresAt}
+	status.TokenIssuedAt = &metav1.Time{Time: f.TokenIssuedAt}
 }
 
 func setCondition(
@@ -445,16 +465,28 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 // selfCredentialDue reports whether k2a-token-sync's own credential is old enough
 // to replace.
 //
-// Nothing records when a credential was issued, so its age is inferred from what
-// is left of the requested lifetime. If the API server capped that lifetime, this
-// reads the credential as older than it is and renews sooner — the safe direction,
-// and the case that already logs a warning.
-func selfCredentialDue(cluster config.Cluster, expiresAt time.Time, now time.Time) bool {
+// Two tests, and the second is the one that matters most. Age answers the ordinary
+// case: replace a day-old credential, keeping the remaining lifetime within a day
+// of the full TTL. Half the granted lifetime answers the case an API server capping
+// tokens creates — a credential granted an hour cannot wait a day to be renewed, or
+// it expires first and locks k2a-token-sync out of the cluster with no way back but
+// a human re-running bootstrap.
+//
+// issuedAt is absent for a credential written before it was recorded, including one
+// bootstrap created under an older release. Age is then inferred from what is left
+// of the requested lifetime, which reads a capped credential as older than it is
+// and renews sooner — the safe direction, and the same case that already warns.
+func selfCredentialDue(cluster config.Cluster, issuedAt, expiresAt, now time.Time) bool {
 	if expiresAt.IsZero() {
 		// Nothing known about it. Minting establishes an expiry to reason from.
 		return true
 	}
-	return cluster.SelfTokenTTL-expiresAt.Sub(now) >= selfRenewInterval
+	if issuedAt.IsZero() {
+		return cluster.SelfTokenTTL-expiresAt.Sub(now) >= selfRenewInterval
+	}
+
+	granted := expiresAt.Sub(issuedAt)
+	return now.Sub(issuedAt) >= selfRenewInterval || !now.Before(issuedAt.Add(granted/2))
 }
 
 // renewSelfCredential mints a replacement for k2a-token-sync's own credential using
@@ -475,6 +507,7 @@ func (r *Reconciler) renewSelfCredential(
 	access *clusterAccess,
 	status *v1alpha1.ClusterConnectionStatus,
 	logger *slog.Logger,
+	now time.Time,
 ) {
 	namespace := cluster.ServiceAccount.Namespace
 
@@ -485,7 +518,7 @@ func (r *Reconciler) renewSelfCredential(
 		return
 	}
 
-	granted := token.ExpiresAt.Sub(r.now())
+	granted := token.ExpiresAt.Sub(now)
 	if granted < cluster.SelfTokenTTL*9/10 {
 		logger.Warn("API server shortened k2a-token-sync's own token lifetime, which shortens the outage it can survive",
 			"requested", cluster.SelfTokenTTL.String(),
@@ -513,7 +546,10 @@ func (r *Reconciler) renewSelfCredential(
 		return
 	}
 
+	// Both, and only once the credential is stored. Recording an issue time for a
+	// credential that failed to store would age out one that still works.
 	status.SelfCredentialExpiresAt = &metav1.Time{Time: token.ExpiresAt}
+	status.SelfCredentialIssuedAt = &metav1.Time{Time: now}
 	logger.Debug("renewed k2a-token-sync's own credential", "expires_at", token.ExpiresAt.UTC().Format(time.RFC3339))
 }
 

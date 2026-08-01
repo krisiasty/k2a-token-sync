@@ -307,6 +307,10 @@ func TestNeedsRefresh(t *testing.T) {
 		{
 			// Half the lifetime is the refresh point, so a long outage still
 			// leaves a wide margin before ArgoCD's credential dies.
+			//
+			// No issue time here, nor in any case above: they exercise the fallback
+			// for a status written before it was recorded, which must keep behaving
+			// exactly as it used to.
 			name:          "past half its lifetime",
 			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 - time.Minute) },
 			hasCredential: true,
@@ -317,6 +321,41 @@ func TestNeedsRefresh(t *testing.T) {
 			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 + time.Minute) },
 			hasCredential: true,
 			wantSkip:      true,
+		},
+		{
+			// The case the issue time exists for. Against half the *requested*
+			// lifetime, a token the API server capped at an hour read as expiring
+			// from the instant it was minted — so a conservatively configured
+			// cluster reissued on every pass, forever, churning ArgoCD's cache.
+			name: "granted an hour, ten minutes gone",
+			mutate: func(f *Fingerprint) {
+				f.TokenIssuedAt = now.Add(-10 * time.Minute)
+				f.TokenExpiresAt = now.Add(50 * time.Minute)
+			},
+			hasCredential: true,
+			wantSkip:      true,
+		},
+		{
+			// And it must still be reissued in time. Half of an hour, not half of
+			// the 720 hours nobody granted.
+			name: "granted an hour, past half of it",
+			mutate: func(f *Fingerprint) {
+				f.TokenIssuedAt = now.Add(-31 * time.Minute)
+				f.TokenExpiresAt = now.Add(29 * time.Minute)
+			},
+			hasCredential: true,
+			want:          ReasonExpiring,
+		},
+		{
+			// Granted what was asked for: the same answer either way, which is why
+			// recording the issue time changes nothing for an ordinary cluster.
+			name: "issue time recorded, full lifetime granted",
+			mutate: func(f *Fingerprint) {
+				f.TokenIssuedAt = now.Add(-ttl/2 - time.Minute)
+				f.TokenExpiresAt = now.Add(ttl/2 - time.Minute)
+			},
+			hasCredential: true,
+			want:          ReasonExpiring,
 		},
 	}
 
@@ -345,11 +384,16 @@ func TestFingerprintRoundTrip(t *testing.T) {
 
 	// A fingerprint taken from what was applied must compare equal against the
 	// same desired state, or every pass would reissue.
+	issued := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
 	desired := testSecret()
-	desired.TokenExpiresAt = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	desired.TokenIssuedAt = issued
+	desired.TokenExpiresAt = issued.Add(720 * time.Hour)
 
 	applied := desired.Fingerprint()
-	if got := NeedsRefresh(applied, true, desired, 720*time.Hour, desired.TokenExpiresAt.Add(-700*time.Hour)); got != "" {
+	if applied.TokenIssuedAt != issued {
+		t.Errorf("the fingerprint dropped the issue time: %v", applied.TokenIssuedAt)
+	}
+	if got := NeedsRefresh(applied, true, desired, 720*time.Hour, issued.Add(time.Minute)); got != "" {
 		t.Fatalf("NeedsRefresh = %q immediately after applying, want no refresh", got)
 	}
 }
