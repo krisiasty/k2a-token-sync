@@ -1,6 +1,6 @@
-# r2a-cert-sync
+# k2a-token-sync
 
-`r2a-cert-sync` (**R**KE**2**-**to**-**A**rgo **Cert**ificate **Sync**) keeps ArgoCD's registrations for downstream
+`k2a-token-sync` (**K**ubernetes-**to**-**A**rgoCD **Token Sync**) keeps ArgoCD's registrations for downstream
 RKE2 clusters valid, so ArgoCD can connect to each cluster's API server directly instead of through the Rancher proxy.
 
 It removes the Rancher management plane from the GitOps request path, and it removes the annual certificate expiry
@@ -16,7 +16,7 @@ certificate out of `/etc/rancher/rke2/rke2.yaml` into ArgoCD's cluster Secret �
 certificate is valid for one year. When it expires, every ArgoCD Application on that cluster stops syncing, and the
 fix is manual.
 
-`r2a-cert-sync` solves this by not using client certificates at all. It keeps each cluster registered with a
+`k2a-token-sync` solves this by not using client certificates at all. It keeps each cluster registered with a
 short-lived ServiceAccount token that it mints and rotates itself.
 
 ## How it works
@@ -33,7 +33,7 @@ lifetime refreshed daily, Rancher can be down for weeks before anything degrades
 
 ```mermaid
 graph TD
-    A[r2a-cert-sync] -->|control path, daily| B{provider}
+    A[k2a-token-sync] -->|control path, daily| B{provider}
     B -->|rancher| C[Rancher API proxy]
     B -->|direct| D[stored durable credential]
     C --> E[downstream RKE2 API]
@@ -98,8 +98,8 @@ certificate's actual SANs. Add the missing name to `tls-san` and restart `rke2-s
 ### Helm (recommended)
 
 ```bash
-helm install r2a-cert-sync ./charts/r2a-cert-sync \
-  --namespace r2a-cert-sync --create-namespace \
+helm install k2a-token-sync ./charts/k2a-token-sync \
+  --namespace k2a-token-sync --create-namespace \
   --set rancher.url=https://rancher.example.com \
   --set 'clusters[0].name=downstream-1' \
   --set 'clusters[0].endpoint=10.0.0.10'
@@ -110,7 +110,7 @@ and `clusters` drives both the ConfigMap and the RBAC the daemon needs — see
 [Adding or removing a cluster](#adding-or-removing-a-cluster).
 
 ```yaml
-# r2a-values.yaml
+# k2a-values.yaml
 argocdNamespace: argocd
 
 rancher:
@@ -126,9 +126,9 @@ clusters:
 ```
 
 ```bash
-helm upgrade --install r2a-cert-sync ./charts/r2a-cert-sync \
-  --namespace r2a-cert-sync --create-namespace \
-  -f r2a-values.yaml
+helm upgrade --install k2a-token-sync ./charts/k2a-token-sync \
+  --namespace k2a-token-sync --create-namespace \
+  -f k2a-values.yaml
 ```
 
 The Rancher token Secret is not managed by the chart — provide it via `kubectl`, Sealed Secrets, External Secrets
@@ -136,7 +136,7 @@ Operator or anything else. See [Obtaining a Rancher API token](#obtaining-a-ranc
 
 ```bash
 kubectl create secret generic rancher-credentials \
-  --namespace r2a-cert-sync \
+  --namespace k2a-token-sync \
   --from-literal=token=<rancher-api-token>
 ```
 
@@ -144,7 +144,7 @@ kubectl create secret generic rancher-credentials \
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `image.repository` | `ghcr.io/krisiasty/r2a-cert-sync` | Image repository |
+| `image.repository` | `ghcr.io/krisiasty/k2a-token-sync` | Image repository |
 | `image.tag` | **required** | Released version to deploy, e.g. `v0.0.1`. Rendering fails if unset |
 | `rancher.url` | _(unset)_ | Rancher API URL; required if any cluster uses `provider: rancher` |
 | `rancher.tokenSecret.name` | `rancher-credentials` | Secret holding the Rancher token |
@@ -166,14 +166,14 @@ registrations for every downstream cluster.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: r2a-cert-sync
+  name: k2a-token-sync
   namespace: argocd
 spec:
   project: default
   source:
-    repoURL: https://github.com/krisiasty/r2a-cert-sync
+    repoURL: https://github.com/krisiasty/k2a-token-sync
     targetRevision: HEAD
-    path: charts/r2a-cert-sync
+    path: charts/k2a-token-sync
     helm:
       values: |
         image:
@@ -195,7 +195,7 @@ spec:
             endpoint: "10.1.0.10"
   destination:
     server: https://kubernetes.default.svc
-    namespace: r2a-cert-sync
+    namespace: k2a-token-sync
   syncPolicy:
     automated:
       prune: true
@@ -213,8 +213,8 @@ have to reproduce both by hand, and would drift.
 Render the chart instead, and apply or commit the output:
 
 ```bash
-helm template r2a-cert-sync ./charts/r2a-cert-sync \
-  --namespace r2a-cert-sync -f r2a-values.yaml > r2a-cert-sync.yaml
+helm template k2a-token-sync ./charts/k2a-token-sync \
+  --namespace k2a-token-sync -f k2a-values.yaml > k2a-token-sync.yaml
 ```
 
 ## Configuration
@@ -226,7 +226,7 @@ as the inventory — see [Adding or removing a cluster](#adding-or-removing-a-cl
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
 | `POD_NAMESPACE` | yes | | Namespace the daemon runs in; all referenced Secrets live here |
-| `CONFIG_PATH` | no | `/etc/r2a-cert-sync/config.yaml` | Path to the cluster inventory |
+| `CONFIG_PATH` | no | `/etc/k2a-token-sync/config.yaml` | Path to the cluster inventory |
 | `HEALTH_PORT` | no | `8080` | Port for `/livez`, `/readyz` and `/status` |
 
 ### Cluster inventory
@@ -296,7 +296,7 @@ and the next `helm upgrade` silently reverts the edit.
 
 Removing a cluster is the reverse, plus cleanup the daemon deliberately does not perform: it never deletes Secrets, so
 drop the generated `cluster-<name>` in ArgoCD's namespace and, for a standalone cluster, `<name>-credentials` in the
-daemon's namespace. The downstream `argocd-manager` and `r2a-cert-sync` ServiceAccounts also outlive the entry and can
+daemon's namespace. The downstream `argocd-manager` and `k2a-token-sync` ServiceAccounts also outlive the entry and can
 be deleted once ArgoCD no longer needs the cluster.
 
 ## Providers
@@ -330,7 +330,7 @@ Store the token under the key `token` in the Secret named by `rancher.tokenSecre
 
 ```bash
 kubectl create secret generic rancher-credentials \
-  --namespace r2a-cert-sync \
+  --namespace k2a-token-sync \
   --from-literal=token='token-abcde:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
 ```
 
@@ -350,14 +350,14 @@ Standalone RKE2 has no equivalent pre-privileged agent, so the first foothold ha
 once with the same binary, from a workstation that already has a working kubeconfig for both clusters:
 
 ```bash
-r2a-cert-sync bootstrap \
+k2a-token-sync bootstrap \
   --cluster standalone-1 \
   --endpoint 10.1.0.10 \
   --context standalone-1
 ```
 
 This installs two identities downstream — `argocd-manager` with `cluster-admin`, and a narrowly-scoped
-`r2a-cert-sync` identity for the daemon — then stores a durable credential for the latter in the daemon's namespace.
+`k2a-token-sync` identity for the daemon — then stores a durable credential for the latter in the daemon's namespace.
 Nothing sensitive passes through your shell, and nothing lands in git. Use `--dry-run` first to see what it would do.
 
 After that the cluster needs no `bootstrapSecret` at all, and the annual client-certificate expiry is gone: the daemon
@@ -370,10 +370,10 @@ bearer token (key `token`, optionally with `ca.crt`). The daemon will use it onc
 credential, and then no longer need it — so a short-lived token works well:
 
 ```bash
-kubectl -n kube-system create serviceaccount r2a-bootstrap
-kubectl create clusterrolebinding r2a-bootstrap \
-  --clusterrole=cluster-admin --serviceaccount=kube-system:r2a-bootstrap
-kubectl -n kube-system create token r2a-bootstrap --duration=1h
+kubectl -n kube-system create serviceaccount k2a-bootstrap
+kubectl create clusterrolebinding k2a-bootstrap \
+  --clusterrole=cluster-admin --serviceaccount=kube-system:k2a-bootstrap
+kubectl -n kube-system create token k2a-bootstrap --duration=1h
 ```
 
 A kubeconfig copied from `/etc/rancher/rke2/rke2.yaml` needs its `server` rewritten from `127.0.0.1` to the reachable
@@ -394,8 +394,8 @@ kubectl -n argocd get secret cluster-downstream-1 \
   -o jsonpath='{.metadata.annotations}' | jq
 ```
 
-`r2a-cert-sync.io/token-expires-at`, `r2a-cert-sync.io/serving-cert-expires-at`, `r2a-cert-sync.io/last-sync` and
-`r2a-cert-sync.io/cluster`.
+`k2a-token-sync.io/token-expires-at`, `k2a-token-sync.io/serving-cert-expires-at`, `k2a-token-sync.io/last-sync` and
+`k2a-token-sync.io/cluster`.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 
@@ -406,7 +406,7 @@ one in ArgoCD's namespace restricted with `resourceNames` to the Secrets it gene
 Secrets. Kubernetes RBAC forbids combining `resourceNames` with `create`, so `create` on secrets is namespace-scoped
 rather than name-scoped.
 
-Downstream, the `r2a-cert-sync` identity used for standalone clusters is granted only what it needs: get/create
+Downstream, the `k2a-token-sync` identity used for standalone clusters is granted only what it needs: get/create
 ServiceAccounts, create ServiceAccount tokens, get/create ClusterRoleBindings, and read the `kube-root-ca.crt`
 ConfigMap. It holds no direct access to Secrets.
 
@@ -423,7 +423,7 @@ an error rather than silently rewritten — an unannounced privilege change is n
 
 ```bash
 # Local image build
-docker build -t r2a-cert-sync:latest .
+docker build -t k2a-token-sync:latest .
 
 # Tests and linting
 go test ./...
@@ -431,10 +431,10 @@ golangci-lint run
 
 # image.tag is required, so the chart needs one to render — any value will do
 # when you are only checking the templates
-helm lint charts/r2a-cert-sync --set image.tag=v0.0.1
+helm lint charts/k2a-token-sync --set image.tag=v0.0.1
 ```
 
-Releases are published to `ghcr.io/krisiasty/r2a-cert-sync` via GitHub Actions using GoReleaser. Multi-arch images
+Releases are published to `ghcr.io/krisiasty/k2a-token-sync` via GitHub Actions using GoReleaser. Multi-arch images
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
 

@@ -1,14 +1,14 @@
-{{- include "r2a-cert-sync.validate" . }}
+{{- include "k2a-token-sync.validate" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "r2a-cert-sync.name" . }}
+  name: {{ include "k2a-token-sync.name" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 data:
   config.yaml: |
-    argocdNamespace: {{ include "r2a-cert-sync.argocdNamespace" . | quote }}
+    argocdNamespace: {{ include "k2a-token-sync.argocdNamespace" . | quote }}
     {{- if .Values.rancher.url }}
     rancher:
       url: {{ .Values.rancher.url | quote }}

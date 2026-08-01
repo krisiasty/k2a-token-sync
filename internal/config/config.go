@@ -59,7 +59,7 @@ const (
 	defaultArgoCDNamespace     = "argocd"
 	defaultServiceAccountName  = "argocd-manager"
 	defaultServiceAccountNS    = "kube-system"
-	defaultAgentServiceAccount = "r2a-cert-sync"
+	defaultAgentServiceAccount = "k2a-token-sync"
 	defaultBootstrapSecretKey  = "kubeconfig"
 	defaultRancherTokenKey     = "token"
 	defaultRancherCASecretKey  = "ca.crt"
@@ -251,7 +251,7 @@ type serviceAccountRef struct {
 // Load reads process configuration from the environment and the cluster
 // inventory from the referenced YAML file.
 func Load(logger *slog.Logger) (*Config, error) {
-	path := envOrDefault(logger, "CONFIG_PATH", "/etc/r2a-cert-sync/config.yaml")
+	path := envOrDefault(logger, "CONFIG_PATH", "/etc/k2a-token-sync/config.yaml")
 
 	namespace, err := requireEnv("POD_NAMESPACE")
 	if err != nil {
@@ -445,7 +445,7 @@ func resolveCluster(cf clusterFile, def *defaults, defTokenTTL, defWarn, defRota
 	}
 
 	// bootstrapSecret is optional: a cluster prepared with
-	// 'r2a-cert-sync bootstrap' already has a durable credential stored, and
+	// 'k2a-token-sync bootstrap' already has a durable credential stored, and
 	// needs no bootstrap material at all. It is only required when the operator
 	// wants the daemon to perform the bootstrap itself on first contact, which
 	// is checked at reconciliation time rather than here.

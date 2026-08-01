@@ -40,7 +40,7 @@ const (
 
 // ManagedByLabel marks every object this tool creates in a downstream cluster,
 // so an operator can find and remove them.
-var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "r2a-cert-sync"}
+var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "k2a-token-sync"}
 
 // Token is a freshly minted ServiceAccount token.
 type Token struct {

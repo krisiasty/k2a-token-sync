@@ -1,4 +1,4 @@
-module github.com/krisiasty/r2a-cert-sync
+module github.com/krisiasty/k2a-token-sync
 
 go 1.26.5
 

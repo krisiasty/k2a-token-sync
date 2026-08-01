@@ -17,7 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/k8s"
+	"github.com/krisiasty/k2a-token-sync/internal/k8s"
 )
 
 const (
@@ -27,22 +27,22 @@ const (
 	secretTypeCluster = "cluster"
 
 	managedByLabel = "app.kubernetes.io/managed-by"
-	managedByValue = "r2a-cert-sync"
+	managedByValue = "k2a-token-sync"
 
 	// TokenExpiryAnnotation records when the credential we wrote expires. It is
 	// what lets the daemon decide whether a refresh is due without having to
 	// decode the token itself.
-	TokenExpiryAnnotation = "r2a-cert-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
+	TokenExpiryAnnotation = "k2a-token-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
 
 	// ServingCertExpiryAnnotation records the observed expiry of the downstream
 	// API server's serving certificate, so it is visible with kubectl.
-	ServingCertExpiryAnnotation = "r2a-cert-sync.io/serving-cert-expires-at"
+	ServingCertExpiryAnnotation = "k2a-token-sync.io/serving-cert-expires-at"
 
 	// LastSyncAnnotation records the last successful reconciliation.
-	LastSyncAnnotation = "r2a-cert-sync.io/last-sync"
+	LastSyncAnnotation = "k2a-token-sync.io/last-sync"
 
 	// ClusterNameAnnotation records which configured cluster owns this Secret.
-	ClusterNameAnnotation = "r2a-cert-sync.io/cluster"
+	ClusterNameAnnotation = "k2a-token-sync.io/cluster"
 
 	nameKey    = "name"
 	serverKey  = "server"

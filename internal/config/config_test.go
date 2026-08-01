@@ -64,7 +64,7 @@ func loadFrom(t *testing.T, body string) (*Config, error) {
 		t.Fatalf("writing test config: %v", err)
 	}
 	t.Setenv("CONFIG_PATH", path)
-	t.Setenv("POD_NAMESPACE", "r2a-cert-sync")
+	t.Setenv("POD_NAMESPACE", "k2a-token-sync")
 
 	return Load(discardLogger())
 }

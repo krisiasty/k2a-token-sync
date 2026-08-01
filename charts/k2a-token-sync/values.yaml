@@ -1,8 +1,8 @@
 image:
-  repository: ghcr.io/krisiasty/r2a-cert-sync
+  repository: ghcr.io/krisiasty/k2a-token-sync
 
   # Required. The released version to deploy, e.g. "v0.0.1" — see
-  # https://github.com/krisiasty/r2a-cert-sync/releases
+  # https://github.com/krisiasty/k2a-token-sync/releases
   #
   # Not defaulted from the chart's metadata on purpose: the chart is versioned
   # independently of the application, so the version you deploy is stated here
@@ -90,7 +90,7 @@ defaults:
 #   - name: standalone-1
 #     provider: direct
 #     endpoint: 10.1.0.10
-#     # Bootstrap once with: r2a-cert-sync bootstrap --cluster standalone-1 \
+#     # Bootstrap once with: k2a-token-sync bootstrap --cluster standalone-1 \
 #     #   --endpoint 10.1.0.10 --context standalone-1
 #     # If you would rather supply the credential yourself, reference it here and
 #     # the daemon will use it on the first pass:

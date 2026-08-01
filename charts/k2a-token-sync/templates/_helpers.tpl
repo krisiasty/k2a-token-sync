@@ -1,17 +1,17 @@
-{{- define "r2a-cert-sync.name" -}}
+{{- define "k2a-token-sync.name" -}}
 {{- .Release.Name | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
-{{- define "r2a-cert-sync.labels" -}}
+{{- define "k2a-token-sync.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
-app.kubernetes.io/name: {{ include "r2a-cert-sync.name" . }}
+app.kubernetes.io/name: {{ include "k2a-token-sync.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Values.image.tag | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
-{{- define "r2a-cert-sync.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "r2a-cert-sync.name" . }}
+{{- define "k2a-token-sync.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "k2a-token-sync.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
@@ -24,9 +24,9 @@ never name the image that release produced. Keeping the version in deployment
 values instead means it is set after the release, and the deployed version is
 stated explicitly rather than implied.
 */}}
-{{- define "r2a-cert-sync.image" -}}
+{{- define "k2a-token-sync.image" -}}
 {{- if not .Values.image.tag }}
-{{- fail "image.tag is required: set it to a released version, e.g. --set image.tag=v0.0.1 (see https://github.com/krisiasty/r2a-cert-sync/releases)" }}
+{{- fail "image.tag is required: set it to a released version, e.g. --set image.tag=v0.0.1 (see https://github.com/krisiasty/k2a-token-sync/releases)" }}
 {{- end }}
 {{- printf "%s:%s" .Values.image.repository .Values.image.tag }}
 {{- end }}
@@ -35,7 +35,7 @@ stated explicitly rather than implied.
 Namespace of the ArgoCD instance this release serves. All generated cluster
 Secrets go here, and the daemon needs one Role there.
 */}}
-{{- define "r2a-cert-sync.argocdNamespace" -}}
+{{- define "k2a-token-sync.argocdNamespace" -}}
 {{- .Values.argocdNamespace | default "argocd" }}
 {{- end }}
 
@@ -43,7 +43,7 @@ Secrets go here, and the daemon needs one Role there.
 Validates cluster entries early, so a typo fails at render time rather than in
 the daemon's crash loop. The daemon revalidates everything itself.
 */}}
-{{- define "r2a-cert-sync.validate" -}}
+{{- define "k2a-token-sync.validate" -}}
 {{- $needsRancher := false }}
 {{- $secretNames := list }}
 {{- range $i, $c := .Values.clusters }}

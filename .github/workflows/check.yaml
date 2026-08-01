@@ -80,14 +80,14 @@ jobs:
         uses: azure/setup-helm@v5
 
       - name: helm lint
-        run: helm lint charts/r2a-cert-sync --set "image.tag=${TAG}"
+        run: helm lint charts/k2a-token-sync --set "image.tag=${TAG}"
 
       # image.tag is required; rendering without one must fail rather than
       # silently produce an image reference ending in a colon.
       - name: helm template rejects a missing image.tag
         run: |
-          if helm template r2a-cert-sync charts/r2a-cert-sync \
-               --namespace r2a-cert-sync > /dev/null 2>&1; then
+          if helm template k2a-token-sync charts/k2a-token-sync \
+               --namespace k2a-token-sync > /dev/null 2>&1; then
             echo "::error::rendering succeeded without image.tag"
             exit 1
           fi
@@ -96,10 +96,10 @@ jobs:
       # here rather than at deploy time.
       - name: helm template
         run: |
-          helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync --set "image.tag=${TAG}" > /dev/null
-          helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync --set "image.tag=${TAG}" \
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" > /dev/null
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" \
             --set rancher.url=https://rancher.example.com \
             --set 'clusters[0].name=downstream-1' \
             --set 'clusters[0].endpoint=10.0.0.10' \
@@ -108,7 +108,7 @@ jobs:
             --set 'clusters[1].provider=direct' \
             --set 'clusters[1].endpoint=10.1.0.10' > /dev/null
           # Deploying into ArgoCD's own namespace must not render a duplicate Role.
-          helm template r2a-cert-sync charts/r2a-cert-sync \
+          helm template k2a-token-sync charts/k2a-token-sync \
             --namespace argocd --set "image.tag=${TAG}" \
             --set 'clusters[0].name=standalone-1' \
             --set 'clusters[0].provider=direct' \

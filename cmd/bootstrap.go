@@ -11,9 +11,9 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/config"
-	kubeclient "github.com/krisiasty/r2a-cert-sync/internal/k8s"
-	"github.com/krisiasty/r2a-cert-sync/internal/reconcile"
+	"github.com/krisiasty/k2a-token-sync/internal/config"
+	kubeclient "github.com/krisiasty/k2a-token-sync/internal/k8s"
+	"github.com/krisiasty/k2a-token-sync/internal/reconcile"
 )
 
 const bootstrapTimeout = 2 * time.Minute
@@ -39,15 +39,15 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 		downstreamKube = fs.String("kubeconfig", "", "path to the kubeconfig holding --context (default: normal kubeconfig resolution)")
 		localCtx       = fs.String("argocd-context", "", "kubeconfig context of the cluster running ArgoCD and this daemon (default: current context)")
 		localKube      = fs.String("argocd-kubeconfig", "", "path to the kubeconfig holding --argocd-context")
-		namespace      = fs.String("namespace", "r2a-cert-sync", "namespace the daemon runs in; the credential secret is written here")
+		namespace      = fs.String("namespace", "k2a-token-sync", "namespace the daemon runs in; the credential secret is written here")
 		saName         = fs.String("serviceaccount", "argocd-manager", "downstream ServiceAccount ArgoCD authenticates as")
 		saNamespace    = fs.String("serviceaccount-namespace", "kube-system", "namespace for the downstream ServiceAccounts")
-		agentSAName    = fs.String("agent-serviceaccount", "r2a-cert-sync", "downstream ServiceAccount the daemon authenticates as")
+		agentSAName    = fs.String("agent-serviceaccount", "k2a-token-sync", "downstream ServiceAccount the daemon authenticates as")
 		dryRun         = fs.Bool("dry-run", false, "report what would be done without changing anything")
 	)
 
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `Usage: r2a-cert-sync bootstrap --cluster NAME --endpoint HOST[:PORT] --context CTX [flags]
+		fmt.Fprint(os.Stderr, `Usage: k2a-token-sync bootstrap --cluster NAME --endpoint HOST[:PORT] --context CTX [flags]
 
 Provisions a standalone RKE2 cluster so the daemon can maintain its ArgoCD
 registration without Rancher. Installs two downstream identities — one for
@@ -132,8 +132,8 @@ Flags:
 
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), creds,
 		map[string]string{
-			"app.kubernetes.io/managed-by": "r2a-cert-sync",
-			"r2a-cert-sync.io/cluster":     cluster.Name,
+			"app.kubernetes.io/managed-by": "k2a-token-sync",
+			"k2a-token-sync.io/cluster":     cluster.Name,
 		}); err != nil {
 		return fmt.Errorf("writing credential secret: %w", err)
 	}

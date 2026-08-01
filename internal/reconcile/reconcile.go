@@ -19,11 +19,11 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/argocd"
-	"github.com/krisiasty/r2a-cert-sync/internal/config"
-	"github.com/krisiasty/r2a-cert-sync/internal/downstream"
-	"github.com/krisiasty/r2a-cert-sync/internal/k8s"
-	"github.com/krisiasty/r2a-cert-sync/internal/rancher"
+	"github.com/krisiasty/k2a-token-sync/internal/argocd"
+	"github.com/krisiasty/k2a-token-sync/internal/config"
+	"github.com/krisiasty/k2a-token-sync/internal/downstream"
+	"github.com/krisiasty/k2a-token-sync/internal/k8s"
+	"github.com/krisiasty/k2a-token-sync/internal/rancher"
 )
 
 // clientTimeout bounds any single downstream API call.
@@ -464,7 +464,7 @@ func (r *Reconciler) directAccess(ctx context.Context, cluster config.Cluster, l
 	// bootstrap material for the daemon to use once, here.
 	if cluster.BootstrapSecret.Name == "" {
 		return nil, fmt.Errorf("cluster %q has no credential in %s/%s and no bootstrapSecret is configured; "+
-			"run 'r2a-cert-sync bootstrap --cluster %s --endpoint %s --context <kubeconfig-context>', "+
+			"run 'k2a-token-sync bootstrap --cluster %s --endpoint %s --context <kubeconfig-context>', "+
 			"or set bootstrapSecret to a secret holding a kubeconfig or token for the cluster",
 			cluster.Name, r.cfg.Namespace, cluster.CredentialsSecretName(), cluster.Name, cluster.Endpoint)
 	}
@@ -484,8 +484,8 @@ func (r *Reconciler) directAccess(ctx context.Context, cluster config.Cluster, l
 
 	if err := k8s.WriteCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName(),
 		provisioned, map[string]string{
-			"app.kubernetes.io/managed-by": "r2a-cert-sync",
-			"r2a-cert-sync.io/cluster":     cluster.Name,
+			"app.kubernetes.io/managed-by": "k2a-token-sync",
+			"k2a-token-sync.io/cluster":     cluster.Name,
 		}); err != nil {
 		return nil, fmt.Errorf("storing provisioned credential: %w", err)
 	}
@@ -538,7 +538,7 @@ func (r *Reconciler) bootstrapClient(ctx context.Context, cluster config.Cluster
 	if err != nil {
 		if errors.Is(err, k8s.ErrNotFound) {
 			return nil, fmt.Errorf("cluster %q has no stored credential and its bootstrap secret %s/%s is missing; "+
-				"run 'r2a-cert-sync bootstrap --cluster %s' or create the secret manually: %w",
+				"run 'k2a-token-sync bootstrap --cluster %s' or create the secret manually: %w",
 				cluster.Name, r.cfg.Namespace, cluster.BootstrapSecret.Name, cluster.Name, err)
 		}
 		return nil, err

@@ -19,7 +19,7 @@ func TestShippedExampleConfigIsValid(t *testing.T) {
 	}
 
 	t.Setenv("CONFIG_PATH", path)
-	t.Setenv("POD_NAMESPACE", "r2a-cert-sync")
+	t.Setenv("POD_NAMESPACE", "k2a-token-sync")
 
 	cfg, err := Load(discardLogger())
 	if err != nil {

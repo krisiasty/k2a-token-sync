@@ -1,12 +1,12 @@
-{{- $name := include "r2a-cert-sync.name" . }}
-{{- $argocdNamespace := include "r2a-cert-sync.argocdNamespace" . }}
+{{- $name := include "k2a-token-sync.name" . }}
+{{- $argocdNamespace := include "k2a-token-sync.argocdNamespace" . }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
@@ -21,7 +21,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -33,7 +33,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -54,7 +54,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ $argocdNamespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
@@ -75,7 +75,7 @@ metadata:
   name: {{ $name }}
   namespace: {{ $argocdNamespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

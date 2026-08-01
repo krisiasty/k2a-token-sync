@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/reconcile"
+	"github.com/krisiasty/k2a-token-sync/internal/reconcile"
 )
 
 // healthState tracks the reconciliation loop for the probe endpoints.

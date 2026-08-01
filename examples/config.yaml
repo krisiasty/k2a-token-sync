@@ -1,6 +1,6 @@
 # Example cluster inventory.
 #
-# This is the file the daemon reads (CONFIG_PATH, /etc/r2a-cert-sync/config.yaml
+# This is the file the daemon reads (CONFIG_PATH, /etc/k2a-token-sync/config.yaml
 # by default). With the Helm chart you do not write it by hand — the chart
 # renders it into a ConfigMap from the `clusters` list in your values, and
 # derives the RBAC from the same list. This file documents the resulting format,
@@ -42,7 +42,7 @@ clusters:
     autoRotate: false         # true lets the daemon restart the control plane
 
   # Standalone RKE2: bootstrap once with
-  #   r2a-cert-sync bootstrap --cluster standalone-1 \
+  #   k2a-token-sync bootstrap --cluster standalone-1 \
   #     --endpoint 10.1.0.10 --context standalone-1
   # after which no bootstrapSecret is needed. Alternatively, supply
   # bootstrap material and let the daemon do it on first contact:

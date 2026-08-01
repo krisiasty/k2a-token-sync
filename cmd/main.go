@@ -1,4 +1,4 @@
-// Command r2a-cert-sync keeps ArgoCD's registrations for downstream RKE2
+// Command k2a-token-sync keeps ArgoCD's registrations for downstream RKE2
 // clusters valid, bypassing the Rancher proxy on the GitOps request path.
 package main
 
@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/config"
-	kubeclient "github.com/krisiasty/r2a-cert-sync/internal/k8s"
-	"github.com/krisiasty/r2a-cert-sync/internal/reconcile"
+	"github.com/krisiasty/k2a-token-sync/internal/config"
+	kubeclient "github.com/krisiasty/k2a-token-sync/internal/k8s"
+	"github.com/krisiasty/k2a-token-sync/internal/reconcile"
 )
 
 const (
@@ -95,14 +95,14 @@ func runSubcommand(logger *slog.Logger, name string, args []string) error {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `r2a-cert-sync — keeps ArgoCD's downstream RKE2 cluster registrations valid.
+	fmt.Fprint(os.Stderr, `k2a-token-sync — keeps ArgoCD's downstream RKE2 cluster registrations valid.
 
 Usage:
-  r2a-cert-sync                 run the reconciliation daemon (default)
-  r2a-cert-sync bootstrap ...   provision a standalone cluster for the daemon
-  r2a-cert-sync version         print version information
+  k2a-token-sync                 run the reconciliation daemon (default)
+  k2a-token-sync bootstrap ...   provision a standalone cluster for the daemon
+  k2a-token-sync version         print version information
 
-Run 'r2a-cert-sync bootstrap --help' for bootstrap options.
+Run 'k2a-token-sync bootstrap --help' for bootstrap options.
 `)
 }
 
@@ -133,7 +133,7 @@ func runDaemon(logger *slog.Logger) error {
 		runHealthServer(ctx, logger, cfg.HealthPort, state, stop)
 	})
 
-	logger.Info("starting r2a-cert-sync",
+	logger.Info("starting k2a-token-sync",
 		"version", versionString(),
 		"namespace", cfg.Namespace,
 		"clusters", len(cfg.Clusters),

@@ -10,7 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/krisiasty/r2a-cert-sync/internal/config"
+	"github.com/krisiasty/k2a-token-sync/internal/config"
 )
 
 func TestResultSoonestTokenExpiry(t *testing.T) {

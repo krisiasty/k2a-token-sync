@@ -1,15 +1,15 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "r2a-cert-sync.name" . }}
+  name: {{ include "k2a-token-sync.name" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "r2a-cert-sync.selectorLabels" . | nindent 6 }}
+      {{- include "k2a-token-sync.selectorLabels" . | nindent 6 }}
   # Recreate, not RollingUpdate: two instances reconciling the same clusters
   # would race to mint and publish credentials.
   strategy:
@@ -24,19 +24,19 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "r2a-cert-sync.labels" . | nindent 8 }}
+        {{- include "k2a-token-sync.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "r2a-cert-sync.name" . }}
+      serviceAccountName: {{ include "k2a-token-sync.name" . }}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: r2a-cert-sync
-          image: {{ include "r2a-cert-sync.image" . }}
+        - name: k2a-token-sync
+          image: {{ include "k2a-token-sync.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: POD_NAMESPACE
@@ -44,7 +44,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: CONFIG_PATH
-              value: /etc/r2a-cert-sync/config.yaml
+              value: /etc/k2a-token-sync/config.yaml
             - name: HEALTH_PORT
               value: {{ .Values.health.port | quote }}
           ports:
@@ -53,7 +53,7 @@ spec:
               protocol: TCP
           volumeMounts:
             - name: config
-              mountPath: /etc/r2a-cert-sync
+              mountPath: /etc/k2a-token-sync
               readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
@@ -81,7 +81,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: {{ include "r2a-cert-sync.name" . }}
+            name: {{ include "k2a-token-sync.name" . }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
