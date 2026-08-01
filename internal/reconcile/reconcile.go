@@ -203,7 +203,11 @@ func (r *Reconciler) reconcile(
 	}
 
 	recordFingerprint(status, desired.Fingerprint())
-	status.LastAction = string(reason)
+	// The reason alone would read as a state rather than an action: "cluster secret
+	// does not exist" is not what the pass did, and it is untrue by the time it is
+	// recorded. Naming the action keeps the field consistent with "up-to-date" and
+	// "failed", and the reason stays as the cause.
+	status.LastAction = "reissued the credential: " + string(reason)
 	logger.Info("credential reissued",
 		"reason", string(reason),
 		"token_expires_at", token.ExpiresAt.UTC().Format(time.RFC3339),

@@ -106,11 +106,20 @@ func TestMintTokenUsesServerReportedExpiry(t *testing.T) {
 	// so the granted expiry — not the requested TTL — must drive scheduling.
 	granted := time.Now().Add(1 * time.Hour).UTC().Truncate(time.Second)
 
+	var requested int64
 	client := fake.NewSimpleClientset()
 	client.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		create, ok := action.(k8stesting.CreateAction)
 		if !ok || create.GetSubresource() != "token" {
 			return false, nil, nil
+		}
+		// The request itself is inspected, not just answered. A reactor that only
+		// returns a canned response accepts any request, which is how a token asking
+		// for expirationSeconds: 0 reached a real API server.
+		if req, isRequest := create.GetObject().(*authenticationv1.TokenRequest); isRequest {
+			if req.Spec.ExpirationSeconds != nil {
+				requested = *req.Spec.ExpirationSeconds
+			}
 		}
 		return true, &authenticationv1.TokenRequest{
 			Status: authenticationv1.TokenRequestStatus{
@@ -129,6 +138,24 @@ func TestMintTokenUsesServerReportedExpiry(t *testing.T) {
 	}
 	if !token.ExpiresAt.Equal(granted) {
 		t.Errorf("ExpiresAt = %v, want the server-reported %v", token.ExpiresAt, granted)
+	}
+	if want := int64((720 * time.Hour).Seconds()); requested != want {
+		t.Errorf("requested expirationSeconds = %d, want %d", requested, want)
+	}
+}
+
+func TestMintTokenRefusesAnUnsetLifetime(t *testing.T) {
+	t.Parallel()
+
+	// A zero TTL is a caller that forgot to set one. The API server's own complaint
+	// — "may not specify a duration less than 10 minutes" — reads like a cluster
+	// misconfiguration, so it is caught here and named for what it is.
+	_, err := MintToken(context.Background(), fake.NewSimpleClientset(), "kube-system", "argocd-manager", 0)
+	if err == nil {
+		t.Fatal("MintToken accepted a zero lifetime")
+	}
+	if !strings.Contains(err.Error(), "never set") {
+		t.Errorf("the error does not say the lifetime was unset: %v", err)
 	}
 }
 

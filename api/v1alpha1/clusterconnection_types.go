@@ -44,8 +44,12 @@ const (
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.spec.endpoint`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
-// +kubebuilder:printcolumn:name="Token Expires",type=date,JSONPath=`.status.tokenExpiresAt`
-// +kubebuilder:printcolumn:name="Self Expires",type=date,JSONPath=`.status.selfCredentialExpiresAt`
+// A date column is rendered by kubectl as time *elapsed*, which is negative for
+// anything in the future and prints as "<invalid>". Both of these are expiries,
+// so they are strings and show the timestamp itself. Age below is a real date
+// column, and correct as one.
+// +kubebuilder:printcolumn:name="Token Expires",type=string,JSONPath=`.status.tokenExpiresAt`
+// +kubebuilder:printcolumn:name="Self Expires",type=string,JSONPath=`.status.selfCredentialExpiresAt`
 // +kubebuilder:printcolumn:name="Cert Days",type=integer,JSONPath=`.status.servingCertDaysRemaining`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type ClusterConnection struct {

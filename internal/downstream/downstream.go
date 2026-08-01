@@ -156,6 +156,15 @@ func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, name
 // (--service-account-max-token-expiration), so the returned expiry is the
 // authoritative one and callers must schedule against it rather than the request.
 func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name string, ttl time.Duration) (*Token, error) {
+	// A zero TTL means a caller left the field unset, since no configuration path
+	// can produce one. The API server rejects it as "may not specify a duration
+	// less than 10 minutes", which sends whoever reads that towards the cluster
+	// rather than towards the bug.
+	if ttl <= 0 {
+		return nil, fmt.Errorf("refusing to mint a token for %s/%s with a lifetime of %s: "+
+			"the requested lifetime was never set", namespace, name, ttl)
+	}
+
 	request := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
 			// ExpirationSeconds is a *int64 so the field can be left unset;
