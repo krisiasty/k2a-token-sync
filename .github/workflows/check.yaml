@@ -34,6 +34,17 @@ jobs:
       - name: go mod verify
         run: go mod verify
 
+      # The CRD schema is generated from api/v1alpha1, so a field added to the
+      # Go types without regenerating would be pruned by the API server rather
+      # than reported. Same idea as the go mod tidy check above.
+      - name: crd schema is current
+        run: |
+          ./hack/gen-crd.sh
+          git diff --exit-code -- charts/k2a-token-sync/crds
+
+      - name: shellcheck
+        run: shellcheck hack/*.sh
+
       - name: go build
         run: go build ./...
 
@@ -98,6 +109,10 @@ jobs:
         run: |
           helm template k2a-token-sync charts/k2a-token-sync \
             --namespace k2a-token-sync --set "image.tag=${TAG}" > /dev/null
+          # Helm skips crds/ unless asked, so a malformed generated CRD would
+          # otherwise only surface at install time.
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" --include-crds > /dev/null
           helm template k2a-token-sync charts/k2a-token-sync \
             --namespace k2a-token-sync --set "image.tag=${TAG}" \
             --set 'clusters[0].name=downstream-1' \

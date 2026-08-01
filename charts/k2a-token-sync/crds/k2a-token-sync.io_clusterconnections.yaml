@@ -1,0 +1,285 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: clusterconnections.k2a-token-sync.io
+spec:
+  group: k2a-token-sync.io
+  names:
+    categories:
+    - argocd
+    kind: ClusterConnection
+    listKind: ClusterConnectionList
+    plural: clusterconnections
+    shortNames:
+    - ccon
+    singular: clusterconnection
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.endpoint
+      name: Endpoint
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.tokenExpiresAt
+      name: Token Expires
+      type: date
+    - jsonPath: .status.agentCredentialExpiresAt
+      name: Agent Expires
+      type: date
+    - jsonPath: .status.servingCertDaysRemaining
+      name: Cert Days
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterConnection declares how to reach one downstream cluster, how to
+          authenticate to it, and how long the credentials it publishes should live.
+
+          Deleting one stops maintenance. It deliberately does not delete the generated
+          ArgoCD Secret: the daemon holds no delete permission in ArgoCD's namespace, so
+          removing that Secret stays an explicit operator action.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ClusterConnectionSpec is the desired registration.
+
+              The object's name is the cluster's name: it identifies the cluster in logs, in
+              the ArgoCD cluster list unless displayName overrides it, and in the names of
+              the Secrets derived from it.
+            properties:
+              agentServiceAccountName:
+                default: k2a-token-sync
+                description: |-
+                  AgentServiceAccountName is the downstream identity the daemon itself
+                  authenticates as, in the same namespace as ServiceAccount. It is narrowly
+                  scoped: it can mint tokens and read the cluster CA, nothing more.
+                type: string
+              agentTokenTTL:
+                default: 2160h
+                description: |-
+                  AgentTokenTTL is the lifetime requested for the daemon's own credential,
+                  renewed on every successful pass. It is therefore also the downtime
+                  budget: if the daemon does not run for this long, it locks itself out and
+                  the cluster must be bootstrapped again.
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
+              annotations:
+                additionalProperties:
+                  type: string
+                type: object
+              displayName:
+                description: DisplayName is the name ArgoCD shows. Defaults to the
+                  object's name.
+                type: string
+              endpoint:
+                description: |-
+                  Endpoint is the address ArgoCD connects to, as "host" or "host:port".
+                  Port 6443 is assumed when omitted. This must be an address that bypasses
+                  any management-plane proxy, and it must appear in the API server's
+                  serving-certificate SANs — the daemon refuses to publish a registration
+                  whose certificate does not cover it.
+                minLength: 1
+                pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?(:[0-9]{1,5})?$
+                type: string
+              expiryWarnThreshold:
+                default: 2160h
+                description: |-
+                  ExpiryWarnThreshold is the remaining serving-certificate lifetime below
+                  which the daemon starts warning.
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
+              labels:
+                additionalProperties:
+                  type: string
+                description: Labels and Annotations are merged into the generated
+                  ArgoCD Secret.
+                type: object
+              project:
+                description: Project optionally scopes the cluster to a single ArgoCD
+                  project.
+                type: string
+              secretName:
+                description: |-
+                  SecretName is the ArgoCD cluster Secret this connection maintains, in the
+                  namespace the daemon serves. Defaults to "cluster-<name>".
+
+                  The cluster- prefix is required rather than conventional. The daemon holds
+                  namespace-wide patch on Secrets in ArgoCD's namespace, because cluster
+                  names are not known when its RBAC is created and RBAC cannot scope by
+                  prefix. The prefix is what keeps a connection from being pointed at
+                  ArgoCD's own Secrets.
+                pattern: ^cluster-[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
+              serviceAccount:
+                default:
+                  name: argocd-manager
+                  namespace: kube-system
+                description: |-
+                  ServiceAccount is the downstream identity ArgoCD authenticates as. The
+                  default matches what `argocd cluster add` installs, so an existing
+                  registration can be taken over without touching the cluster.
+                properties:
+                  name:
+                    default: argocd-manager
+                    type: string
+                  namespace:
+                    default: kube-system
+                    type: string
+                type: object
+              tokenTTL:
+                default: 720h
+                description: |-
+                  TokenTTL is the lifetime requested for ArgoCD's credential, reissued at
+                  half life. The API server may cap it; the granted lifetime is what the
+                  daemon schedules against, and a shortened one is reported.
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
+            required:
+            - endpoint
+            type: object
+          status:
+            description: |-
+              ClusterConnectionStatus is what the daemon observed and published.
+
+              It is also the daemon's memory. Holding no read permission on Secrets in
+              ArgoCD's namespace, it cannot inspect what it published, so the applied
+              fingerprint below is how drift is detected on the next pass.
+            properties:
+              agentCredentialExpiresAt:
+                description: |-
+                  AgentCredentialExpiresAt is when the daemon's own credential expires, and
+                  so when it would lock itself out if it stopped running.
+                format: date-time
+                type: string
+              appliedCAHash:
+                type: string
+              appliedDisplayName:
+                type: string
+              appliedProject:
+                type: string
+              appliedServer:
+                description: |-
+                  AppliedServer, AppliedDisplayName, AppliedProject and AppliedCAHash are
+                  the fingerprint of what was last written to the ArgoCD Secret. Comparing
+                  them with the desired values detects drift without reading the Secret
+                  back. An empty fingerprint means "reissue", which is the safe default
+                  after a status loss.
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastAction:
+                description: |-
+                  LastAction records what the last pass did — reissued a credential, found
+                  the registration current, or failed.
+                type: string
+              lastSyncTime:
+                format: date-time
+                type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec generation this status describes. A
+                  generation ahead of it means the object was edited and is due immediately.
+                format: int64
+                type: integer
+              secret:
+                description: Secret is the generated ArgoCD cluster Secret, as namespace/name.
+                type: string
+              servingCertDaysRemaining:
+                format: int32
+                type: integer
+              servingCertExpiresAt:
+                format: date-time
+                type: string
+              tokenExpiresAt:
+                description: TokenExpiresAt is when ArgoCD's credential expires.
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
