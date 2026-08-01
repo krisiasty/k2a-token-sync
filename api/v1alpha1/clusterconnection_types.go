@@ -28,6 +28,7 @@ const (
 	ReasonCredentialExpired   = "CredentialExpired" //nolint:gosec // a condition reason, not a credential
 	ReasonEndpointUnreachable = "EndpointUnreachable"
 	ReasonCertificateInvalid  = "CertificateInvalid"
+	ReasonCredentialRejected  = "CredentialRejected" //nolint:gosec // a condition reason, not a credential
 	ReasonSecretNameConflict  = "SecretNameConflict"
 	ReasonInvalidSpec         = "InvalidSpec"
 )

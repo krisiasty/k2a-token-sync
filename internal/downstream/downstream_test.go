@@ -7,8 +7,10 @@ import (
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -267,5 +269,108 @@ func TestEnsureSelfIdentityGrantsOnlyWhatIsNeeded(t *testing.T) {
 	// Idempotent: this runs on the bootstrap path and must tolerate re-runs.
 	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
 		t.Fatalf("second EnsureSelfIdentity returned unexpected error: %v", err)
+	}
+}
+
+// A freshly minted token is proof of nothing until it is used. This is the one
+// call that exercises endpoint, CA, token and RBAC together, so what it reports
+// has to be exact: an unauthenticated token must surface as an error, and an
+// authenticated but unauthorised one must not.
+func TestCanActAsClusterAdmin(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		allowed     bool
+		apiErr      error
+		want        bool
+		wantErr     bool
+		errContains string
+	}{
+		{
+			name:    "cluster-admin",
+			allowed: true,
+			want:    true,
+		},
+		{
+			// The dangling-binding case: the token is real and the API server
+			// accepted it, but the role behind it grants nothing.
+			name:    "authenticated but not authorised",
+			allowed: false,
+			want:    false,
+		},
+		{
+			// A rejected token is not a false answer, it is no answer.
+			name:        "token refused",
+			apiErr:      apierrors.NewUnauthorized("Unauthorized"),
+			wantErr:     true,
+			errContains: "what this credential may do",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := fake.NewSimpleClientset()
+			client.PrependReactor("create", "selfsubjectaccessreviews",
+				func(k8stesting.Action) (bool, runtime.Object, error) {
+					if tc.apiErr != nil {
+						return true, nil, tc.apiErr
+					}
+					return true, &authorizationv1.SelfSubjectAccessReview{
+						Status: authorizationv1.SubjectAccessReviewStatus{Allowed: tc.allowed},
+					}, nil
+				})
+
+			got, err := CanActAsClusterAdmin(context.Background(), client)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("CanActAsClusterAdmin accepted a refused token")
+				}
+				if !strings.Contains(err.Error(), tc.errContains) {
+					t.Errorf("error does not say what was being attempted: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CanActAsClusterAdmin returned unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("allowed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The review must ask about everything, since that is the permission ArgoCD's
+// identity is supposed to hold and the one a dangling binding no longer grants.
+func TestCanActAsClusterAdminAsksTheBroadestQuestion(t *testing.T) {
+	t.Parallel()
+
+	var asked *authorizationv1.ResourceAttributes
+	client := fake.NewSimpleClientset()
+	client.PrependReactor("create", "selfsubjectaccessreviews",
+		func(action k8stesting.Action) (bool, runtime.Object, error) {
+			create, ok := action.(k8stesting.CreateAction)
+			if !ok {
+				return false, nil, nil
+			}
+			if review, isReview := create.GetObject().(*authorizationv1.SelfSubjectAccessReview); isReview {
+				asked = review.Spec.ResourceAttributes
+			}
+			return true, &authorizationv1.SelfSubjectAccessReview{
+				Status: authorizationv1.SubjectAccessReviewStatus{Allowed: true},
+			}, nil
+		})
+
+	if _, err := CanActAsClusterAdmin(context.Background(), client); err != nil {
+		t.Fatalf("CanActAsClusterAdmin returned unexpected error: %v", err)
+	}
+	if asked == nil {
+		t.Fatal("no resource attributes were sent")
+	}
+	if asked.Verb != "*" || asked.Group != "*" || asked.Resource != "*" {
+		t.Errorf("asked about %+v, want every verb on every resource in every group", asked)
 	}
 }

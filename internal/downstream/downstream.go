@@ -14,6 +14,7 @@ import (
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -211,6 +212,37 @@ func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name
 		Value:     result.Status.Token,
 		ExpiresAt: result.Status.ExpirationTimestamp.Time,
 	}, nil
+}
+
+// CanActAsClusterAdmin asks the API server what the caller may do, using the
+// caller's own credential.
+//
+// A SelfSubjectAccessReview needs no permission of its own — every authenticated
+// identity may ask about itself — which is what makes it usable as a proof that a
+// freshly minted token works. Two separate facts come out of one call: that the
+// request was authenticated at all, which is the error return, and what the
+// identity is authorised for, which is the boolean.
+//
+// The question asked is deliberately the broadest one. ArgoCD's identity is bound
+// to cluster-admin and applies arbitrary manifests, so "may I do anything to
+// anything" is precisely the permission it is supposed to hold, and the one a
+// binding left dangling by a deleted ClusterRole would no longer grant.
+func CanActAsClusterAdmin(ctx context.Context, client kubernetes.Interface) (bool, error) {
+	review := &authorizationv1.SelfSubjectAccessReview{
+		Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+			ResourceAttributes: &authorizationv1.ResourceAttributes{
+				Verb:     "*",
+				Group:    "*",
+				Resource: "*",
+			},
+		},
+	}
+
+	result, err := client.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
+	if err != nil {
+		return false, fmt.Errorf("asking the API server what this credential may do: %w", err)
+	}
+	return result.Status.Allowed, nil
 }
 
 // selfRules are the only permissions k2a-token-sync needs in a downstream cluster

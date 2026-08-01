@@ -71,7 +71,9 @@ so the great majority of passes stop there, having written nothing at all. When 
 
 1. Mints a bound token via the TokenRequest API for that identity — the same one `argocd cluster add` installs —
    honouring whatever lifetime the API server grants.
-2. Writes the credential, then re-applies the registration. That order means ArgoCD never sees a cluster it cannot
+2. Uses that token, against that endpoint, with that CA bundle, to ask the API server what it is allowed to do. This
+   is the only check that exercises all four together, which is what ArgoCD depends on.
+3. Writes the credential, then re-applies the registration. That order means ArgoCD never sees a cluster it cannot
    authenticate to, not even briefly between two applies. It re-reads cluster Secrets on every reconcile, so credentials
    swap with no restart of any ArgoCD component.
 
@@ -580,8 +582,11 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
   actually granted rather than what was asked for, so a capped cluster works; it just has a shorter downtime budget.
 - k2a-token-sync cannot detect a generated Secret left behind by a cluster removed while it was down, because it holds no
   `list` permission in ArgoCD's namespace. Cleanup is a documented step.
-- ArgoCD's credential is never exercised. Its validity is inferred from the TokenRequest API having issued it, and from
-  the identity behind it still existing, which is checked every pass. What cannot be checked from here is the request
-  path itself: whether ArgoCD, from where it runs, can reach the endpoint and authenticate. Nothing on the control path
-  observes that.
+- ArgoCD's credential is exercised when it is minted, never afterwards. Holding no read access in ArgoCD's namespace,
+  k2a-token-sync cannot recover a published token to re-test it — that is the same restriction that makes the design
+  safe, and it is not worth trading away. Later breakage is caught indirectly instead, by checking the identity behind
+  the token on every pass.
+- Whether ArgoCD itself can reach an endpoint is not observable from here. The verification above runs from
+  k2a-token-sync's pod, which is usually the same network path but not necessarily: NetworkPolicies, egress rules or a
+  service mesh can differ between workloads in the same cluster.
 - No metrics endpoint. `/status` and the objects' own status carry the same information for now.
