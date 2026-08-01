@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
@@ -144,20 +145,27 @@ Flags:
 	if err != nil {
 		return err
 	}
-	localClient, err := localClientFor(*kubeconfig, *kubeContext)
+	localClient, localCfg, err := localClientFor(*kubeconfig, *kubeContext)
 	if err != nil {
 		return err
 	}
 
+	// Output is grouped by cluster, because "where did that happen" is the first
+	// question a reader has when a command touches two of them. Each heading names
+	// its cluster once and the steps beneath it inherit the location.
 	out.headingf("Bootstrapping %s", cluster.Name)
-	out.stepf("downstream cluster", "%s", downstreamCfg.Host)
-	out.stepf("ArgoCD endpoint", "%s", cluster.ServerURL())
 	out.blank()
+	out.headingf("Downstream cluster — %s", cluster.Name)
+	out.stepf("reached via", "%s", downstreamCfg.Host)
+	out.stepf("ArgoCD endpoint", "%s", cluster.ServerURL())
 
 	if *dryRun {
 		out.stepf("identities", "would create %s and %s",
 			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
 			cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
+		out.blank()
+		out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
+		out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
 		out.stepf("credential", "would write %s", *namespace+"/"+cluster.CredentialsSecretName())
 		out.stepf("registration", "would apply %s", *namespace+"/"+cluster.Name)
 		out.blank()
@@ -184,6 +192,21 @@ Flags:
 		cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
 		cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
 
+	// Prove the path ArgoCD will use, with the credential just minted, before
+	// storing it. Reported here because it is the downstream endpoint being tested;
+	// a failure is a warning, since the endpoint may be reachable from the cluster
+	// k2a-token-sync runs on but not from wherever this is being run.
+	if err := verifyCredential(ctx, cluster, provisioned); err != nil {
+		out.warnf("could not reach the endpoint with the new credential from here: %v", err)
+		out.warnf("k2a-token-sync may still succeed if it can reach the endpoint")
+	} else {
+		out.stepf("verified", "the new credential works against the endpoint")
+	}
+
+	out.blank()
+	out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
+	out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
+
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), provisioned,
 		map[string]string{
 			"app.kubernetes.io/managed-by": "k2a-token-sync",
@@ -195,19 +218,10 @@ Flags:
 		*namespace+"/"+cluster.CredentialsSecretName(),
 		provisioned.ExpiresAt.UTC().Format(time.DateOnly))
 
-	// Prove the whole path ArgoCD will use, with the credential just stored. A
-	// failure here is a warning: the endpoint may be reachable from the cluster
-	// k2a-token-sync runs on but not from wherever this is being run.
-	if err := verifyCredential(ctx, cluster, provisioned); err != nil {
-		out.warnf("could not reach %s with the new credential from here: %v", cluster.Endpoint, err)
-		out.warnf("k2a-token-sync may still succeed if it can reach the endpoint")
-	} else {
-		out.stepf("verified", "the credential works against the ArgoCD endpoint")
-	}
-
 	if *printOnly {
 		out.blank()
-		out.notef("Apply or commit the manifest below to put %s into service.", cluster.Name)
+		out.notef("Apply or commit the manifest below, to %s, to put %s into service.",
+			describeCluster(*kubeContext, localCfg.Host), cluster.Name)
 		out.blank()
 		return printConnection(cluster, *namespace)
 	}
@@ -257,6 +271,15 @@ func (s *steps) notef(format string, args ...any) {
 
 func (s *steps) blank() {
 	_, _ = fmt.Fprintln(s.w)
+}
+
+// sameClusterNote calls out the case where both clusters are one — registering the
+// cluster ArgoCD itself runs on. Without it the reader sees the same address twice
+// and has to work out whether that is a mistake.
+func (s *steps) sameClusterNote(downstreamHost, localHost string) {
+	if downstreamHost == localHost {
+		s.stepf("note", "the same cluster as above")
+	}
 }
 
 // preflight checks that the endpoint ArgoCD will use presents a certificate that
@@ -373,10 +396,31 @@ func applyConnection(ctx context.Context, cluster config.Cluster, namespace, kub
 // localClientFor builds a client for the cluster running ArgoCD and k2a-token-sync.
 // With no explicit context it falls back to normal kubeconfig resolution, which
 // also covers running this inside that cluster.
-func localClientFor(kubeconfig, contextName string) (kubernetes.Interface, error) {
+//
+// The rest.Config comes back so the cluster can be named in the output: a command
+// that writes to two clusters should say which one each step touched.
+func localClientFor(kubeconfig, contextName string) (kubernetes.Interface, *rest.Config, error) {
 	if kubeconfig == "" && contextName == "" {
-		return kubeclient.NewClient()
+		cfg, err := kubeclient.LocalRESTConfig()
+		if err != nil {
+			return nil, nil, err
+		}
+		client, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("creating kubernetes client: %w", err)
+		}
+		return client, cfg, nil
 	}
-	client, _, err := kubeclient.ClientForContext(kubeconfig, contextName)
-	return client, err
+	return kubeclient.ClientForContext(kubeconfig, contextName)
+}
+
+// describeCluster names a cluster the way its operator would recognise it: by
+// context when one was given, since that is what they typed, with the server
+// address for confirmation. In-cluster there is no context, so the address stands
+// alone.
+func describeCluster(contextName, host string) string {
+	if contextName == "" {
+		return host
+	}
+	return fmt.Sprintf("context %s (%s)", contextName, host)
 }
