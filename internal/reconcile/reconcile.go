@@ -236,6 +236,18 @@ func (r *Reconciler) reconcile(
 			"hint", "raise --service-account-max-token-expiration on the downstream API server, or lower tokenTTL")
 	}
 
+	// Prove the credential before publishing it, exactly as bootstrap and
+	// self-renewal do for the tool's own. Every part of this has been checked
+	// separately by now — the endpoint's certificate against this CA, the identity
+	// existing, the API server issuing a token for it — but never the composition,
+	// and it is the composition ArgoCD depends on.
+	//
+	// The CA passed here is the bundle about to be published, so this connects the
+	// way ArgoCD will, not the way this tool happens to be configured.
+	if err := r.verifyForArgoCD(ctx, cluster, token.Value, ca, logger); err != nil {
+		return err
+	}
+
 	desired.BearerToken = token.Value
 	desired.TokenExpiresAt = token.ExpiresAt
 	desired.TokenIssuedAt = now
@@ -317,6 +329,8 @@ func reasonFor(err error) string {
 		return v1alpha1.ReasonCredentialExpired
 	case errors.Is(err, errCertificateInvalid):
 		return v1alpha1.ReasonCertificateInvalid
+	case errors.Is(err, errCredentialRejected):
+		return v1alpha1.ReasonCredentialRejected
 	default:
 		return v1alpha1.ReasonEndpointUnreachable
 	}
@@ -334,6 +348,12 @@ var (
 	// errCertificateInvalid means the endpoint's certificate cannot work for
 	// ArgoCD, whatever the credential.
 	errCertificateInvalid = errors.New("serving certificate unusable")
+
+	// errCredentialRejected means a credential this tool just minted was refused by
+	// the API server it was minted against. It gets a reason of its own because the
+	// obvious alternative, EndpointUnreachable, would be actively misleading: the
+	// endpoint answered, and said no.
+	errCredentialRejected = errors.New("minted credential rejected")
 )
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.
@@ -479,6 +499,47 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 	}
 
 	return &k8s.Credentials{Token: token.Value, CA: ca, ExpiresAt: token.ExpiresAt}, nil
+}
+
+// verifyForArgoCD checks a freshly minted credential the way ArgoCD will use it.
+//
+// The two answers this produces are treated very differently, and deliberately so.
+//
+// Failing to authenticate is fatal. The call reaching the API server and coming
+// back rejected means the token is worthless, so publishing it would replace a
+// credential that may still work with one that certainly does not. The pass fails
+// instead, the previous credential stays where it is, and the object says why.
+//
+// Being authenticated but unauthorised is only a warning. It almost certainly
+// means the cluster-admin ClusterRole has been deleted or emptied, leaving the
+// binding dangling — worth shouting about, since ArgoCD will get 403s on
+// everything. But refusing to publish on that basis would be worse: authorisation
+// can involve webhooks and authorizers this tool knows nothing about, and a false
+// negative here would withhold a perfectly good credential and break the cluster
+// this is meant to protect.
+func (r *Reconciler) verifyForArgoCD(
+	ctx context.Context,
+	cluster config.Cluster,
+	token string,
+	ca []byte,
+	logger *slog.Logger,
+) error {
+	client, err := r.clientForToken(cluster.ServerURL(), token, ca)
+	if err != nil {
+		return fmt.Errorf("building a client for the new credential: %w", err)
+	}
+
+	allowed, err := downstream.CanActAsClusterAdmin(ctx, client)
+	if err != nil {
+		return fmt.Errorf("%w: the credential just minted for ArgoCD does not work against %s: %w",
+			errCredentialRejected, cluster.ServerURL(), err)
+	}
+	if !allowed {
+		logger.Warn("ArgoCD's credential authenticates but is not authorised; ArgoCD will get 403s",
+			"serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+			"hint", "check that the cluster-admin ClusterRole still exists and still grants what its name implies")
+	}
+	return nil
 }
 
 // selfCredentialDue reports whether k2a-token-sync's own credential is old enough
