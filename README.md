@@ -29,8 +29,8 @@ Two paths, and keeping them apart is the whole design:
   ArgoCD's token. It runs once a day.
 - **Request path** — ArgoCD connects straight to the cluster's own endpoint with the credential k2a-token-sync published.
 
-If k2a-token-sync is down, reconciliation pauses; ArgoCD keeps working. With the default 30-day token lifetime reissued at
-half life, k2a-token-sync can be down for a fortnight before anything degrades.
+If k2a-token-sync is down, reconciliation pauses; ArgoCD keeps working. With the default 30-day token lifetime
+reissued at half life, k2a-token-sync can be down for a fortnight before anything degrades.
 
 ```mermaid
 graph TD
@@ -97,9 +97,10 @@ Reusing ArgoCD's token for both would be simpler and worse. k2a-token-sync would
 permanently, and it would not even remove the permanence: a credential you can always renew *is* a permanent credential,
 with extra steps. What would change is only the blast radius, in the wrong direction.
 
-**Lifecycle.** Bootstrap creates both identities and mints the first token for its own. From then on k2a-token-sync mints ArgoCD's
-tokens and renews its own, verifying each replacement against the cluster before storing it — overwriting a working
-credential with a broken one would lock it out, and that is the one failure self-renewal could introduce.
+**Lifecycle.** Bootstrap creates both identities and mints the first token for its own. From then on k2a-token-sync
+mints ArgoCD's tokens and renews its own, verifying each replacement against the cluster before storing it —
+overwriting a working credential with a broken one would lock it out, and that is the one failure self-renewal could
+introduce.
 
 **The downtime budget.** `selfTokenTTL` measured from the *last successful pass*, so about 90 days by default. Nothing
 else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the cluster again — the
@@ -276,9 +277,9 @@ alone, the credential in it expires within `tokenTTL`.
 Two more objects outlive the connection, and can be removed once ArgoCD no longer needs the cluster: the
 `argocd-manager` and `k2a-token-sync` ServiceAccounts downstream, along with their bindings.
 
-With no `list` permission in ArgoCD's namespace, k2a-token-sync cannot detect a Secret left behind by a connection that was
-removed while it was down. That is the cost of the RBAC posture below, and it is why cleanup is a documented step rather
-than a promise.
+With no `list` permission in ArgoCD's namespace, k2a-token-sync cannot detect a Secret left behind by a connection
+that was removed while it was down. That is the cost of the RBAC posture below, and it is why cleanup is a documented
+step rather than a promise.
 
 ## One-time bootstrap per cluster
 
@@ -325,9 +326,9 @@ same contract:
 - mint a token for the second one;
 - write `<name>-credentials` in k2a-token-sync's namespace with keys `token`, `ca.crt` and `expires-at`.
 
-`expires-at` is RFC 3339 and may be omitted; k2a-token-sync then treats the deadline as unknown and replaces it with one it
-knows at the next renewal. That contract is worth automating alongside cluster creation, so a new cluster arrives ready
-and no administrative credential ever moves.
+`expires-at` is RFC 3339 and may be omitted; k2a-token-sync then treats the deadline as unknown and replaces it with
+one it knows at the next renewal. That contract is worth automating alongside cluster creation, so a new cluster
+arrives ready and no administrative credential ever moves.
 
 ## Health and observability
 
@@ -386,9 +387,9 @@ tokens, get/create ClusterRoleBindings, and read the `kube-root-ca.crt` ConfigMa
 
 Be equally clear-eyed there. The right to mint a token for a `cluster-admin` ServiceAccount is equivalent to
 `cluster-admin` by one hop — the narrow grant is for auditability and to avoid blanket Secret access, not because the
-identity is unprivileged. What the design genuinely achieves is that **no non-expiring credential exists anywhere in the
-system**: ArgoCD's token lasts 30 days and k2a-token-sync's own 90, both renewed automatically. That bounds the value of any
-leak, which a permanent `cluster-admin` JWT does not.
+identity is unprivileged. What the design genuinely achieves is that **no non-expiring credential exists anywhere in
+the system**: ArgoCD's token lasts 30 days and k2a-token-sync's own 90, both renewed automatically. That bounds the
+value of any leak, which a permanent `cluster-admin` JWT does not.
 
 An existing `ClusterRoleBinding` that points at a different role, or omits the expected ServiceAccount, is reported as
 an error rather than silently rewritten — an unannounced privilege change is not something this tool should make.
@@ -444,9 +445,9 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
   the cluster.
 - One replica, `Recreate` strategy. Two instances reconciling the same clusters would race to publish credentials.
 - The CA bundle is never rotated. Rotating a cluster CA is a deliberate, disruptive operation and out of scope.
-- Token lifetime is capped by the downstream API server's `--service-account-max-token-expiration`. k2a-token-sync logs a
-  warning when it is granted materially less than it requested — which matters more for its own credential than for
-  ArgoCD's, since that lifetime is the outage it can survive.
+- Token lifetime is capped by the downstream API server's `--service-account-max-token-expiration`. k2a-token-sync
+  logs a warning when it is granted materially less than it requested — which matters more for its own credential than
+  for ArgoCD's, since that lifetime is the outage it can survive.
 - k2a-token-sync cannot detect a generated Secret left behind by a cluster removed while it was down, because it holds no
   `list` permission in ArgoCD's namespace. Cleanup is a documented step.
 - No metrics endpoint. `/status` and the objects' own status carry the same information for now.
