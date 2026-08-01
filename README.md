@@ -118,7 +118,7 @@ check working exactly as intended, and a confusing error to meet cold.
 ## Prerequisites
 
 - ArgoCD, and k2a-token-sync, running on a cluster that can reach each downstream API server directly.
-- One-time bootstrap access per cluster, see [below](#one-time-bootstrap-per-cluster).
+- One-time bootstrap access per cluster, see [Bootstrap](#bootstrap).
 
 **Check the API server's certificate SANs first.** A serving certificate normally covers the node's own addresses,
 `127.0.0.1`, `localhost` and the in-cluster names — but not a VIP, load balancer or FQDN unless that name was included
@@ -196,7 +196,8 @@ spec:
       - CreateNamespace=true
 ```
 
-A second Application can own the ClusterConnection objects, so the fleet is declared in git alongside everything else.
+A second Application can own the ClusterConnection objects if you want the fleet declared in git — optional, and
+discussed under [Deployment paths](#deployment-paths).
 
 ### Without Helm
 
@@ -246,19 +247,20 @@ overwrite each other.
 ### Adding a cluster
 
 ```bash
-# 1. Provision the cluster and store its credential; print the object to commit.
 k2a-token-sync bootstrap --cluster standalone-1 --endpoint 10.1.0.10 \
-  --from-kubeconfig ./standalone-1.kubeconfig > clusters/standalone-1.yaml
-
-# 2. Apply it — or let ArgoCD apply it from git.
-kubectl apply -f clusters/standalone-1.yaml
+  --from-kubeconfig ./standalone-1.kubeconfig
 ```
 
-k2a-token-sync picks it up within one poll, roughly 30 seconds. No release upgrade, no restart, and no RBAC change: the
-chart's Role does not name individual Secrets, so nothing about it depends on how many clusters exist.
+That is the whole thing. Bootstrap prepares the downstream cluster, stores the credential, and applies the
+ClusterConnection; k2a-token-sync publishes ArgoCD's credential within one poll, roughly 30 seconds. No release upgrade,
+no restart, and no RBAC change — the chart's Role does not name individual Secrets, so nothing about it depends on how
+many clusters exist.
 
-The order does not matter. Apply the object first and it reports `Ready=False` with reason `AwaitingCredential` until
-bootstrap has run, which makes `kubectl get ccon` a worklist of what is still outstanding.
+It is safe to re-run. Every step is idempotent, including the object, which is written with server-side apply.
+
+If you keep the ClusterConnections in git instead, see [Keeping the objects in
+git](#keeping-the-objects-in-git). Order never matters either way: an object applied before its credential exists reports
+`Ready=False` with reason `AwaitingCredential`, which makes `kubectl get ccon` a worklist of what is still outstanding.
 
 Editing works the same way: `kubectl edit ccon standalone-1`, and the change takes effect within a poll. k2a-token-sync
 compares the spec's generation against the one recorded in status, so an edit made while it was down is noticed too.
@@ -281,40 +283,75 @@ With no `list` permission in ArgoCD's namespace, k2a-token-sync cannot detect a 
 that was removed while it was down. That is the cost of the RBAC posture below, and it is why cleanup is a documented
 step rather than a promise.
 
-## One-time bootstrap per cluster
+## Bootstrap
 
 k2a-token-sync has no way into a cluster until an identity exists for it there, and it deliberately never holds
-administrative material of its own. So the first foothold comes from a workstation, once per cluster:
+administrative material of its own. Something therefore has to establish the first foothold, using a credential no
+repository should contain — which makes bootstrap an imperative step by nature. `argocd cluster add` has the same seam;
+the difference is what the act leaves behind.
 
 ```bash
 k2a-token-sync bootstrap --cluster standalone-1 \
   --endpoint standalone-1.example.com:6443 \
-  --from-kubeconfig ./standalone-1.kubeconfig > clusters/standalone-1.yaml
+  --from-kubeconfig ./standalone-1.kubeconfig
 ```
 
-What it does, in order: resolve both clusters before changing anything; read the cluster CA; **probe the endpoint** and
-refuse if its certificate does not cover it; install the two identities; write the credential into k2a-token-sync's
-namespace; use that credential once against the endpoint to prove the whole path works; print the ClusterConnection.
+```text
+Bootstrapping standalone-1
+  downstream cluster    https://standalone-1.example.com:6443
+  ArgoCD endpoint       https://standalone-1.example.com:6443
+
+  endpoint certificate  valid until 2027-07-31 (364 days left)
+  identities            kube-system/argocd-manager, kube-system/k2a-token-sync
+  credential            k2a-token-sync/standalone-1-credentials, expires 2026-10-30
+  verified              the credential works against the ArgoCD endpoint
+  registration          k2a-token-sync/standalone-1
+
+Done. k2a-token-sync publishes ArgoCD's credential within 30 seconds:
+  kubectl -n k2a-token-sync get ccon standalone-1
+```
+
+In order: resolve both clusters before changing anything; read the cluster CA; **probe the endpoint** and refuse if its
+certificate does not cover it; install the two identities; store the credential; use that credential once against the
+endpoint to prove the whole path works; apply the ClusterConnection.
 
 The pre-flight is there because a certificate that does not cover the endpoint is the most common reason direct access
-fails, and it is far cheaper to learn before two identities exist than after. The final check is a warning rather than an
-error — the endpoint may be reachable from k2a-token-sync's cluster but not from your desk.
+fails, and it is far cheaper to learn before two identities exist than after. The verification is a warning rather than
+an error — the endpoint may be reachable from the cluster k2a-token-sync runs on but not from your desk.
 
-Two clusters are involved, and the flags say which is which. `--kubeconfig` and `--context` select the cluster running
-ArgoCD and `k2a-token-sync`, where the credential is stored and the object created — the unprefixed pair, as in any
-kubectl-like tool, defaulting to your usual kubeconfig and current context. `--from-kubeconfig` and `--from-context`
-select the downstream cluster being onboarded, and one of them is required.
-
-Downstream access is a **file**, not a context: files are what you can copy off a control-plane node. Separate files are
+Downstream access is a **file**, not a context: files are what you can copy off a control-plane node.
+`--from-kubeconfig` takes one, `--from-context` selects within it or within your ambient kubeconfig. Separate files are
 supported on purpose, because merging kubeconfigs is unsafe when both define the same context name for different
-clusters — as two of the kubeconfigs here do.
+clusters.
 
-`--dry-run` reports what it would do and prints the object without touching anything. `--create` applies the object
-instead of printing it. `k2a-token-sync bootstrap --help` lists the rest.
+The credential never passes through your terminal — it goes from the downstream cluster into k2a-token-sync's namespace
+directly. Progress goes to stderr, so `--print` can send the manifest to stdout without anything else in the way.
 
-**The output split matters.** The credential goes from the downstream cluster into k2a-token-sync's namespace and never
-passes through your terminal. Only the ClusterConnection is printed, and it contains nothing secret — which is why the
-redirect above is safe to commit. Logs go to stderr so that redirect stays clean.
+### Modes
+
+| Mode | Prepares the cluster | Stores the credential | ClusterConnection |
+| --- | --- | --- | --- |
+| default | yes | yes | applied |
+| `--print` | yes | yes | written to stdout, not applied |
+| `--dry-run` | no | no | shown as a preview |
+
+`k2a-token-sync bootstrap --help` lists the rest.
+
+### Keeping the objects in git
+
+`--print` provisions the cluster and stores the credential as usual, then writes the manifest to stdout instead of
+applying it:
+
+```bash
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig \
+  --print > clusters/standalone-1.yaml
+```
+
+Commit that and let ArgoCD apply it, or apply it yourself. The value is review and audit — the object is spec-only, so a
+repository is a reasonable home for it. Note that the declaration alone does nothing until the credential exists, which
+bootstrap has already handled by the time the manifest is printed.
 
 ### Provisioning it yourself
 
@@ -326,9 +363,41 @@ same contract:
 - mint a token for the second one;
 - write `<name>-credentials` in k2a-token-sync's namespace with keys `token`, `ca.crt` and `expires-at`.
 
-`expires-at` is RFC 3339 and may be omitted; k2a-token-sync then treats the deadline as unknown and replaces it with
-one it knows at the next renewal. That contract is worth automating alongside cluster creation, so a new cluster
-arrives ready and no administrative credential ever moves.
+`expires-at` is RFC 3339 and may be omitted; the deadline is then treated as unknown and replaced with a known one at the
+next renewal. That contract is worth implementing wherever your clusters are built, so a new cluster arrives ready and no
+administrative credential ever moves.
+
+### Never manage the credential Secrets declaratively
+
+Do **not** create `<name>-credentials` with External Secrets, an ArgoCD Application, Sealed Secrets, or anything else that
+reconciles toward a stored value. Those Secrets belong to k2a-token-sync, which rewrites each one on every pass — roughly
+daily — to keep the remaining lifetime near the full `selfTokenTTL`.
+
+A second writer turns that into a silent fault. Every renewal is undone on the next reconcile, so the credential stops
+advancing; about ninety days later the stored copy expires and gets pushed over a working token, and k2a-token-sync locks
+itself out of the cluster. The symptom appears a quarter after the cause.
+
+There is also nothing to gain. The credential is disposable: it is regenerated in seconds by re-running bootstrap, and
+k2a-token-sync replaces it daily regardless, so a vaulted copy is stale almost immediately. What deserves protecting is
+the administrative kubeconfig bootstrap consumes — which you already manage somewhere.
+
+## Deployment paths
+
+Two shapes work, and they differ only in who applies the chart.
+
+**Helm or Ansible, then bootstrap.** Install the chart, then run bootstrap once per cluster. Nothing per-cluster lives in
+git; the inventory lives in the API, which is what moving it out of a ConfigMap was for.
+
+**ArgoCD owns the chart, then bootstrap.** An Application deploys the chart from git — CRD, RBAC, Deployment, no secrets,
+fully declarative. Bootstrap still runs out-of-band, because the credential cannot be in git.
+
+So the part GitOps cannot express is exactly **one credential per cluster**, and the natural place to create it is
+wherever administrative access already exists: the automation that builds the cluster. Implement the contract above in
+that automation and there is no separate onboarding step at all.
+
+If you also want the ClusterConnections in git, add a second Application for them and use `--print`. That is optional
+rather than implied: an Application that renders only the chart never prunes bootstrap-created objects, because ArgoCD
+prunes only what it tracks.
 
 ## Health and observability
 
