@@ -92,24 +92,20 @@ jobs:
             exit 1
           fi
 
-      # Render both providers so template errors and bad RBAC scoping surface
-      # here rather than at deploy time.
+      # Render with and without clusters so template errors and bad RBAC scoping
+      # surface here rather than at deploy time.
       - name: helm template
         run: |
           helm template k2a-token-sync charts/k2a-token-sync \
             --namespace k2a-token-sync --set "image.tag=${TAG}" > /dev/null
           helm template k2a-token-sync charts/k2a-token-sync \
             --namespace k2a-token-sync --set "image.tag=${TAG}" \
-            --set rancher.url=https://rancher.example.com \
             --set 'clusters[0].name=downstream-1' \
             --set 'clusters[0].endpoint=10.0.0.10' \
-            --set 'clusters[0].autoRotate=true' \
             --set 'clusters[1].name=standalone-1' \
-            --set 'clusters[1].provider=direct' \
             --set 'clusters[1].endpoint=10.1.0.10' > /dev/null
           # Deploying into ArgoCD's own namespace must not render a duplicate Role.
           helm template k2a-token-sync charts/k2a-token-sync \
             --namespace argocd --set "image.tag=${TAG}" \
             --set 'clusters[0].name=standalone-1' \
-            --set 'clusters[0].provider=direct' \
             --set 'clusters[0].endpoint=10.1.0.10' > /dev/null

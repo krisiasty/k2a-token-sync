@@ -18,31 +18,6 @@ imagePullSecrets: []
 # One daemon serves one ArgoCD instance; deploy a second release for a second.
 argocdNamespace: argocd
 
-# Rancher management API. Required only if at least one cluster below uses
-# provider "rancher". Rancher is used strictly on the control path — to reach
-# downstream clusters so credentials can be provisioned, and to trigger
-# certificate rotation. ArgoCD itself never talks to Rancher.
-rancher:
-  url: ""  # e.g. https://rancher.example.com
-
-  # Secret holding the Rancher API token. Creation is out of scope — provide it
-  # via kubectl, Sealed Secrets, External Secrets Operator or anything else.
-  # The token's Rancher user needs cluster-owner rights on the managed clusters,
-  # and rotateCertificates permission if autoRotate is enabled anywhere.
-  tokenSecret:
-    name: rancher-credentials
-    key: token
-
-  # Optional PEM bundle for verifying the Rancher endpoint, when it uses a
-  # private CA. Falls back to the system trust store.
-  caSecret:
-    name: ""
-    key: ca.crt
-
-  # Disables verification of the Rancher endpoint. Affects only the control
-  # path — never the credentials handed to ArgoCD. Leave false in production.
-  insecureSkipTLSVerify: false
-
 # Defaults applied to every cluster unless overridden per entry.
 #
 # These four measure unrelated things: the first two govern the credential the
@@ -62,14 +37,9 @@ defaults:
   refreshInterval: 24h
 
   # Remaining serving-certificate lifetime below which the daemon warns. 90 days
-  # matches the window in which RKE2 itself rotates certificates on a service
-  # restart, so the documented remedy applies for the whole warning period.
+  # is enough notice to schedule a certificate rotation or a control-plane
+  # restart properly rather than as an emergency.
   expiryWarnThreshold: 2160h    # 90 days
-
-  # Remaining serving-certificate lifetime below which rotation is triggered,
-  # for clusters with autoRotate enabled. Well inside the warning window, so
-  # warnings precede any automatic control-plane restart by about two months.
-  rotateThreshold: 720h    # 30 days
 
   # Downstream ServiceAccount ArgoCD authenticates as. Matches what
   # `argocd cluster add` installs.
@@ -77,18 +47,15 @@ defaults:
     name: argocd-manager
     namespace: kube-system
 
-# Downstream RKE2 clusters to keep registered with ArgoCD. All generated Secrets
+# Downstream clusters to keep registered with ArgoCD. All generated Secrets
 # land in argocdNamespace above.
 #
 # clusters:
-#   - name: downstream-1          # also the Rancher cluster name unless overridden
-#     provider: rancher           # rancher (default) | direct
+#   - name: downstream-1
 #     endpoint: 10.0.0.10         # direct API address ArgoCD connects to; :6443 default
 #     secretName: cluster-downstream-1   # default: cluster-<name>
-#     autoRotate: false           # rancher provider only
 #
 #   - name: standalone-1
-#     provider: direct
 #     endpoint: 10.1.0.10
 #     # Bootstrap once with: k2a-token-sync bootstrap --cluster standalone-1 \
 #     #   --endpoint 10.1.0.10 --context standalone-1

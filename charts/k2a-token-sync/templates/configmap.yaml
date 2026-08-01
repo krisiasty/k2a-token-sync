@@ -9,26 +9,10 @@ metadata:
 data:
   config.yaml: |
     argocdNamespace: {{ include "k2a-token-sync.argocdNamespace" . | quote }}
-    {{- if .Values.rancher.url }}
-    rancher:
-      url: {{ .Values.rancher.url | quote }}
-      tokenSecret:
-        name: {{ .Values.rancher.tokenSecret.name | quote }}
-        key: {{ .Values.rancher.tokenSecret.key | default "token" | quote }}
-      {{- if .Values.rancher.caSecret.name }}
-      caSecret:
-        name: {{ .Values.rancher.caSecret.name | quote }}
-        key: {{ .Values.rancher.caSecret.key | default "ca.crt" | quote }}
-      {{- end }}
-      {{- if .Values.rancher.insecureSkipTLSVerify }}
-      insecureSkipTLSVerify: true
-      {{- end }}
-    {{- end }}
     defaults:
       tokenTTL: {{ .Values.defaults.tokenTTL | quote }}
       refreshInterval: {{ .Values.defaults.refreshInterval | quote }}
       expiryWarnThreshold: {{ .Values.defaults.expiryWarnThreshold | quote }}
-      rotateThreshold: {{ .Values.defaults.rotateThreshold | quote }}
       serviceAccount:
         name: {{ .Values.defaults.serviceAccount.name | quote }}
         namespace: {{ .Values.defaults.serviceAccount.namespace | quote }}
@@ -38,14 +22,10 @@ data:
     {{- end }}
     {{- range .Values.clusters }}
       - name: {{ .name | quote }}
-        provider: {{ .provider | default "rancher" | quote }}
         endpoint: {{ .endpoint | quote }}
         secretName: {{ .secretName | default (printf "cluster-%s" .name) | quote }}
         {{- if .displayName }}
         displayName: {{ .displayName | quote }}
-        {{- end }}
-        {{- if .rancherClusterName }}
-        rancherClusterName: {{ .rancherClusterName | quote }}
         {{- end }}
         {{- if .project }}
         project: {{ .project | quote }}
@@ -72,12 +52,6 @@ data:
         {{- end }}
         {{- if .expiryWarnThreshold }}
         expiryWarnThreshold: {{ .expiryWarnThreshold | quote }}
-        {{- end }}
-        {{- if .autoRotate }}
-        autoRotate: true
-        {{- end }}
-        {{- if .rotateThreshold }}
-        rotateThreshold: {{ .rotateThreshold | quote }}
         {{- end }}
         {{- with .labels }}
         labels:

@@ -49,7 +49,7 @@ func (s *healthState) record(result reconcile.Result, next time.Duration) {
 }
 
 // isLive reports whether the loop is running on schedule. The grace window
-// absorbs a long Rancher rotation without tripping the liveness probe.
+// absorbs a slow pass over many clusters without tripping the liveness probe.
 func (s *healthState) isLive() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

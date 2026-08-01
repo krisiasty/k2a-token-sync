@@ -1,5 +1,5 @@
-// Command k2a-token-sync keeps ArgoCD's registrations for downstream RKE2
-// clusters valid, bypassing the Rancher proxy on the GitOps request path.
+// Command k2a-token-sync keeps ArgoCD's registrations for downstream Kubernetes
+// clusters valid, using short-lived tokens it mints and rotates itself.
 package main
 
 import (
@@ -29,7 +29,7 @@ const (
 	minPassInterval = 1 * time.Minute
 
 	// passTimeout bounds one reconciliation pass over all clusters. Generous,
-	// because a Rancher-orchestrated rotation legitimately takes many minutes.
+	// because a pass over many clusters legitimately takes several minutes.
 	passTimeout = 45 * time.Minute
 )
 
@@ -95,7 +95,7 @@ func runSubcommand(logger *slog.Logger, name string, args []string) error {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `k2a-token-sync — keeps ArgoCD's downstream RKE2 cluster registrations valid.
+	fmt.Fprint(os.Stderr, `k2a-token-sync — keeps ArgoCD's downstream cluster registrations valid.
 
 Usage:
   k2a-token-sync                 run the reconciliation daemon (default)
@@ -120,10 +120,7 @@ func runDaemon(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	reconciler, err := reconcile.New(ctx, cfg, local, logger)
-	if err != nil {
-		return err
-	}
+	reconciler := reconcile.New(cfg, local, logger)
 
 	state := newHealthState(len(cfg.Clusters))
 
@@ -138,7 +135,6 @@ func runDaemon(logger *slog.Logger) error {
 		"namespace", cfg.Namespace,
 		"clusters", len(cfg.Clusters),
 		"refresh_interval", cfg.RefreshInterval.String(),
-		"rancher", cfg.Rancher != nil,
 	)
 
 	backoff := retryInterval

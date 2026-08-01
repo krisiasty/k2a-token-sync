@@ -1,4 +1,4 @@
-// Package downstream performs the work that happens inside a managed RKE2
+// Package downstream performs the work that happens inside a managed
 // cluster: provisioning the identities ArgoCD and the daemon authenticate as,
 // minting bound tokens, reading the cluster CA, and probing the API server's
 // serving certificate.
@@ -61,8 +61,9 @@ type ServingCert struct {
 
 	// HostnameError is set when the certificate carries no SAN matching the
 	// configured endpoint. This is the single most common reason direct access
-	// fails on RKE2: the serving cert only covers node addresses plus whatever
-	// is listed under tls-san in the RKE2 config.
+	// fails: a serving certificate typically covers the node addresses and
+	// in-cluster names, but not a VIP, load balancer or FQDN unless it was
+	// explicitly included when the certificate was issued.
 	HostnameError error
 }
 
@@ -312,7 +313,7 @@ func ClusterCA(ctx context.Context, client kubernetes.Interface, namespace strin
 //
 // This is deliberately independent of the credential path: it is the only way to
 // observe what ArgoCD will actually encounter when it connects directly, and the
-// only way to see the RKE2 serving certificate's expiry.
+// only way to see the serving certificate's expiry.
 func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*ServingCert, error) {
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -358,7 +359,7 @@ func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*Serving
 	if err := leaf.VerifyHostname(host); err != nil {
 		out.HostnameError = fmt.Errorf(
 			"the API server certificate at %s carries no SAN for %q (SANs: %v); "+
-				"add it to tls-san in the RKE2 config and restart rke2-server, "+
+				"add this name to the API server's serving certificate, "+
 				"otherwise ArgoCD cannot verify this endpoint: %w",
 			endpoint, host, sans(leaf), err)
 	}

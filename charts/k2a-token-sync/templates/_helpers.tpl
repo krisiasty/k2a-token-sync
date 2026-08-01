@@ -44,7 +44,6 @@ Validates cluster entries early, so a typo fails at render time rather than in
 the daemon's crash loop. The daemon revalidates everything itself.
 */}}
 {{- define "k2a-token-sync.validate" -}}
-{{- $needsRancher := false }}
 {{- $secretNames := list }}
 {{- range $i, $c := .Values.clusters }}
 {{- if not $c.name }}
@@ -58,21 +57,5 @@ the daemon's crash loop. The daemon revalidates everything itself.
 {{- if not $c.endpoint }}
 {{- fail (printf "clusters[%d] (%s): endpoint is required" $i $c.name) }}
 {{- end }}
-{{- $provider := $c.provider | default "rancher" }}
-{{- if not (has $provider (list "rancher" "direct")) }}
-{{- fail (printf "clusters[%d] (%s): provider must be \"rancher\" or \"direct\", got %q" $i $c.name $provider) }}
-{{- end }}
-{{- if eq $provider "rancher" }}
-{{- $needsRancher = true }}
-{{- end }}
-{{- if and $c.autoRotate (ne $provider "rancher") }}
-{{- fail (printf "clusters[%d] (%s): autoRotate requires provider \"rancher\"; standalone RKE2 exposes no rotation API" $i $c.name) }}
-{{- end }}
-{{- end }}
-{{- if and $needsRancher (not .Values.rancher.url) }}
-{{- fail "at least one cluster uses provider \"rancher\" but rancher.url is not set" }}
-{{- end }}
-{{- if and .Values.rancher.url (not .Values.rancher.tokenSecret.name) }}
-{{- fail "rancher.url is set but rancher.tokenSecret.name is empty" }}
 {{- end }}
 {{- end }}

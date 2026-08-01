@@ -79,7 +79,7 @@ type ClusterSecret struct {
 	DisplayName string
 
 	// Server is the API server URL ArgoCD connects to — the direct endpoint,
-	// never the Rancher proxy.
+	// never a management-plane proxy.
 	Server string
 
 	BearerToken string

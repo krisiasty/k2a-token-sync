@@ -18,7 +18,7 @@ import (
 
 const bootstrapTimeout = 2 * time.Minute
 
-// runBootstrap provisions a standalone RKE2 cluster for the daemon.
+// runBootstrap provisions a downstream cluster for the daemon.
 //
 // It runs on an operator's workstation, where a working kubeconfig for both the
 // downstream cluster and the ArgoCD cluster already exists. That existing access
@@ -26,8 +26,8 @@ const bootstrapTimeout = 2 * time.Minute
 // and store a durable credential for it next to the daemon — so no
 // administrative credential has to be transferred or kept anywhere.
 //
-// This exists because standalone RKE2 offers no equivalent of Rancher's
-// pre-privileged cluster agent: something has to establish the first foothold.
+// This exists because something has to establish the first foothold: the daemon
+// has no way into a cluster until an identity exists for it there.
 func runBootstrap(logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -35,7 +35,7 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 	var (
 		clusterName    = fs.String("cluster", "", "name for the cluster; must match the 'name' of an entry in the daemon's config")
 		endpoint       = fs.String("endpoint", "", "direct API endpoint ArgoCD will connect to, as host or host:port")
-		downstreamCtx  = fs.String("context", "", "kubeconfig context of the downstream RKE2 cluster (required)")
+		downstreamCtx  = fs.String("context", "", "kubeconfig context of the downstream cluster (required)")
 		downstreamKube = fs.String("kubeconfig", "", "path to the kubeconfig holding --context (default: normal kubeconfig resolution)")
 		localCtx       = fs.String("argocd-context", "", "kubeconfig context of the cluster running ArgoCD and this daemon (default: current context)")
 		localKube      = fs.String("argocd-kubeconfig", "", "path to the kubeconfig holding --argocd-context")
@@ -49,13 +49,12 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: k2a-token-sync bootstrap --cluster NAME --endpoint HOST[:PORT] --context CTX [flags]
 
-Provisions a standalone RKE2 cluster so the daemon can maintain its ArgoCD
-registration without Rancher. Installs two downstream identities — one for
-ArgoCD (cluster-admin) and one narrowly-scoped for the daemon — then writes a
-durable credential for the latter into the daemon's namespace.
+Provisions a downstream cluster so the daemon can maintain its ArgoCD
+registration. Installs two downstream identities — one for ArgoCD (cluster-admin)
+and one narrowly-scoped for the daemon — then writes a durable credential for the
+latter into the daemon's namespace.
 
-Clusters managed by Rancher do not need this: the daemon bootstraps them through
-the Rancher API proxy.
+Run this once per cluster. Afterwards the daemon needs no administrative access.
 
 Flags:
 `)
@@ -133,7 +132,7 @@ Flags:
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), creds,
 		map[string]string{
 			"app.kubernetes.io/managed-by": "k2a-token-sync",
-			"k2a-token-sync.io/cluster":     cluster.Name,
+			"k2a-token-sync.io/cluster":    cluster.Name,
 		}); err != nil {
 		return fmt.Errorf("writing credential secret: %w", err)
 	}

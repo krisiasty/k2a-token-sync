@@ -35,7 +35,6 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 
 	return Cluster{
 		Name:                    in.Name,
-		Provider:                ProviderDirect,
 		Endpoint:                endpoint,
 		DisplayName:             in.Name,
 		SecretName:              "cluster-" + in.Name,
@@ -46,6 +45,5 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 		},
 		TokenTTL:            defaultTokenTTL,
 		ExpiryWarnThreshold: defaultExpiryWarnThreshold,
-		RotateThreshold:     defaultRotateThreshold,
 	}, nil
 }

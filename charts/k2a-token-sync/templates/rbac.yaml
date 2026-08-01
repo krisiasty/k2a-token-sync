@@ -12,9 +12,9 @@ imagePullSecrets:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 ---
-# In its own namespace the daemon reads the Rancher token and any bootstrap
-# credentials, and stores the durable credentials it provisions for standalone
-# clusters. This namespace holds nothing but the daemon's own secrets.
+# In its own namespace the daemon reads any bootstrap credentials and stores the
+# durable credentials it provisions for each cluster. This namespace holds
+# nothing but the daemon's own secrets.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

@@ -1,10 +1,10 @@
 // Package reconcile drives one pass over every configured cluster.
 //
-// The reconciler is the whole daemon in outline. For each cluster it obtains
-// administrative access, ensures ArgoCD's downstream identity exists, mints a
-// short-lived credential, and publishes it in an ArgoCD cluster Secret pointing
-// at the cluster's direct endpoint. It also probes that endpoint's serving
-// certificate and, where permitted, asks Rancher to rotate it.
+// The reconciler is the whole daemon in outline. For each cluster it connects
+// with the credential provisioned for it, ensures ArgoCD's downstream identity
+// exists, mints a short-lived credential, and publishes it in an ArgoCD cluster
+// Secret pointing at the cluster's direct endpoint. It also probes that
+// endpoint's serving certificate and reports what it finds.
 package reconcile
 
 import (
@@ -23,7 +23,6 @@ import (
 	"github.com/krisiasty/k2a-token-sync/internal/config"
 	"github.com/krisiasty/k2a-token-sync/internal/downstream"
 	"github.com/krisiasty/k2a-token-sync/internal/k8s"
-	"github.com/krisiasty/k2a-token-sync/internal/rancher"
 )
 
 // clientTimeout bounds any single downstream API call.
@@ -35,52 +34,18 @@ type Reconciler struct {
 	local  kubernetes.Interface
 	logger *slog.Logger
 
-	// rancherClient is nil when no cluster uses the Rancher provider.
-	rancherClient *rancher.Client
-
 	// now is injectable for tests.
 	now func() time.Time
 }
 
-// New builds a Reconciler. The Rancher client is constructed eagerly so that a
-// bad URL or unreadable token fails at startup rather than mid-cycle.
-func New(ctx context.Context, cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) (*Reconciler, error) {
-	r := &Reconciler{cfg: cfg, local: local, logger: logger, now: time.Now}
-
-	if cfg.Rancher == nil {
-		return r, nil
-	}
-
-	token, err := k8s.ReadSecretKey(ctx, local, cfg.Namespace, cfg.Rancher.Token.Name, cfg.Rancher.Token.Key)
-	if err != nil {
-		return nil, fmt.Errorf("reading rancher token: %w", err)
-	}
-
-	var ca []byte
-	if cfg.Rancher.CA.Name != "" {
-		ca, err = k8s.ReadSecretKey(ctx, local, cfg.Namespace, cfg.Rancher.CA.Name, cfg.Rancher.CA.Key)
-		if err != nil {
-			return nil, fmt.Errorf("reading rancher CA: %w", err)
-		}
-	}
-
-	r.rancherClient, err = rancher.New(rancher.Options{
-		BaseURL:               cfg.Rancher.URL,
-		Token:                 string(token),
-		CA:                    ca,
-		InsecureSkipTLSVerify: cfg.Rancher.InsecureSkipTLSVerify,
-		Logger:                logger,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return r, nil
+// New builds a Reconciler.
+func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *Reconciler {
+	return &Reconciler{cfg: cfg, local: local, logger: logger, now: time.Now}
 }
 
 // ClusterStatus is the outcome of reconciling one cluster.
 type ClusterStatus struct {
 	Name     string    `json:"name"`
-	Provider string    `json:"provider"`
 	Endpoint string    `json:"endpoint"`
 	Secret   string    `json:"secret"`
 	Synced   bool      `json:"synced"`
@@ -93,7 +58,6 @@ type ClusterStatus struct {
 	ServingCertDaysLeft  int       `json:"servingCertDaysLeft,omitempty"`
 	ServingCertTrusted   bool      `json:"servingCertTrusted"`
 	ServingCertWarning   string    `json:"servingCertWarning,omitempty"`
-	Rotated              bool      `json:"rotated,omitempty"`
 }
 
 // Result aggregates a full pass.
@@ -155,10 +119,9 @@ func (r *Reconciler) Run(ctx context.Context) Result {
 			return result
 		}
 
-		logger := r.logger.With("cluster", cluster.Name, "provider", string(cluster.Provider))
+		logger := r.logger.With("cluster", cluster.Name)
 		status := ClusterStatus{
 			Name:     cluster.Name,
-			Provider: string(cluster.Provider),
 			Endpoint: cluster.Endpoint,
 			Secret:   r.cfg.ArgoCDNamespace + "/" + cluster.SecretName,
 		}
@@ -181,22 +144,6 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 	access, err := r.access(ctx, cluster, logger)
 	if err != nil {
 		return err
-	}
-
-	// Rotation is evaluated before credentials are minted: a rotation restarts
-	// the downstream control plane and invalidates tokens issued beforehand.
-	if cluster.AutoRotate {
-		rotated, err := r.maybeRotate(ctx, cluster, access, logger, status)
-		if err != nil {
-			return err
-		}
-		if rotated {
-			status.Rotated = true
-			// Re-establish access; the proxy connection may have been reset.
-			if access, err = r.access(ctx, cluster, logger); err != nil {
-				return fmt.Errorf("re-establishing access after rotation: %w", err)
-			}
-		}
 	}
 
 	ca, err := downstream.ClusterCA(ctx, access.client, cluster.ServiceAccount.Namespace)
@@ -342,111 +289,24 @@ func (r *Reconciler) probe(ctx context.Context, cluster config.Cluster, ca []byt
 		logger.Warn("downstream API server certificate is nearing expiry",
 			"expires_at", cert.NotAfter.UTC().Format(time.RFC3339),
 			"days_left", cert.DaysRemaining(),
-			"remedy", rotationRemedy(cluster),
+			"remedy", "rotate or reissue the API server's serving certificate; how depends on your distribution",
 		)
 	}
 	return nil
 }
 
-// rotationRemedy states what an operator should do about an expiring certificate.
-func rotationRemedy(cluster config.Cluster) string {
-	switch {
-	case cluster.AutoRotate:
-		return "rotation will be triggered automatically through Rancher"
-	case cluster.Provider == config.ProviderRancher:
-		return "rotate certificates for this cluster in Rancher, or set autoRotate: true"
-	default:
-		return "restart rke2-server on the control-plane nodes; RKE2 rotates certificates within 90 days of expiry on restart"
-	}
-}
-
-// maybeRotate triggers a Rancher-orchestrated rotation when the serving
-// certificate is inside the configured threshold.
-func (r *Reconciler) maybeRotate(ctx context.Context, cluster config.Cluster, access *clusterAccess, logger *slog.Logger, status *ClusterStatus) (bool, error) {
-	// Probe without CA verification here; only the expiry matters for the
-	// rotation decision, and a cluster whose certificate has already drifted
-	// out of trust is exactly the one that needs rotating.
-	cert, err := downstream.ProbeServingCert(ctx, cluster.Endpoint, nil)
-	if err != nil {
-		return false, fmt.Errorf("probing direct endpoint before rotation: %w", err)
-	}
-
-	status.ServingCertExpiresAt = cert.NotAfter
-	status.ServingCertDaysLeft = cert.DaysRemaining()
-
-	if time.Until(cert.NotAfter) >= cluster.RotateThreshold {
-		return false, nil
-	}
-	if access.rancherClusterID == "" {
-		return false, errors.New("autoRotate is enabled but the cluster has no Rancher ID")
-	}
-
-	logger.Warn("triggering certificate rotation through Rancher",
-		"days_left", cert.DaysRemaining(),
-		"threshold", cluster.RotateThreshold.String(),
-		"rancher_cluster_id", access.rancherClusterID,
-	)
-
-	if err := r.rancherClient.RotateCertificates(ctx, access.rancherClusterID); err != nil {
-		return false, fmt.Errorf("rotating certificates: %w", err)
-	}
-	return true, nil
-}
-
-// clusterAccess is an administrative connection to a downstream cluster.
+// clusterAccess is a connection to a downstream cluster.
 type clusterAccess struct {
-	client           kubernetes.Interface
-	rancherClusterID string
+	client kubernetes.Interface
 }
 
-// access establishes administrative access to a downstream cluster.
-func (r *Reconciler) access(ctx context.Context, cluster config.Cluster, logger *slog.Logger) (*clusterAccess, error) {
-	switch cluster.Provider {
-	case config.ProviderRancher:
-		return r.rancherAccess(ctx, cluster)
-	case config.ProviderDirect:
-		return r.directAccess(ctx, cluster, logger)
-	default:
-		return nil, fmt.Errorf("unsupported provider %q", cluster.Provider)
-	}
-}
-
-// rancherAccess reaches the cluster through the Rancher API proxy. Rancher's
-// agent is already privileged in every cluster it manages, so this needs no
-// per-cluster bootstrap.
-func (r *Reconciler) rancherAccess(ctx context.Context, cluster config.Cluster) (*clusterAccess, error) {
-	if r.rancherClient == nil {
-		return nil, errors.New("rancher provider requires a configured rancher section")
-	}
-
-	found, err := r.rancherClient.FindCluster(ctx, cluster.RancherClusterName)
-	if err != nil {
-		return nil, err
-	}
-
-	var ca []byte
-	if r.cfg.Rancher.CA.Name != "" {
-		ca, err = k8s.ReadSecretKey(ctx, r.local, r.cfg.Namespace, r.cfg.Rancher.CA.Name, r.cfg.Rancher.CA.Key)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	restCfg := r.rancherClient.ProxyRESTConfig(found.ID, ca, r.cfg.Rancher.InsecureSkipTLSVerify)
-	client, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("building client for rancher proxy: %w", err)
-	}
-	return &clusterAccess{client: client, rancherClusterID: found.ID}, nil
-}
-
-// directAccess reaches a standalone cluster at its own endpoint.
+// access reaches a cluster at its own endpoint.
 //
 // It prefers the durable credential the daemon provisioned for itself. On the
 // first pass that credential does not exist, so the operator-supplied bootstrap
 // credential is used once to create it — after which the bootstrap Secret can be
 // deleted.
-func (r *Reconciler) directAccess(ctx context.Context, cluster config.Cluster, logger *slog.Logger) (*clusterAccess, error) {
+func (r *Reconciler) access(ctx context.Context, cluster config.Cluster, logger *slog.Logger) (*clusterAccess, error) {
 	creds, err := k8s.ReadCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName())
 	if err == nil {
 		client, err := clientFromToken(cluster.ServerURL(), creds.Token, creds.CA)
@@ -485,7 +345,7 @@ func (r *Reconciler) directAccess(ctx context.Context, cluster config.Cluster, l
 	if err := k8s.WriteCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName(),
 		provisioned, map[string]string{
 			"app.kubernetes.io/managed-by": "k2a-token-sync",
-			"k2a-token-sync.io/cluster":     cluster.Name,
+			"k2a-token-sync.io/cluster":    cluster.Name,
 		}); err != nil {
 		return nil, fmt.Errorf("storing provisioned credential: %w", err)
 	}
@@ -557,10 +417,10 @@ func (r *Reconciler) bootstrapClient(ctx context.Context, cluster config.Cluster
 
 // clientFromKubeconfig builds a client from raw kubeconfig bytes.
 //
-// The server address is taken from the kubeconfig as-is. RKE2 writes
-// https://127.0.0.1:6443 into /etc/rancher/rke2/rke2.yaml, so a kubeconfig
-// copied straight off a node must have its server rewritten to the reachable
-// endpoint before being handed over.
+// The server address is taken from the kubeconfig as-is. A kubeconfig written
+// for use on the node itself usually points at https://127.0.0.1:6443, so one
+// copied straight off a control-plane node must have its server rewritten to the
+// reachable endpoint before being handed over.
 func clientFromKubeconfig(raw []byte) (kubernetes.Interface, error) {
 	apiConfig, err := clientcmd.Load(raw)
 	if err != nil {
