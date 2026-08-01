@@ -27,18 +27,20 @@ func TestNextInterval(t *testing.T) {
 			want:     maxPassInterval,
 		},
 		{
-			// Half of 30 days is 15, well past the daily cap, so the cap wins and
-			// the certificate still gets checked every day.
-			name:      "long-lived token is capped daily",
+			// Half of 30 days is 15, so the cap wins. This is every ordinary
+			// cluster: the interval is the cap, and a deleted Secret is noticed
+			// within it.
+			name:      "long-lived token is capped",
 			expiresIn: 720 * time.Hour,
 			want:      maxPassInterval,
 		},
 		{
-			// A capped token is the case this exists for: waking at half the
-			// remaining lifetime keeps a whole refresh in hand.
+			// A severely capped token is the case the derivation exists for. Half
+			// the remaining lifetime keeps a whole refresh in hand, and it only
+			// takes effect once it is shorter than the cap.
 			name:      "short-lived token pulls the interval in",
-			expiresIn: 4 * time.Hour,
-			want:      2 * time.Hour,
+			expiresIn: 6 * time.Minute,
+			want:      3 * time.Minute,
 		},
 		{
 			// A pathologically short cap must not turn the loop into a busy wait.

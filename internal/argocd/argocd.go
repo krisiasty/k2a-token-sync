@@ -51,9 +51,6 @@ const (
 	// API server's serving certificate, so it is visible with kubectl.
 	ServingCertExpiryAnnotation = "k2a-token-sync.io/serving-cert-expires-at"
 
-	// LastSyncAnnotation records the last successful reconciliation.
-	LastSyncAnnotation = "k2a-token-sync.io/last-sync"
-
 	// ClusterNameAnnotation records which configured cluster owns this Secret.
 	ClusterNameAnnotation = "k2a-token-sync.io/cluster"
 
@@ -115,7 +112,19 @@ type ClusterSecret struct {
 // registrationConfig is everything except the credential: the labels that make
 // ArgoCD notice the Secret at all, the bookkeeping annotations, and the server,
 // name and project it reads.
-func (c ClusterSecret) registrationConfig(now time.Time) *applycorev1.SecretApplyConfiguration {
+//
+// Every value here is derived from the cluster's configuration or from something
+// observed about it, never from the clock. That is what makes an unchanged pass a
+// genuine no-op: the apply finds nothing to change, so there is no write, no
+// resourceVersion bump and nothing for ArgoCD to react to.
+//
+// So there is deliberately no last-sync annotation, tempting as one is. It would
+// change on every pass, making every pass a write and every write an event for
+// ArgoCD — which is precisely what forced the reconciliation interval to be long,
+// and with it how long a deleted Secret stayed deleted. The same fact lives in the
+// ClusterConnection's status.lastSyncTime, alongside everything else this tool
+// records.
+func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguration {
 	labels := map[string]string{
 		SecretTypeLabel: secretTypeCluster,
 		managedByLabel:  managedByValue,
@@ -126,7 +135,6 @@ func (c ClusterSecret) registrationConfig(now time.Time) *applycorev1.SecretAppl
 
 	annotations := map[string]string{
 		ClusterNameAnnotation: c.ClusterName,
-		LastSyncAnnotation:    now.UTC().Format(time.RFC3339),
 	}
 	if !c.TokenExpiresAt.IsZero() {
 		annotations[TokenExpiryAnnotation] = c.TokenExpiresAt.UTC().Format(time.RFC3339)
@@ -180,8 +188,8 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 // or watch permission in ArgoCD's namespace is required anywhere. That is what
 // makes a deleted or emptied Secret self-healing — the next pass recreates the
 // registration and sees that the credential is gone.
-func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret, now time.Time) (bool, error) {
-	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(now), metav1.ApplyOptions{
+func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (bool, error) {
+	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(), metav1.ApplyOptions{
 		FieldManager: FieldManagerRegistration,
 		Force:        true,
 	})
@@ -261,7 +269,11 @@ type RefreshReason string
 // The reasons a credential is reissued. They are surfaced in logs and in
 // /status, so they read as explanations rather than codes.
 const (
-	ReasonMissing       RefreshReason = "cluster secret does not exist"
+	// ReasonUnrecorded fires when status holds no fingerprint. It deliberately
+	// does not claim the Secret is absent: holding no read permission on it, this
+	// tool cannot know that. Either the cluster has never been published or its
+	// status was lost, and the two are indistinguishable from here.
+	ReasonUnrecorded    RefreshReason = "no registration recorded in status"
 	ReasonNoToken       RefreshReason = "cluster secret has no bearer token"
 	ReasonExpiring      RefreshReason = "token is past half its lifetime"
 	ReasonServerDrift   RefreshReason = "recorded server URL does not match configuration"
@@ -283,7 +295,7 @@ func NeedsRefresh(applied Fingerprint, hasCredential bool, desired ClusterSecret
 	case applied == (Fingerprint{}):
 		// Nothing recorded: either this cluster has never been published, or
 		// status was lost. Reissuing is the safe reading of both.
-		return ReasonMissing
+		return ReasonUnrecorded
 	case !hasCredential:
 		return ReasonNoToken
 	case applied.Server != desired.Server:
