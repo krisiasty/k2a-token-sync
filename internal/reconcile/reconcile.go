@@ -1,10 +1,13 @@
-// Package reconcile drives one pass over every configured cluster.
+// Package reconcile brings one cluster's ArgoCD registration up to date.
 //
-// The reconciler is the whole daemon in outline. For each cluster it connects
-// with the credential provisioned for it, ensures ArgoCD's downstream identity
-// exists, mints a short-lived credential, and publishes it in an ArgoCD cluster
-// Secret pointing at the cluster's direct endpoint. It also probes that
-// endpoint's serving certificate and reports what it finds.
+// The reconciler is the whole daemon in outline. For a cluster it connects with
+// the credential provisioned for it, ensures ArgoCD's downstream identity exists,
+// mints a short-lived credential, and publishes it in an ArgoCD cluster Secret
+// pointing at the cluster's own endpoint. It also probes that endpoint's serving
+// certificate and reports what it finds.
+//
+// Scheduling lives with the caller. Each cluster is reconciled on its own cadence,
+// so a cluster that fails cannot drag the others onto its retry interval.
 package reconcile
 
 import (
@@ -15,10 +18,12 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
 	"github.com/krisiasty/k2a-token-sync/internal/argocd"
 	"github.com/krisiasty/k2a-token-sync/internal/config"
 	"github.com/krisiasty/k2a-token-sync/internal/downstream"
@@ -28,20 +33,11 @@ import (
 // clientTimeout bounds any single downstream API call.
 const clientTimeout = 30 * time.Second
 
-// Reconciler holds the collaborators needed for a reconciliation pass.
+// Reconciler holds the collaborators needed to reconcile a cluster.
 type Reconciler struct {
 	cfg    *config.Config
 	local  kubernetes.Interface
 	logger *slog.Logger
-
-	// applied records what was last published for each cluster, keyed by
-	// cluster name. The daemon holds no read permission on Secrets in ArgoCD's
-	// namespace, so this is how drift is detected.
-	//
-	// In memory for now, which means a restart reissues once per cluster —
-	// harmless, and self-correcting. It moves into ClusterConnection status,
-	// where it survives restarts, when the inventory does.
-	applied map[string]argocd.Fingerprint
 
 	// now is injectable for tests.
 	now func() time.Time
@@ -49,114 +45,52 @@ type Reconciler struct {
 
 // New builds a Reconciler.
 func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *Reconciler {
-	return &Reconciler{
-		cfg:     cfg,
-		local:   local,
-		logger:  logger,
-		applied: make(map[string]argocd.Fingerprint, len(cfg.Clusters)),
-		now:     time.Now,
-	}
+	return &Reconciler{cfg: cfg, local: local, logger: logger, now: time.Now}
 }
 
-// ClusterStatus is the outcome of reconciling one cluster.
-type ClusterStatus struct {
-	Name     string    `json:"name"`
-	Endpoint string    `json:"endpoint"`
-	Secret   string    `json:"secret"`
-	Synced   bool      `json:"synced"`
-	Error    string    `json:"error,omitempty"`
-	Action   string    `json:"action,omitempty"`
-	SyncedAt time.Time `json:"syncedAt,omitzero"`
-
-	TokenExpiresAt       time.Time `json:"tokenExpiresAt,omitzero"`
-	ServingCertExpiresAt time.Time `json:"servingCertExpiresAt,omitzero"`
-	ServingCertDaysLeft  int       `json:"servingCertDaysLeft,omitempty"`
-	ServingCertTrusted   bool      `json:"servingCertTrusted"`
-	ServingCertWarning   string    `json:"servingCertWarning,omitempty"`
-}
-
-// Result aggregates a full pass.
-type Result struct {
-	Clusters []ClusterStatus `json:"clusters"`
-}
-
-// AllSynced reports whether every cluster reconciled cleanly.
-func (r Result) AllSynced() bool {
-	for _, c := range r.Clusters {
-		if !c.Synced {
-			return false
-		}
-	}
-	return true
-}
-
-// Failures counts clusters that did not reconcile.
-func (r Result) Failures() int {
-	var n int
-	for _, c := range r.Clusters {
-		if !c.Synced {
-			n++
-		}
-	}
-	return n
-}
-
-// SoonestTokenExpiry returns the earliest expiry among the credentials this pass
-// published, or the zero time if none are known.
+// Cluster reconciles one cluster and returns the status to record on its
+// ClusterConnection.
 //
-// The scheduler needs this because the API server may cap token lifetime far
-// below what was requested. Sleeping for a fixed refreshInterval would then let
-// ArgoCD's credential die between passes.
-func (r Result) SoonestTokenExpiry() time.Time {
-	var soonest time.Time
-	for _, c := range r.Clusters {
-		if c.TokenExpiresAt.IsZero() {
-			continue
-		}
-		if soonest.IsZero() || c.TokenExpiresAt.Before(soonest) {
-			soonest = c.TokenExpiresAt
-		}
-	}
-	return soonest
-}
-
-// Run reconciles every configured cluster.
+// prior is the status from the previous pass, and is the daemon's only memory:
+// holding no read permission on the generated Secret, it cannot inspect what it
+// published, so the applied fingerprint in prior is how drift is detected.
 //
-// Clusters are independent: a failure is recorded and the pass continues, so one
-// unreachable cluster cannot stall the others.
-func (r *Reconciler) Run(ctx context.Context) Result {
-	result := Result{Clusters: make([]ClusterStatus, 0, len(r.cfg.Clusters))}
+// A status is returned even on failure, so the object always says what went
+// wrong. The error is returned alongside it for the caller's backoff.
+func (r *Reconciler) Cluster(
+	ctx context.Context,
+	cluster config.Cluster,
+	prior v1alpha1.ClusterConnectionStatus,
+	generation int64,
+) (v1alpha1.ClusterConnectionStatus, error) {
+	logger := r.logger.With("cluster", cluster.Name)
+	now := r.now()
 
-	for i := range r.cfg.Clusters {
-		cluster := r.cfg.Clusters[i]
+	status := prior
+	status.ObservedGeneration = generation
+	status.Secret = r.cfg.ArgoCDNamespace + "/" + cluster.SecretName
 
-		if ctx.Err() != nil {
-			return result
-		}
-
-		logger := r.logger.With("cluster", cluster.Name)
-		status := ClusterStatus{
-			Name:     cluster.Name,
-			Endpoint: cluster.Endpoint,
-			Secret:   r.cfg.ArgoCDNamespace + "/" + cluster.SecretName,
-		}
-
-		if err := r.reconcileCluster(ctx, cluster, logger, &status); err != nil {
-			status.Error = err.Error()
-			logger.Error("cluster reconciliation failed", "error", err)
-		} else {
-			status.Synced = true
-			status.SyncedAt = r.now()
-		}
-
-		result.Clusters = append(result.Clusters, status)
+	if err := r.reconcile(ctx, cluster, &status, logger, now); err != nil {
+		setCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reasonFor(err), err.Error(), generation)
+		status.LastAction = "failed"
+		logger.Error("cluster reconciliation failed", "error", err)
+		return status, err
 	}
 
-	return result
+	status.LastSyncTime = &metav1.Time{Time: now}
+	setCondition(&status, v1alpha1.ConditionReady, metav1.ConditionTrue, v1alpha1.ReasonReady,
+		"ArgoCD holds a current credential for this cluster", generation)
+	return status, nil
 }
 
-func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluster, logger *slog.Logger, status *ClusterStatus) error {
-	access, err := r.access(ctx, cluster, logger)
+func (r *Reconciler) reconcile(
+	ctx context.Context,
+	cluster config.Cluster,
+	status *v1alpha1.ClusterConnectionStatus,
+	logger *slog.Logger,
+	now time.Time,
+) error {
+	access, err := r.access(ctx, cluster)
 	if err != nil {
 		return err
 	}
@@ -166,36 +100,34 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		return err
 	}
 
-	if err := r.probe(ctx, cluster, ca, logger, status); err != nil {
+	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
 		return err
 	}
 
 	desired := argocd.ClusterSecret{
-		Name:                 cluster.SecretName,
-		Namespace:            r.cfg.ArgoCDNamespace,
-		DisplayName:          cluster.DisplayName,
-		Server:               cluster.ServerURL(),
-		CAData:               ca,
-		Project:              cluster.Project,
-		ClusterName:          cluster.Name,
-		ServingCertExpiresAt: status.ServingCertExpiresAt,
-		ExtraLabels:          cluster.Labels,
-		ExtraAnnotations:     cluster.Annotations,
+		Name:             cluster.SecretName,
+		Namespace:        r.cfg.ArgoCDNamespace,
+		DisplayName:      cluster.DisplayName,
+		Server:           cluster.ServerURL(),
+		CAData:           ca,
+		Project:          cluster.Project,
+		ClusterName:      cluster.Name,
+		ExtraLabels:      cluster.Labels,
+		ExtraAnnotations: cluster.Annotations,
+	}
+	if status.ServingCertExpiresAt != nil {
+		desired.ServingCertExpiresAt = status.ServingCertExpiresAt.Time
 	}
 
-	now := r.now()
-	applied := r.applied[cluster.Name]
+	applied := fingerprintFrom(*status)
+	desired.TokenExpiresAt = applied.TokenExpiresAt
 	first := applied == (argocd.Fingerprint{})
 
-	// Carry the recorded expiry into the desired state so the registration
-	// re-applies with the annotation it already had, rather than dropping it.
-	desired.TokenExpiresAt = applied.TokenExpiresAt
-
 	// Applying the registration is how the daemon observes what it published: an
-	// apply returns the object and needs only the patch verb. Skipped on the
-	// first pass for a cluster, where the credential has to be minted anyway and
-	// applying the label first would briefly show ArgoCD a cluster with no
-	// credential.
+	// apply returns the object and needs only the patch verb. Skipped on a
+	// cluster's first pass, where a credential has to be minted anyway and
+	// applying the label first would briefly show ArgoCD a cluster it cannot
+	// authenticate to.
 	var hasCredential bool
 	if !first {
 		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
@@ -205,16 +137,16 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 
 	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
 	if reason == "" {
-		status.Action = "up-to-date"
-		status.TokenExpiresAt = applied.TokenExpiresAt
+		status.LastAction = "up-to-date"
 		logger.Info("registration current",
 			"token_expires_at", applied.TokenExpiresAt.UTC().Format(time.RFC3339),
-			"serving_cert_days_left", status.ServingCertDaysLeft,
+			"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 		)
 		return nil
 	}
 
-	created, err := downstream.EnsureArgoCDIdentity(ctx, access.client, cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
+	created, err := downstream.EnsureArgoCDIdentity(ctx, access.client,
+		cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
 	if err != nil {
 		return err
 	}
@@ -229,7 +161,7 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		return err
 	}
 
-	granted := time.Until(token.ExpiresAt)
+	granted := token.ExpiresAt.Sub(now)
 	if granted < cluster.TokenTTL*9/10 {
 		logger.Warn("API server shortened the requested token lifetime",
 			"requested", cluster.TokenTTL.String(),
@@ -240,27 +172,86 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 	desired.BearerToken = token.Value
 	desired.TokenExpiresAt = token.ExpiresAt
 
-	// The credential goes on first when the Secret is new. A Secret carrying no
+	// The credential goes on first. A Secret carrying no
 	// argocd.argoproj.io/secret-type label is invisible to ArgoCD, so writing the
 	// credential before the registration means ArgoCD never sees a cluster it
-	// cannot authenticate to — not even for the moment between two applies.
+	// cannot authenticate to — not even between two applies.
 	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
 	if _, err := argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
-	r.applied[cluster.Name] = desired.Fingerprint()
 
-	status.Action = string(reason)
-	status.TokenExpiresAt = token.ExpiresAt
+	recordFingerprint(status, desired.Fingerprint())
+	status.LastAction = string(reason)
 	logger.Info("credential reissued",
 		"reason", string(reason),
 		"token_expires_at", token.ExpiresAt.UTC().Format(time.RFC3339),
-		"serving_cert_days_left", status.ServingCertDaysLeft,
+		"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 	)
 	return nil
 }
+
+// fingerprintFrom reads back what a previous pass recorded.
+func fingerprintFrom(status v1alpha1.ClusterConnectionStatus) argocd.Fingerprint {
+	f := argocd.Fingerprint{
+		Server:      status.AppliedServer,
+		DisplayName: status.AppliedDisplayName,
+		Project:     status.AppliedProject,
+		CAHash:      status.AppliedCAHash,
+	}
+	if status.TokenExpiresAt != nil {
+		f.TokenExpiresAt = status.TokenExpiresAt.Time
+	}
+	return f
+}
+
+func recordFingerprint(status *v1alpha1.ClusterConnectionStatus, f argocd.Fingerprint) {
+	status.AppliedServer = f.Server
+	status.AppliedDisplayName = f.DisplayName
+	status.AppliedProject = f.Project
+	status.AppliedCAHash = f.CAHash
+	status.TokenExpiresAt = &metav1.Time{Time: f.TokenExpiresAt}
+}
+
+func setCondition(
+	status *v1alpha1.ClusterConnectionStatus,
+	condType string,
+	state metav1.ConditionStatus,
+	reason, message string,
+	generation int64,
+) {
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               condType,
+		Status:             state,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: generation,
+	})
+}
+
+// reasonFor maps a failure onto the condition reason that best describes it, so
+// 'kubectl get ccon' distinguishes "never bootstrapped" from "cannot connect".
+func reasonFor(err error) string {
+	switch {
+	case errors.Is(err, errNoCredential):
+		return v1alpha1.ReasonAwaitingCredential
+	case errors.Is(err, errCertificateInvalid):
+		return v1alpha1.ReasonCertificateInvalid
+	default:
+		return v1alpha1.ReasonEndpointUnreachable
+	}
+}
+
+var (
+	// errNoCredential means the cluster has never been bootstrapped.
+	errNoCredential = errors.New("no stored credential")
+
+	// errCertificateInvalid means the endpoint's certificate cannot work for
+	// ArgoCD, whatever the credential.
+	errCertificateInvalid = errors.New("serving certificate unusable")
+)
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.
 //
@@ -277,39 +268,58 @@ func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error 
 		"so it can maintain %q", err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 
-// probe inspects the serving certificate at the direct endpoint and records what
-// it finds, warning about conditions that will break ArgoCD.
-func (r *Reconciler) probe(ctx context.Context, cluster config.Cluster, ca []byte, logger *slog.Logger, status *ClusterStatus) error {
+// probe inspects the serving certificate at the endpoint and records what it
+// finds, failing on conditions that would break ArgoCD.
+func (r *Reconciler) probe(
+	ctx context.Context,
+	cluster config.Cluster,
+	ca []byte,
+	status *v1alpha1.ClusterConnectionStatus,
+	logger *slog.Logger,
+) error {
 	cert, err := downstream.ProbeServingCert(ctx, cluster.Endpoint, ca)
 	if err != nil {
-		return fmt.Errorf("probing direct endpoint: %w", err)
+		return fmt.Errorf("probing the endpoint: %w", err)
 	}
 
-	status.ServingCertExpiresAt = cert.NotAfter
-	status.ServingCertDaysLeft = cert.DaysRemaining()
-	status.ServingCertTrusted = cert.TrustedByCA
+	status.ServingCertExpiresAt = &metav1.Time{Time: cert.NotAfter}
+	status.ServingCertDaysRemaining = int32(cert.DaysRemaining()) //nolint:gosec // G115: a day count cannot overflow int32
 
 	if cert.HostnameError != nil {
-		status.ServingCertWarning = cert.HostnameError.Error()
 		// Fail loudly: publishing this credential would produce a cluster
 		// registration ArgoCD can never connect to, which is far harder to
 		// diagnose from the ArgoCD side than an explicit error here.
-		return cert.HostnameError
+		setCondition(status, v1alpha1.ConditionServingCertificateValid, metav1.ConditionFalse,
+			v1alpha1.ReasonCertificateInvalid, cert.HostnameError.Error(), status.ObservedGeneration)
+		return fmt.Errorf("%w: %w", errCertificateInvalid, cert.HostnameError)
 	}
 
 	if !cert.TrustedByCA {
-		status.ServingCertWarning = "serving certificate does not verify against the cluster CA"
-		return fmt.Errorf("the certificate presented at %s does not verify against the cluster CA "+
+		message := fmt.Sprintf("the certificate presented at %s does not verify against the cluster CA "+
 			"published as ArgoCD's caData; ArgoCD would reject this endpoint", cluster.Endpoint)
+		setCondition(status, v1alpha1.ConditionServingCertificateValid, metav1.ConditionFalse,
+			v1alpha1.ReasonCertificateInvalid, message, status.ObservedGeneration)
+		return fmt.Errorf("%w: %s", errCertificateInvalid, message)
 	}
 
-	if remaining := time.Until(cert.NotAfter); remaining < cluster.ExpiryWarnThreshold {
-		logger.Warn("downstream API server certificate is nearing expiry",
+	if remaining := cert.NotAfter.Sub(r.now()); remaining < cluster.ExpiryWarnThreshold {
+		message := fmt.Sprintf("expires in %d days; rotate or reissue the API server's serving certificate, "+
+			"which depends on your distribution", cert.DaysRemaining())
+		setCondition(status, v1alpha1.ConditionServingCertificateValid, metav1.ConditionFalse,
+			v1alpha1.ReasonCertificateInvalid, message, status.ObservedGeneration)
+		logger.Warn("API server certificate is nearing expiry",
 			"expires_at", cert.NotAfter.UTC().Format(time.RFC3339),
-			"days_left", cert.DaysRemaining(),
+			"days_remaining", cert.DaysRemaining(),
 			"remedy", "rotate or reissue the API server's serving certificate; how depends on your distribution",
 		)
+		// Not an error: the registration still works until it expires, and
+		// refusing to publish would break a cluster that is merely due for
+		// maintenance.
+		return nil
 	}
+
+	setCondition(status, v1alpha1.ConditionServingCertificateValid, metav1.ConditionTrue,
+		v1alpha1.ReasonReady, "trusted, covers the endpoint, and not near expiry", status.ObservedGeneration)
 	return nil
 }
 
@@ -318,61 +328,25 @@ type clusterAccess struct {
 	client kubernetes.Interface
 }
 
-// access reaches a cluster at its own endpoint.
+// access reaches a cluster at its own endpoint with the credential provisioned
+// for it at bootstrap.
 //
-// It prefers the durable credential the daemon provisioned for itself. On the
-// first pass that credential does not exist, so the operator-supplied bootstrap
-// credential is used once to create it — after which the bootstrap Secret can be
-// deleted.
-func (r *Reconciler) access(ctx context.Context, cluster config.Cluster, logger *slog.Logger) (*clusterAccess, error) {
+// There is deliberately no fallback: the daemon never holds administrative
+// material for a downstream cluster, so a cluster with no credential is reported
+// as awaiting bootstrap rather than bootstrapped from something lying around.
+func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clusterAccess, error) {
 	creds, err := k8s.ReadCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName())
-	if err == nil {
-		client, err := clientFromToken(cluster.ServerURL(), creds.Token, creds.CA)
-		if err != nil {
-			return nil, err
+	if err != nil {
+		if errors.Is(err, k8s.ErrNotFound) {
+			return nil, fmt.Errorf("%w in %s/%s; bootstrap this cluster with "+
+				"'k2a-token-sync bootstrap --cluster %s --endpoint %s --from-kubeconfig <file>', "+
+				"or provision the identities and that Secret with your own automation",
+				errNoCredential, r.cfg.Namespace, cluster.CredentialsSecretName(), cluster.Name, cluster.Endpoint)
 		}
-		return &clusterAccess{client: client}, nil
-	}
-	if !errors.Is(err, k8s.ErrNotFound) {
 		return nil, err
 	}
 
-	// No durable credential yet. Either the operator ran the bootstrap
-	// subcommand (in which case the credential would exist) or they supplied
-	// bootstrap material for the daemon to use once, here.
-	if cluster.BootstrapSecret.Name == "" {
-		return nil, fmt.Errorf("cluster %q has no credential in %s/%s and no bootstrapSecret is configured; "+
-			"run 'k2a-token-sync bootstrap --cluster %s --endpoint %s --context <kubeconfig-context>', "+
-			"or set bootstrapSecret to a secret holding a kubeconfig or token for the cluster",
-			cluster.Name, r.cfg.Namespace, cluster.CredentialsSecretName(), cluster.Name, cluster.Endpoint)
-	}
-
-	logger.Info("no stored credential, bootstrapping from the supplied bootstrap secret",
-		"bootstrap_secret", r.cfg.Namespace+"/"+cluster.BootstrapSecret.Name)
-
-	bootstrapClient, err := r.bootstrapClient(ctx, cluster)
-	if err != nil {
-		return nil, err
-	}
-
-	provisioned, err := Provision(ctx, bootstrapClient, cluster)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := k8s.WriteCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName(),
-		provisioned, map[string]string{
-			"app.kubernetes.io/managed-by": "k2a-token-sync",
-			"k2a-token-sync.io/cluster":    cluster.Name,
-		}); err != nil {
-		return nil, fmt.Errorf("storing provisioned credential: %w", err)
-	}
-
-	logger.Info("stored durable credential; the bootstrap secret is no longer needed",
-		"credentials_secret", r.cfg.Namespace+"/"+cluster.CredentialsSecretName(),
-		"bootstrap_secret", r.cfg.Namespace+"/"+cluster.BootstrapSecret.Name)
-
-	client, err := clientFromToken(cluster.ServerURL(), provisioned.Token, provisioned.CA)
+	client, err := clientFromToken(cluster.ServerURL(), creds.Token, creds.CA)
 	if err != nil {
 		return nil, err
 	}
@@ -382,9 +356,9 @@ func (r *Reconciler) access(ctx context.Context, cluster config.Cluster, logger 
 // Provision installs the daemon's own identity in a downstream cluster and
 // returns a durable credential for it.
 //
-// A bound token cannot be used here: its lifetime is capped by the API server,
-// so the daemon would eventually lock itself out with no way back in without
-// another human bootstrap. The identity is narrowly scoped instead.
+// The identity is narrowly scoped — see downstream.EnsureAgentIdentity — so the
+// credential this returns can do little beyond minting tokens and reading the
+// cluster CA.
 func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
 	namespace := cluster.ServiceAccount.Namespace
 
@@ -407,54 +381,6 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 	}
 
 	return &k8s.Credentials{Token: token, CA: ca}, nil
-}
-
-// bootstrapClient builds a client from the operator-supplied bootstrap Secret,
-// which may hold either a kubeconfig or a bare bearer token.
-func (r *Reconciler) bootstrapClient(ctx context.Context, cluster config.Cluster) (kubernetes.Interface, error) {
-	secret, err := k8s.GetSecret(ctx, r.local, r.cfg.Namespace, cluster.BootstrapSecret.Name)
-	if err != nil {
-		if errors.Is(err, k8s.ErrNotFound) {
-			return nil, fmt.Errorf("cluster %q has no stored credential and its bootstrap secret %s/%s is missing; "+
-				"run 'k2a-token-sync bootstrap --cluster %s' or create the secret manually: %w",
-				cluster.Name, r.cfg.Namespace, cluster.BootstrapSecret.Name, cluster.Name, err)
-		}
-		return nil, err
-	}
-
-	if raw, ok := secret.Data[cluster.BootstrapSecret.Key]; ok && len(raw) > 0 {
-		return clientFromKubeconfig(raw)
-	}
-	if raw, ok := secret.Data["token"]; ok && len(raw) > 0 {
-		ca := secret.Data["ca.crt"]
-		return clientFromToken(cluster.ServerURL(), string(raw), ca)
-	}
-	return nil, fmt.Errorf("bootstrap secret %s/%s has neither a %q nor a \"token\" key",
-		r.cfg.Namespace, cluster.BootstrapSecret.Name, cluster.BootstrapSecret.Key)
-}
-
-// clientFromKubeconfig builds a client from raw kubeconfig bytes.
-//
-// The server address is taken from the kubeconfig as-is. A kubeconfig written
-// for use on the node itself usually points at https://127.0.0.1:6443, so one
-// copied straight off a control-plane node must have its server rewritten to the
-// reachable endpoint before being handed over.
-func clientFromKubeconfig(raw []byte) (kubernetes.Interface, error) {
-	apiConfig, err := clientcmd.Load(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parsing bootstrap kubeconfig: %w", err)
-	}
-	restCfg, err := clientcmd.NewDefaultClientConfig(*apiConfig, nil).ClientConfig()
-	if err != nil {
-		return nil, fmt.Errorf("building client from bootstrap kubeconfig: %w", err)
-	}
-	restCfg.Timeout = clientTimeout
-
-	client, err := kubernetes.NewForConfig(restCfg)
-	if err != nil {
-		return nil, fmt.Errorf("creating client from bootstrap kubeconfig: %w", err)
-	}
-	return client, nil
 }
 
 func clientFromToken(server, token string, ca []byte) (kubernetes.Interface, error) {

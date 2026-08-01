@@ -10,27 +10,11 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/krisiasty/k2a-token-sync/internal/config"
+	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 	kubeclient "github.com/krisiasty/k2a-token-sync/internal/k8s"
 	"github.com/krisiasty/k2a-token-sync/internal/reconcile"
-)
-
-const (
-	// retryInterval is how soon a failed pass is retried, before backoff.
-	retryInterval = 1 * time.Minute
-
-	// maxRetryInterval caps the exponential backoff.
-	maxRetryInterval = 30 * time.Minute
-
-	// minPassInterval floors the derived pass interval, so an aggressively
-	// capped token lifetime cannot turn the loop into a busy wait.
-	minPassInterval = 1 * time.Minute
-
-	// passTimeout bounds one reconciliation pass over all clusters. Generous,
-	// because a pass over many clusters legitimately takes several minutes.
-	passTimeout = 45 * time.Minute
 )
 
 func main() {
@@ -48,23 +32,6 @@ func main() {
 		logger.Error("daemon failed", "error", err)
 		os.Exit(1)
 	}
-}
-
-// nextPassInterval decides how long to sleep after a clean pass.
-//
-// The configured refreshInterval is an upper bound, not the whole story: a
-// downstream API server may cap token lifetime via
-// --service-account-max-token-expiration, so a credential can be far shorter
-// lived than requested. Sleeping the full interval would then leave ArgoCD
-// holding an expired token for most of the gap. Waking at half the shortest
-// remaining lifetime keeps a margin of one whole refresh, and the floor stops a
-// pathologically short cap from turning into a busy loop.
-func nextPassInterval(refreshInterval time.Duration, soonestExpiry, now time.Time) time.Duration {
-	if soonestExpiry.IsZero() {
-		return refreshInterval
-	}
-	derived := soonestExpiry.Sub(now) / 2
-	return max(min(refreshInterval, derived), minPassInterval)
 }
 
 func newLogger() *slog.Logger {
@@ -120,9 +87,12 @@ func runDaemon(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	reconciler := reconcile.New(cfg, local, logger)
+	dyn, err := kubeclient.NewDynamicClient()
+	if err != nil {
+		return fmt.Errorf("building dynamic client: %w", err)
+	}
 
-	state := newHealthState(len(cfg.Clusters))
+	state := newHealthState()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -133,51 +103,16 @@ func runDaemon(logger *slog.Logger) error {
 	logger.Info("starting k2a-token-sync",
 		"version", versionString(),
 		"namespace", cfg.Namespace,
-		"clusters", len(cfg.Clusters),
-		"refresh_interval", cfg.RefreshInterval.String(),
+		"argocd_namespace", cfg.ArgoCDNamespace,
+		"poll_interval", pollInterval.String(),
 	)
 
-	backoff := retryInterval
+	newScheduler(
+		inventory.NewClient(dyn, cfg.Namespace),
+		reconcile.New(cfg, local, logger),
+		logger,
+		state,
+	).run(ctx)
 
-	for {
-		state.recordAttempt()
-
-		passCtx, cancel := context.WithTimeout(ctx, passTimeout)
-		result := reconciler.Run(passCtx)
-		cancel()
-
-		if ctx.Err() != nil {
-			logger.Info("shutting down")
-			return nil
-		}
-
-		var next time.Duration
-		if failures := result.Failures(); failures > 0 {
-			next = backoff
-			backoff = min(backoff*2, maxRetryInterval)
-			state.record(result, next)
-			logger.Error("reconciliation pass had failures",
-				"failed", failures,
-				"total", len(result.Clusters),
-				"retry_in", next.Round(time.Second).String(),
-			)
-		} else {
-			backoff = retryInterval
-			next = nextPassInterval(cfg.RefreshInterval, result.SoonestTokenExpiry(), time.Now())
-			state.record(result, next)
-			logger.Info("reconciliation pass complete",
-				"clusters", len(result.Clusters),
-				"next_pass_in", next.Round(time.Second).String(),
-			)
-		}
-
-		timer := time.NewTimer(next)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			logger.Info("shutting down")
-			return nil
-		case <-timer.C:
-		}
-	}
+	return nil
 }

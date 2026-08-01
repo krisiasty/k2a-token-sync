@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -53,6 +54,21 @@ func NewClient() (kubernetes.Interface, error) {
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("creating kubernetes client: %w", err)
+	}
+	return client, nil
+}
+
+// NewDynamicClient builds a dynamic client for the cluster the daemon runs in.
+// It is used for ClusterConnection objects, which need no typed client: the
+// daemon converts them with runtime.DefaultUnstructuredConverter.
+func NewDynamicClient() (dynamic.Interface, error) {
+	cfg, err := LocalRESTConfig()
+	if err != nil {
+		return nil, err
+	}
+	client, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("creating dynamic client: %w", err)
 	}
 	return client, nil
 }

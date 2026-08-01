@@ -1,0 +1,121 @@
+package main
+
+import (
+	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
+)
+
+func TestNextInterval(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		expiresIn time.Duration
+		noExpiry  bool
+		want      time.Duration
+	}{
+		{
+			// Nothing published yet, so there is no expiry to derive from.
+			name:     "no recorded expiry falls back to the cap",
+			noExpiry: true,
+			want:     maxPassInterval,
+		},
+		{
+			// Half of 30 days is 15, well past the daily cap, so the cap wins and
+			// the certificate still gets checked every day.
+			name:      "long-lived token is capped daily",
+			expiresIn: 720 * time.Hour,
+			want:      maxPassInterval,
+		},
+		{
+			// A capped token is the case this exists for: waking at half the
+			// remaining lifetime keeps a whole refresh in hand.
+			name:      "short-lived token pulls the interval in",
+			expiresIn: 4 * time.Hour,
+			want:      2 * time.Hour,
+		},
+		{
+			// A pathologically short cap must not turn the loop into a busy wait.
+			name:      "very short token is floored",
+			expiresIn: 30 * time.Second,
+			want:      minPassInterval,
+		},
+		{
+			// An already-expired token would derive a negative interval.
+			name:      "expired token is floored rather than negative",
+			expiresIn: -time.Hour,
+			want:      minPassInterval,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var status v1alpha1.ClusterConnectionStatus
+			if !tc.noExpiry {
+				status.TokenExpiresAt = &metav1.Time{Time: now.Add(tc.expiresIn)}
+			}
+
+			got := nextInterval(status, now)
+			if got != tc.want {
+				t.Fatalf("nextInterval(+%v) = %v, want %v", tc.expiresIn, got, tc.want)
+			}
+			if got <= 0 {
+				t.Fatalf("nextInterval returned %v; a non-positive interval would spin", got)
+			}
+		})
+	}
+}
+
+func TestHealthReadinessTracksEveryCluster(t *testing.T) {
+	t.Parallel()
+
+	state := newHealthState()
+	if state.isReady() {
+		t.Error("a freshly created state reports ready before anything reconciled")
+	}
+
+	state.record([]clusterReport{{Name: "a", Synced: true}, {Name: "b", Synced: false}}, time.Minute)
+	if state.isReady() {
+		t.Error("ready with one cluster unsynced; a partial failure must be visible")
+	}
+
+	state.record([]clusterReport{{Name: "a", Synced: true}, {Name: "b", Synced: true}}, time.Minute)
+	if !state.isReady() {
+		t.Error("not ready although every cluster synced")
+	}
+
+	// An empty inventory is ready: there is nothing to fail, and holding the pod
+	// unready would make a cluster-less install look broken.
+	empty := newHealthState()
+	empty.record(nil, time.Minute)
+	if !empty.isReady() {
+		t.Error("an empty inventory reports unready")
+	}
+}
+
+func TestHealthLivenessSurvivesAPassInProgress(t *testing.T) {
+	t.Parallel()
+
+	state := newHealthState()
+	if !state.isLive() {
+		t.Error("not live at startup")
+	}
+
+	state.recordAttempt()
+	if !state.isLive() {
+		t.Error("not live while a pass is in progress")
+	}
+
+	state.record([]clusterReport{{Name: "a", Synced: true}}, time.Minute)
+	if !state.isLive() {
+		t.Error("not live immediately after a pass")
+	}
+}
