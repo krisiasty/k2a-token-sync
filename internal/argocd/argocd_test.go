@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -125,11 +126,11 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	registrationOnly := testSecret()
 	registrationOnly.BearerToken = ""
 
-	hasCredential, err := ApplyRegistration(ctx, client, registrationOnly)
+	published, err := ApplyRegistration(ctx, client, registrationOnly)
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
-	if !hasCredential {
+	if published == "" {
 		t.Error("ApplyRegistration reported no credential, but one was applied before it")
 	}
 
@@ -137,7 +138,7 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the secret back: %v", err)
 	}
-	if !hasBearerToken(secret) {
+	if hashCredential(secret) == "" {
 		t.Fatal("re-applying the registration stripped the credential")
 	}
 }
@@ -154,11 +155,11 @@ func TestApplyRegistrationReportsAMissingCredential(t *testing.T) {
 	desired := testSecret()
 	desired.BearerToken = ""
 
-	hasCredential, err := ApplyRegistration(ctx, client, desired)
+	published, err := ApplyRegistration(ctx, client, desired)
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
-	if hasCredential {
+	if published != "" {
 		t.Error("ApplyRegistration reported a credential on a Secret that has none")
 	}
 }
@@ -252,57 +253,59 @@ func TestNeedsRefresh(t *testing.T) {
 		}
 	}
 
+	const publishedHash = "the-credential-this-tool-published"
+
 	cases := []struct {
-		name          string
-		mutate        func(*Fingerprint)
-		hasCredential bool
-		want          RefreshReason
-		wantSkip      bool
+		name      string
+		mutate    func(*Fingerprint)
+		published string
+		want      RefreshReason
+		wantSkip  bool
 	}{
-		{name: "fresh registration needs nothing", mutate: func(*Fingerprint) {}, hasCredential: true, wantSkip: true},
+		{name: "fresh registration needs nothing", mutate: func(*Fingerprint) {}, published: publishedHash, wantSkip: true},
 		{
 			// Also the status-was-lost case: nothing recorded reads as reissue.
-			name:          "nothing published yet",
-			mutate:        func(f *Fingerprint) { *f = Fingerprint{} },
-			hasCredential: true,
-			want:          ReasonUnrecorded,
+			name:      "nothing published yet",
+			mutate:    func(f *Fingerprint) { *f = Fingerprint{} },
+			published: publishedHash,
+			want:      ReasonUnrecorded,
 		},
 		{
 			// The self-healing path: someone deleted or emptied the Secret.
-			name:          "credential gone from the secret",
-			mutate:        func(*Fingerprint) {},
-			hasCredential: false,
-			want:          ReasonNoToken,
+			name:      "credential gone from the secret",
+			mutate:    func(*Fingerprint) {},
+			published: "",
+			want:      ReasonNoToken,
 		},
 		{
-			name:          "server drift",
-			mutate:        func(f *Fingerprint) { f.Server = "https://10.9.9.9:6443" },
-			hasCredential: true,
-			want:          ReasonServerDrift,
+			name:      "server drift",
+			mutate:    func(f *Fingerprint) { f.Server = "https://10.9.9.9:6443" },
+			published: publishedHash,
+			want:      ReasonServerDrift,
 		},
 		{
-			name:          "name drift",
-			mutate:        func(f *Fingerprint) { f.DisplayName = "renamed" },
-			hasCredential: true,
-			want:          ReasonNameDrift,
+			name:      "name drift",
+			mutate:    func(f *Fingerprint) { f.DisplayName = "renamed" },
+			published: publishedHash,
+			want:      ReasonNameDrift,
 		},
 		{
-			name:          "project drift",
-			mutate:        func(f *Fingerprint) { f.Project = "other" },
-			hasCredential: true,
-			want:          ReasonProjectDrift,
+			name:      "project drift",
+			mutate:    func(f *Fingerprint) { f.Project = "other" },
+			published: publishedHash,
+			want:      ReasonProjectDrift,
 		},
 		{
-			name:          "ca drift",
-			mutate:        func(f *Fingerprint) { f.CAHash = HashCA([]byte("different")) },
-			hasCredential: true,
-			want:          ReasonCADrift,
+			name:      "ca drift",
+			mutate:    func(f *Fingerprint) { f.CAHash = HashCA([]byte("different")) },
+			published: publishedHash,
+			want:      ReasonCADrift,
 		},
 		{
-			name:          "unrecorded expiry",
-			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = time.Time{} },
-			hasCredential: true,
-			want:          ReasonUnknownExpiry,
+			name:      "unrecorded expiry",
+			mutate:    func(f *Fingerprint) { f.TokenExpiresAt = time.Time{} },
+			published: publishedHash,
+			want:      ReasonUnknownExpiry,
 		},
 		{
 			// Half the lifetime is the refresh point, so a long outage still
@@ -311,16 +314,45 @@ func TestNeedsRefresh(t *testing.T) {
 			// No issue time here, nor in any case above: they exercise the fallback
 			// for a status written before it was recorded, which must keep behaving
 			// exactly as it used to.
-			name:          "past half its lifetime",
-			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 - time.Minute) },
-			hasCredential: true,
-			want:          ReasonExpiring,
+			name:      "past half its lifetime",
+			mutate:    func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 - time.Minute) },
+			published: publishedHash,
+			want:      ReasonExpiring,
 		},
 		{
-			name:          "just inside half its lifetime",
-			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 + time.Minute) },
-			hasCredential: true,
-			wantSkip:      true,
+			name:      "just inside half its lifetime",
+			mutate:    func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 + time.Minute) },
+			published: publishedHash,
+			wantSkip:  true,
+		},
+		{
+			// Somebody else wrote over the credential. Nothing else about the Secret
+			// has to change for this to be true, which is why no other comparison
+			// here can see it.
+			name: "credential replaced by another writer",
+			mutate: func(f *Fingerprint) {
+				f.CredentialHash = "the-digest-this-tool-recorded"
+			},
+			published: "a-completely-different-credential",
+			want:      ReasonCredentialReplaced,
+		},
+		{
+			// The same digest is the ordinary case, and must not reissue.
+			name: "credential is the one that was published",
+			mutate: func(f *Fingerprint) {
+				f.CredentialHash = publishedHash
+			},
+			published: publishedHash,
+			wantSkip:  true,
+		},
+		{
+			// A status written before digests were recorded has none. Comparing
+			// against nothing would reissue every cluster at once on upgrade, so the
+			// check waits for the next reissue to record one.
+			name:      "no digest recorded yet",
+			mutate:    func(f *Fingerprint) { f.CredentialHash = "" },
+			published: "anything at all",
+			wantSkip:  true,
 		},
 		{
 			// The case the issue time exists for. Against half the *requested*
@@ -332,8 +364,8 @@ func TestNeedsRefresh(t *testing.T) {
 				f.TokenIssuedAt = now.Add(-10 * time.Minute)
 				f.TokenExpiresAt = now.Add(50 * time.Minute)
 			},
-			hasCredential: true,
-			wantSkip:      true,
+			published: publishedHash,
+			wantSkip:  true,
 		},
 		{
 			// And it must still be reissued in time. Half of an hour, not half of
@@ -343,8 +375,8 @@ func TestNeedsRefresh(t *testing.T) {
 				f.TokenIssuedAt = now.Add(-31 * time.Minute)
 				f.TokenExpiresAt = now.Add(29 * time.Minute)
 			},
-			hasCredential: true,
-			want:          ReasonExpiring,
+			published: publishedHash,
+			want:      ReasonExpiring,
 		},
 		{
 			// Granted what was asked for: the same answer either way, which is why
@@ -354,8 +386,8 @@ func TestNeedsRefresh(t *testing.T) {
 				f.TokenIssuedAt = now.Add(-ttl/2 - time.Minute)
 				f.TokenExpiresAt = now.Add(ttl/2 - time.Minute)
 			},
-			hasCredential: true,
-			want:          ReasonExpiring,
+			published: publishedHash,
+			want:      ReasonExpiring,
 		},
 	}
 
@@ -365,7 +397,7 @@ func TestNeedsRefresh(t *testing.T) {
 			applied := current()
 			tc.mutate(&applied)
 
-			got := NeedsRefresh(applied, tc.hasCredential, desired, ttl, now)
+			got := NeedsRefresh(applied, tc.published, desired, ttl, now)
 			if tc.wantSkip {
 				if got != "" {
 					t.Fatalf("NeedsRefresh = %q, want no refresh", got)
@@ -389,11 +421,78 @@ func TestFingerprintRoundTrip(t *testing.T) {
 	desired.TokenIssuedAt = issued
 	desired.TokenExpiresAt = issued.Add(720 * time.Hour)
 
+	const published = "digest-of-what-was-published"
+
 	applied := desired.Fingerprint()
+	applied.CredentialHash = published
 	if applied.TokenIssuedAt != issued {
 		t.Errorf("the fingerprint dropped the issue time: %v", applied.TokenIssuedAt)
 	}
-	if got := NeedsRefresh(applied, true, desired, 720*time.Hour, issued.Add(time.Minute)); got != "" {
+	if got := NeedsRefresh(applied, published, desired, 720*time.Hour, issued.Add(time.Minute)); got != "" {
 		t.Fatalf("NeedsRefresh = %q immediately after applying, want no refresh", got)
+	}
+}
+
+// The digest is the whole mechanism, so what it does and does not distinguish
+// matters. Two credentials that differ in any way must hash differently, and
+// anything that is not a usable credential must hash to nothing at all —
+// otherwise "no credential" and "somebody else's credential" become the same
+// answer, and they call for opposite reactions.
+func TestHashCredential(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	published := func(t *testing.T, mutate func(*ClusterSecret)) string {
+		t.Helper()
+		client := newClient()
+		desired := testSecret()
+		mutate(&desired)
+		if err := ApplyCredential(ctx, client, desired); err != nil {
+			t.Fatalf("ApplyCredential returned unexpected error: %v", err)
+		}
+		secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("reading the secret back: %v", err)
+		}
+		return hashCredential(secret)
+	}
+
+	base := published(t, func(*ClusterSecret) {})
+	if base == "" {
+		t.Fatal("a published credential hashed to nothing")
+	}
+
+	same := published(t, func(*ClusterSecret) {})
+	if same != base {
+		t.Error("the same credential hashed differently twice; every pass would reissue")
+	}
+
+	otherToken := published(t, func(c *ClusterSecret) { c.BearerToken = "a-different-token" })
+	if otherToken == base {
+		t.Error("a different bearer token hashed the same; a replaced credential would go unnoticed")
+	}
+
+	// The CA travels in the same payload, and a hand-edited one breaks ArgoCD's
+	// connection just as thoroughly as a bad token.
+	otherCA := published(t, func(c *ClusterSecret) {
+		c.CAData = []byte("-----BEGIN CERTIFICATE-----\nDIFFERENT\n-----END CERTIFICATE-----\n")
+	})
+	if otherCA == base {
+		t.Error("a different CA bundle hashed the same")
+	}
+
+	// Absent, and present-but-empty, both mean there is no credential.
+	for _, tc := range []struct {
+		name   string
+		secret *corev1.Secret
+	}{
+		{"no config key", &corev1.Secret{}},
+		{"config is not json", &corev1.Secret{Data: map[string][]byte{"config": []byte("{")}}},
+		{"config carries no token", &corev1.Secret{Data: map[string][]byte{"config": []byte(`{"tlsClientConfig":{}}`)}}},
+	} {
+		if got := hashCredential(tc.secret); got != "" {
+			t.Errorf("%s hashed to %q, want the empty string that means no credential", tc.name, got)
+		}
 	}
 }

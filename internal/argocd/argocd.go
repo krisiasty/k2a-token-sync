@@ -184,23 +184,23 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 		WithData(map[string][]byte{configKey: payload}), nil
 }
 
-// ApplyRegistration writes everything except the credential and reports whether
-// the credential is present on the server afterwards.
+// ApplyRegistration writes everything except the credential and reports the
+// credential that is on the server afterwards, digested.
 //
 // An apply returns the object it produced, and needs only the patch verb, so
 // this doubles as k2a-token-sync's only view of what it has published: no get, list
 // or watch permission in ArgoCD's namespace is required anywhere. That is what
 // makes a deleted or emptied Secret self-healing — the next pass recreates the
 // registration and sees that the credential is gone.
-func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (bool, error) {
+func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (string, error) {
 	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(), metav1.ApplyOptions{
 		FieldManager: FieldManagerRegistration,
 		Force:        true,
 	})
 	if err != nil {
-		return false, fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
+		return "", fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
-	return hasBearerToken(applied), nil
+	return hashCredential(applied), nil
 }
 
 // ApplyCredential writes the credential half.
@@ -218,16 +218,30 @@ func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired C
 	return nil
 }
 
-func hasBearerToken(secret *corev1.Secret) bool {
+// hashCredential digests the credential half of a Secret as it currently stands
+// on the server, or returns "" when there is effectively none.
+//
+// An empty string means the same thing it always did — no usable credential — so
+// a config present but carrying no bearer token still counts as absent.
+//
+// The digest covers the whole config payload rather than the token alone, because
+// ArgoCD's TLS settings live in there too: a hand-edited caData would otherwise
+// survive unnoticed until the next reissue, breaking ArgoCD's connection while
+// the token itself looked perfectly fine.
+func hashCredential(secret *corev1.Secret) string {
 	raw, ok := secret.Data[configKey]
 	if !ok {
-		return false
+		return ""
 	}
 	var parsed clusterConfig
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return false
+		return ""
 	}
-	return parsed.BearerToken != ""
+	if parsed.BearerToken == "" {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // Fingerprint is what a previous pass wrote, as recorded in the owning
@@ -243,6 +257,14 @@ type Fingerprint struct {
 	CAHash         string
 	TokenExpiresAt time.Time
 	TokenIssuedAt  time.Time
+
+	// CredentialHash digests the credential this tool last published.
+	//
+	// Every other field here describes what was *wanted*. This one records what
+	// was actually left on the server, so the next pass can tell its own
+	// credential apart from somebody else's — which is the one thing an apply
+	// response can reveal about a Secret nothing here may read.
+	CredentialHash string
 }
 
 // Fingerprint describes what applying this ClusterSecret would publish, for
@@ -282,6 +304,13 @@ const (
 	ReasonUnrecorded RefreshReason = "no registration recorded in status"
 	ReasonNoToken    RefreshReason = "cluster secret has no bearer token"
 
+	// ReasonCredentialReplaced means the published credential is not the one this
+	// tool last wrote. Something else — External Secrets, a sealed-secrets
+	// controller, a person with kubectl — has written over it, and whatever is
+	// there now was not minted here, is not tracked here, and cannot be renewed
+	// here.
+	ReasonCredentialReplaced RefreshReason = "cluster secret holds a credential this tool did not write"
+
 	// ReasonIdentityRecreated is the one reason that does not come from comparing
 	// what was published against what is wanted. Both can match exactly while the
 	// token is dead: a bound token carries the ServiceAccount's UID, so deleting
@@ -298,19 +327,25 @@ const (
 
 // NeedsRefresh decides whether to mint a new credential.
 //
-// applied is what the last pass recorded in status; hasCredential is what the
-// server reported when the registration was applied this pass. Minting on every
-// cycle would work, but each write churns ArgoCD's cluster cache, so a
-// credential is reissued only when it is past half its lifetime, when something
-// it depends on has drifted, or when it has gone missing entirely.
-func NeedsRefresh(applied Fingerprint, hasCredential bool, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
+// applied is what the last pass recorded in status; published is the credential
+// the server reported when the registration was applied this pass, digested.
+// Minting on every cycle would work, but each write churns ArgoCD's cluster
+// cache, so a credential is reissued only when it is past half its lifetime, when
+// something it depends on has drifted, or when it has gone missing or been
+// replaced.
+func NeedsRefresh(applied Fingerprint, published string, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
 	switch {
 	case applied == (Fingerprint{}):
 		// Nothing recorded: either this cluster has never been published, or
 		// status was lost. Reissuing is the safe reading of both.
 		return ReasonUnrecorded
-	case !hasCredential:
+	case published == "":
 		return ReasonNoToken
+	case applied.CredentialHash != "" && published != applied.CredentialHash:
+		// Only meaningful once a hash has been recorded. A status written before
+		// this existed has none, so the comparison waits for the next reissue to
+		// record one rather than reissuing every cluster at once on upgrade.
+		return ReasonCredentialReplaced
 	case applied.Server != desired.Server:
 		return ReasonServerDrift
 	case applied.DisplayName != desired.DisplayName:

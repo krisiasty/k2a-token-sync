@@ -256,4 +256,14 @@ type ClusterConnectionStatus struct {
 
 	// +optional
 	AppliedCAHash string `json:"appliedCAHash,omitempty"`
+
+	// AppliedCredentialHash digests the credential last published to ArgoCD.
+	//
+	// Every other applied* field records what was wanted. This one records what
+	// was left on the server, so a later pass can tell its own credential apart
+	// from one written over it by something else — the only thing an apply
+	// response can reveal about a Secret this tool may not read.
+	//
+	// +optional
+	AppliedCredentialHash string `json:"appliedCredentialHash,omitempty"`
 }

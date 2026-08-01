@@ -187,14 +187,14 @@ func (r *Reconciler) reconcile(
 	// cluster's first pass, where a credential has to be minted anyway and
 	// applying the label first would briefly show ArgoCD a cluster it cannot
 	// authenticate to.
-	var hasCredential bool
+	var published string
 	if !first {
-		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
+		if published, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
 			return r.argocdSecretError(cluster, err)
 		}
 	}
 
-	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
+	reason := argocd.NeedsRefresh(applied, published, desired, cluster.TokenTTL, now)
 	if repairs.ServiceAccount {
 		// Outranks anything the published state comparison concluded: that compares
 		// what was written against what is wanted, and both can look perfect while
@@ -259,11 +259,17 @@ func (r *Reconciler) reconcile(
 	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
-	if _, err := argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
+	// The response reports the credential as it now stands, which is what the next
+	// pass has to recognise. Hashing what was sent instead would record an
+	// intention; this records the fact.
+	republished, err := argocd.ApplyRegistration(ctx, r.local, desired)
+	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
 
-	recordFingerprint(status, desired.Fingerprint())
+	fingerprint := desired.Fingerprint()
+	fingerprint.CredentialHash = republished
+	recordFingerprint(status, fingerprint)
 	// The reason alone would read as a state rather than an action: "cluster secret
 	// does not exist" is not what the pass did, and it is untrue by the time it is
 	// recorded. Naming the action keeps the field consistent with "up-to-date" and
@@ -280,10 +286,11 @@ func (r *Reconciler) reconcile(
 // fingerprintFrom reads back what a previous pass recorded.
 func fingerprintFrom(status v1alpha1.ClusterConnectionStatus) argocd.Fingerprint {
 	f := argocd.Fingerprint{
-		Server:      status.AppliedServer,
-		DisplayName: status.AppliedDisplayName,
-		Project:     status.AppliedProject,
-		CAHash:      status.AppliedCAHash,
+		Server:         status.AppliedServer,
+		DisplayName:    status.AppliedDisplayName,
+		Project:        status.AppliedProject,
+		CAHash:         status.AppliedCAHash,
+		CredentialHash: status.AppliedCredentialHash,
 	}
 	if status.TokenExpiresAt != nil {
 		f.TokenExpiresAt = status.TokenExpiresAt.Time
@@ -299,6 +306,7 @@ func recordFingerprint(status *v1alpha1.ClusterConnectionStatus, f argocd.Finger
 	status.AppliedDisplayName = f.DisplayName
 	status.AppliedProject = f.Project
 	status.AppliedCAHash = f.CAHash
+	status.AppliedCredentialHash = f.CredentialHash
 	status.TokenExpiresAt = &metav1.Time{Time: f.TokenExpiresAt}
 	status.TokenIssuedAt = &metav1.Time{Time: f.TokenIssuedAt}
 }
