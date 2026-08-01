@@ -185,9 +185,10 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 	out.Annotations = spec.Annotations
 	out.Project = spec.Project
 
-	out.ServiceAccount = ServiceAccountRef{
-		Name:      orDefault(spec.ServiceAccount.Name, defaultServiceAccountName),
-		Namespace: orDefault(spec.ServiceAccount.Namespace, defaultServiceAccountNS),
+	out.ServiceAccount = ServiceAccountRef{Name: defaultServiceAccountName, Namespace: defaultServiceAccountNS}
+	if spec.ServiceAccount != nil {
+		out.ServiceAccount.Name = orDefault(spec.ServiceAccount.Name, defaultServiceAccountName)
+		out.ServiceAccount.Namespace = orDefault(spec.ServiceAccount.Namespace, defaultServiceAccountNS)
 	}
 
 	if out.TokenTTL, err = parseDuration("tokenTTL", spec.TokenTTL, defaultTokenTTL, minTokenTTL); err != nil {

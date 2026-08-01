@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -18,9 +19,12 @@ import (
 )
 
 func main() {
-	logger := newLogger()
-
+	// Subcommands log to stderr, because stdout is their output: the bootstrap
+	// subcommand prints a manifest there, and log lines mixed into it would break
+	// a redirect or a pipe into kubectl. The daemon has no such output, and its
+	// logs belong on stdout where a collector expects them.
 	if len(os.Args) > 1 {
+		logger := newLogger(os.Stderr)
 		if err := runSubcommand(logger, os.Args[1], os.Args[2:]); err != nil {
 			logger.Error("command failed", "error", err)
 			os.Exit(1)
@@ -28,14 +32,15 @@ func main() {
 		return
 	}
 
+	logger := newLogger(os.Stdout)
 	if err := runDaemon(logger); err != nil {
 		logger.Error("daemon failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func newLogger() *slog.Logger {
-	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+func newLogger(w io.Writer) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
 		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
 			if attr.Key == slog.TimeKey && attr.Value.Kind() == slog.KindTime {
 				return slog.String(attr.Key, attr.Value.Time().UTC().Format("2006-01-02T15:04:05.000Z07:00"))

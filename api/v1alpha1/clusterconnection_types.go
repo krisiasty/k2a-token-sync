@@ -112,7 +112,7 @@ type ClusterConnectionSpec struct {
 	//
 	// +optional
 	// +kubebuilder:default={name: "argocd-manager", namespace: "kube-system"}
-	ServiceAccount ServiceAccountRef `json:"serviceAccount,omitempty"`
+	ServiceAccount *ServiceAccountRef `json:"serviceAccount,omitempty"`
 
 	// AgentServiceAccountName is the downstream identity the daemon itself
 	// authenticates as, in the same namespace as ServiceAccount. It is narrowly

@@ -18,7 +18,7 @@ func discardLogger() *slog.Logger {
 func minimalSpec() v1alpha1.ClusterConnectionSpec {
 	return v1alpha1.ClusterConnectionSpec{
 		Endpoint: "10.0.0.10",
-		ServiceAccount: v1alpha1.ServiceAccountRef{
+		ServiceAccount: &v1alpha1.ServiceAccountRef{
 			Name:      defaultServiceAccountName,
 			Namespace: defaultServiceAccountNS,
 		},
@@ -100,7 +100,7 @@ func TestFromSpecOverrides(t *testing.T) {
 	spec.SecretName = "cluster-custom"
 	spec.Project = "platform"
 	spec.TokenTTL = "12h"
-	spec.ServiceAccount = v1alpha1.ServiceAccountRef{Name: "argo-sa", Namespace: "argo-system"}
+	spec.ServiceAccount = &v1alpha1.ServiceAccountRef{Name: "argo-sa", Namespace: "argo-system"}
 
 	cluster, err := FromSpec("downstream-1", spec)
 	if err != nil {

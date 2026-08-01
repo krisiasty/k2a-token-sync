@@ -86,6 +86,30 @@ func NewDynamicClient() (dynamic.Interface, error) {
 	return client, nil
 }
 
+// DynamicClientForContext builds a dynamic client from a named kubeconfig
+// context, for the bootstrap subcommand's --create.
+func DynamicClientForContext(kubeconfigPath, contextName string) (dynamic.Interface, error) {
+	if kubeconfigPath == "" && contextName == "" {
+		return NewDynamicClient()
+	}
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfigPath != "" {
+		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath}
+	}
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		rules,
+		&clientcmd.ConfigOverrides{CurrentContext: contextName},
+	).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig context %q: %w", contextName, err)
+	}
+	client, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("creating dynamic client for context %q: %w", contextName, err)
+	}
+	return client, nil
+}
+
 // LocalRESTConfig resolves in-cluster configuration, then the ambient kubeconfig.
 func LocalRESTConfig() (*rest.Config, error) {
 	cfg, err := rest.InClusterConfig()

@@ -491,6 +491,13 @@ func formatTime(t *metav1.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
+// ClientFromCredentials builds a client for a downstream cluster from a stored
+// credential, so the bootstrap subcommand can verify one exactly as the daemon
+// will use it.
+func ClientFromCredentials(server string, creds *k8s.Credentials) (kubernetes.Interface, error) {
+	return clientFromToken(server, creds.Token, creds.CA)
+}
+
 func clientFromToken(server, token string, ca []byte) (kubernetes.Interface, error) {
 	cfg := &rest.Config{
 		Host:        server,
