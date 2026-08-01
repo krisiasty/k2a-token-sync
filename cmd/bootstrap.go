@@ -5,7 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
+	"io"
 	"os"
 	"time"
 
@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
@@ -25,17 +26,20 @@ import (
 
 const bootstrapTimeout = 2 * time.Minute
 
-// runBootstrap provisions a downstream cluster for k2a-token-sync.
+// runBootstrap provisions a downstream cluster for k2a-token-sync and registers
+// it.
 //
 // It exists because something has to establish the first foothold: k2a-token-sync
 // has no way into a cluster until an identity exists for it there, and it
-// deliberately never holds administrative material of its own.
+// deliberately never holds administrative material of its own. That makes this an
+// imperative step by nature — it needs a credential no repository should hold —
+// and the same is true of `argocd cluster add`.
 //
-// The split of outputs is the point. The credential goes straight from the
-// downstream cluster into its own namespace, never through the terminal; the
-// ClusterConnection goes to stdout, where it carries nothing secret and can be
-// committed. So the operator's shell sees only what is safe to keep.
-func runBootstrap(logger *slog.Logger, args []string) error {
+// By default it finishes the job: provisions the identities, stores the
+// credential, and applies the ClusterConnection. --print stops short of applying
+// and writes the manifest to stdout instead, for anyone keeping those objects in
+// git. Progress goes to stderr either way, so a redirect captures only YAML.
+func runBootstrap(args []string) error {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
@@ -50,7 +54,7 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 
 		// The unprefixed pair means what it means in any kubectl-like tool: the
 		// cluster this command works against. For bootstrap that is where the
-		// output lands — the credential and the ClusterConnection.
+		// credential is stored and the ClusterConnection created.
 		kubeconfig = fs.String("kubeconfig", "",
 			"path to the kubeconfig for the cluster running ArgoCD and k2a-token-sync (default: normal resolution)")
 		kubeContext = fs.String("context", "",
@@ -61,33 +65,38 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 		saNamespace = fs.String("serviceaccount-namespace", "kube-system", "namespace for the downstream ServiceAccounts")
 		selfSAName  = fs.String("self-serviceaccount", "k2a-token-sync", "downstream ServiceAccount k2a-token-sync authenticates as")
 
-		create = fs.Bool("create", false, "apply the ClusterConnection instead of printing it")
-		dryRun = fs.Bool("dry-run", false, "report what would be done without changing anything")
+		printOnly = fs.Bool("print", false, "write the ClusterConnection to stdout instead of applying it")
+		dryRun    = fs.Bool("dry-run", false, "report what would be done and change nothing")
 	)
 
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: k2a-token-sync bootstrap --cluster NAME --endpoint HOST[:PORT] [flags]
 
-Provisions a downstream cluster so k2a-token-sync can maintain its ArgoCD
-registration. Installs two downstream identities — one for ArgoCD (cluster-admin)
-and one narrowly-scoped for k2a-token-sync — stores a credential for the latter in
-its namespace, and prints the ClusterConnection to apply.
+Prepares a downstream cluster and registers it, so ArgoCD can reach it directly.
+Installs two identities there — one for ArgoCD (cluster-admin) and one
+narrowly-scoped for k2a-token-sync — stores a credential for the latter, and
+applies the ClusterConnection that puts the cluster into service.
 
 Run this once per cluster. Afterwards k2a-token-sync needs no administrative
-access.
+access, and renews its own credential unattended.
 
 Two clusters are involved. --kubeconfig and --context select the one running
 ArgoCD and k2a-token-sync, where the credential is stored and the object created;
 both default to your usual kubeconfig and current context. --from-kubeconfig and
---from-context select the downstream cluster being onboarded, and one of them is
-required. Separate files are supported deliberately: merging kubeconfigs is unsafe
-when they define the same context name for different clusters.
+--from-context select the downstream cluster being prepared, and one of them is
+required.
 
-The credential never passes through your shell. Only the ClusterConnection is
-printed, and it contains nothing secret:
+Modes:
+  (default)    provision, store the credential, and apply the ClusterConnection
+  --print      provision and store the credential, but write the manifest to
+               stdout instead of applying it — for keeping those objects in git
+  --dry-run    change nothing; report the plan and show the manifest
+
+The credential never passes through your terminal, and the manifest contains
+nothing secret:
 
   k2a-token-sync bootstrap --cluster prod-1 --endpoint prod-1.example.com:6443 \
-    --from-kubeconfig ./prod-1.kubeconfig > clusters/prod-1.yaml
+    --from-kubeconfig ./prod-1.kubeconfig
 
 Flags:
 `)
@@ -127,6 +136,8 @@ Flags:
 	ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
 	defer cancel()
 
+	out := &steps{w: os.Stderr}
+
 	// Both connections are resolved before anything is created. Provisioning a
 	// cluster and then discovering there is nowhere to put the result would leave
 	// identities behind with no credential stored for them.
@@ -134,42 +145,67 @@ Flags:
 	if err != nil {
 		return err
 	}
-	localClient, err := localClientFor(*kubeconfig, *kubeContext)
+	localClient, localCfg, err := localClientFor(*kubeconfig, *kubeContext)
 	if err != nil {
 		return err
 	}
 
-	logger = logger.With("cluster", cluster.Name)
-	logger.Info("connected to the downstream cluster",
-		"server", downstreamCfg.Host,
-		"argocd_endpoint", cluster.ServerURL(),
-	)
+	// Output is grouped by cluster, because "where did that happen" is the first
+	// question a reader has when a command touches two of them. Each heading names
+	// its cluster once and the steps beneath it inherit the location.
+	out.headingf("Bootstrapping %s", cluster.Name)
+	out.blank()
+	out.headingf("Downstream cluster — %s", cluster.Name)
+	out.stepf("reached via", "%s", downstreamCfg.Host)
+	out.stepf("ArgoCD endpoint", "%s", cluster.ServerURL())
 
 	if *dryRun {
-		logger.Info("dry run; no changes made",
-			"would_create_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
-			"would_create_self_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName,
-			"would_write_secret", *namespace+"/"+cluster.CredentialsSecretName(),
-		)
+		out.stepf("identities", "would create %s and %s",
+			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+			cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
+		out.blank()
+		out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
+		out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
+		out.stepf("credential", "would write %s", *namespace+"/"+cluster.CredentialsSecretName())
+		out.stepf("registration", "would apply %s", *namespace+"/"+cluster.Name)
+		out.blank()
+		out.notef("Nothing was changed. The manifest below is what would be applied.")
+		out.blank()
 		return printConnection(cluster, *namespace)
 	}
 
 	// Pre-flight before provisioning. A certificate that does not cover the
 	// endpoint is the most common reason direct access fails, and it is far
 	// cheaper to learn now than after two identities exist downstream.
-	if err := preflight(ctx, downstreamClient, cluster, logger); err != nil {
+	cert, err := preflight(ctx, downstreamClient, cluster)
+	if err != nil {
 		return err
 	}
+	out.stepf("endpoint certificate", "valid until %s (%d days left)",
+		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
 
 	provisioned, err := reconcile.Provision(ctx, downstreamClient, cluster)
 	if err != nil {
 		return fmt.Errorf("provisioning the downstream cluster: %w", err)
 	}
-	logger.Info("provisioned downstream identities",
-		"argocd_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
-		"self_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName,
-		"self_credential_expires_at", provisioned.ExpiresAt.UTC().Format(time.RFC3339),
-	)
+	out.stepf("identities", "%s, %s",
+		cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+		cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
+
+	// Prove the path ArgoCD will use, with the credential just minted, before
+	// storing it. Reported here because it is the downstream endpoint being tested;
+	// a failure is a warning, since the endpoint may be reachable from the cluster
+	// k2a-token-sync runs on but not from wherever this is being run.
+	if err := verifyCredential(ctx, cluster, provisioned); err != nil {
+		out.warnf("could not reach the endpoint with the new credential from here: %v", err)
+		out.warnf("k2a-token-sync may still succeed if it can reach the endpoint")
+	} else {
+		out.stepf("verified", "the new credential works against the endpoint")
+	}
+
+	out.blank()
+	out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
+	out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
 
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), provisioned,
 		map[string]string{
@@ -178,64 +214,105 @@ Flags:
 		}); err != nil {
 		return fmt.Errorf("writing the credential: %w", err)
 	}
-	logger.Info("stored the credential", "secret", *namespace+"/"+cluster.CredentialsSecretName())
+	out.stepf("credential", "%s, expires %s",
+		*namespace+"/"+cluster.CredentialsSecretName(),
+		provisioned.ExpiresAt.UTC().Format(time.DateOnly))
 
-	// Prove the whole path ArgoCD will use, with the credential just minted. This
-	// is a warning rather than a failure: the endpoint may be reachable from the
-	// cluster k2a-token-sync runs on but not from here.
-	verifyCredential(ctx, cluster, provisioned, logger)
-
-	if *create {
-		return createConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext, logger)
+	if *printOnly {
+		out.blank()
+		out.notef("Apply or commit the manifest below, to %s, to put %s into service.",
+			describeCluster(*kubeContext, localCfg.Host), cluster.Name)
+		out.blank()
+		return printConnection(cluster, *namespace)
 	}
 
-	fmt.Fprintf(os.Stderr, "\nApply the ClusterConnection below to register %q. "+
-		"k2a-token-sync picks it up within one poll.\n\n", cluster.Name)
-	return printConnection(cluster, *namespace)
+	if err := applyConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext); err != nil {
+		return err
+	}
+	out.stepf("registration", "%s", *namespace+"/"+cluster.Name)
+	out.blank()
+	out.notef("Done. k2a-token-sync publishes ArgoCD's credential within 30 seconds:")
+	out.notef("  kubectl -n %s get ccon %s", *namespace, cluster.Name)
+	return nil
+}
+
+// steps writes the progress a person reads. Structured logging is right for the
+// reconciliation loop, which a collector consumes, and wrong here: every value is
+// short, the labels are self-evident, and JSON would spend most of its characters
+// on quoting and timestamps.
+//
+// Everything goes to stderr, so --print can send YAML to stdout and a redirect
+// captures only the manifest.
+type steps struct {
+	w io.Writer
+}
+
+const stepLabelWidth = 21
+
+// The writes are deliberately unchecked: progress output that cannot reach the
+// terminal has no useful recovery, and failing the bootstrap because a pipe closed
+// would be worse than finishing quietly.
+
+func (s *steps) headingf(format string, args ...any) {
+	_, _ = fmt.Fprintf(s.w, format+"\n", args...)
+}
+
+func (s *steps) stepf(label, format string, args ...any) {
+	_, _ = fmt.Fprintf(s.w, "  %-*s %s\n", stepLabelWidth, label, fmt.Sprintf(format, args...))
+}
+
+func (s *steps) warnf(format string, args ...any) {
+	_, _ = fmt.Fprintf(s.w, "  %-*s %s\n", stepLabelWidth, "warning", fmt.Sprintf(format, args...))
+}
+
+func (s *steps) notef(format string, args ...any) {
+	_, _ = fmt.Fprintf(s.w, format+"\n", args...)
+}
+
+func (s *steps) blank() {
+	_, _ = fmt.Fprintln(s.w)
+}
+
+// sameClusterNote calls out the case where both clusters are one — registering the
+// cluster ArgoCD itself runs on. Without it the reader sees the same address twice
+// and has to work out whether that is a mistake.
+func (s *steps) sameClusterNote(downstreamHost, localHost string) {
+	if downstreamHost == localHost {
+		s.stepf("note", "the same cluster as above")
+	}
 }
 
 // preflight checks that the endpoint ArgoCD will use presents a certificate that
 // covers it and verifies against the cluster's own CA.
-func preflight(ctx context.Context, client kubernetes.Interface, cluster config.Cluster, logger *slog.Logger) error {
+func preflight(ctx context.Context, client kubernetes.Interface, cluster config.Cluster) (*downstream.ServingCert, error) {
 	ca, err := downstream.ClusterCA(ctx, client, cluster.ServiceAccount.Namespace)
 	if err != nil {
-		return fmt.Errorf("reading the cluster CA: %w", err)
+		return nil, fmt.Errorf("reading the cluster CA: %w", err)
 	}
 
 	cert, err := downstream.ProbeServingCert(ctx, cluster.Endpoint, ca)
 	if err != nil {
-		return fmt.Errorf("probing %s: %w", cluster.Endpoint, err)
+		return nil, fmt.Errorf("probing %s: %w", cluster.Endpoint, err)
 	}
 	if cert.HostnameError != nil {
-		return fmt.Errorf("the endpoint's certificate cannot be used: %w", cert.HostnameError)
+		return nil, fmt.Errorf("the endpoint's certificate cannot be used: %w", cert.HostnameError)
 	}
 	if !cert.TrustedByCA {
-		return fmt.Errorf("the certificate presented at %s does not verify against the cluster CA; "+
+		return nil, fmt.Errorf("the certificate presented at %s does not verify against the cluster CA; "+
 			"ArgoCD would reject this endpoint", cluster.Endpoint)
 	}
-
-	logger.Info("endpoint certificate checked",
-		"expires_at", cert.NotAfter.UTC().Format(time.RFC3339),
-		"days_remaining", cert.DaysRemaining(),
-	)
-	return nil
+	return cert, nil
 }
 
 // verifyCredential uses the stored credential exactly as k2a-token-sync will, to
 // prove endpoint, certificate, token and downstream RBAC work together.
-func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubeclient.Credentials, logger *slog.Logger) {
+func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubeclient.Credentials) error {
 	client, err := reconcile.ClientFromCredentials(cluster.ServerURL(), creds)
 	if err != nil {
-		logger.Warn("could not build a client for the stored credential", "error", err)
-		return
+		return err
 	}
-	if _, err := downstream.ClusterCA(ctx, client, cluster.ServiceAccount.Namespace); err != nil {
-		logger.Warn("could not verify the credential against the endpoint from here; "+
-			"k2a-token-sync may still succeed if it can reach the endpoint",
-			"endpoint", cluster.Endpoint, "error", err)
-		return
-	}
-	logger.Info("verified the credential against the endpoint ArgoCD will use", "endpoint", cluster.Endpoint)
+	_, err = downstream.ClusterCA(ctx, client, cluster.ServiceAccount.Namespace)
+	return err
 }
 
 // connectionFor builds the object that declares this cluster to k2a-token-sync.
@@ -260,13 +337,12 @@ func connectionFor(cluster config.Cluster, namespace string) *v1alpha1.ClusterCo
 	}
 }
 
-// printConnection writes the object to stdout. Logs go to stderr, so the output
-// can be redirected into a file or piped into kubectl.
+// renderConnection encodes the object as the YAML a person would commit.
 //
-// Only apiVersion, kind, metadata and spec are printed: status belongs to
+// Only apiVersion, kind, metadata and spec are included: status belongs to
 // k2a-token-sync, and a "status: {}" stanza in a committed file is noise at best
 // and an invitation to edit it at worst.
-func printConnection(cluster config.Cluster, namespace string) error {
+func renderConnection(cluster config.Cluster, namespace string) ([]byte, error) {
 	conn := connectionFor(cluster, namespace)
 	raw, err := yaml.Marshal(struct {
 		metav1.TypeMeta `json:",inline"`
@@ -274,7 +350,17 @@ func printConnection(cluster config.Cluster, namespace string) error {
 		Spec            v1alpha1.ClusterConnectionSpec `json:"spec"`
 	}{TypeMeta: conn.TypeMeta, Metadata: conn.ObjectMeta, Spec: conn.Spec})
 	if err != nil {
-		return fmt.Errorf("encoding the ClusterConnection: %w", err)
+		return nil, fmt.Errorf("encoding the ClusterConnection: %w", err)
+	}
+	return raw, nil
+}
+
+// printConnection writes the manifest to stdout, where a redirect or a pipe into
+// kubectl can take it.
+func printConnection(cluster config.Cluster, namespace string) error {
+	raw, err := renderConnection(cluster, namespace)
+	if err != nil {
+		return err
 	}
 	if _, err := os.Stdout.Write(raw); err != nil {
 		return fmt.Errorf("writing the ClusterConnection: %w", err)
@@ -282,15 +368,12 @@ func printConnection(cluster config.Cluster, namespace string) error {
 	return nil
 }
 
-// createConnection applies the object directly, for people who would rather not
-// pipe YAML around. It uses the dynamic client for the same reason k2a-token-sync
-// does: no generated clientset is needed to write one object.
-func createConnection(
-	ctx context.Context,
-	cluster config.Cluster,
-	namespace, kubeconfig, kubeContext string,
-	logger *slog.Logger,
-) error {
+// applyConnection puts the object into the cluster. Server-side apply means this
+// both creates and updates, so re-running bootstrap for a cluster is safe.
+//
+// It uses the dynamic client for the same reason k2a-token-sync does: no
+// generated clientset is needed to write one object.
+func applyConnection(ctx context.Context, cluster config.Cluster, namespace, kubeconfig, kubeContext string) error {
 	dyn, err := kubeclient.DynamicClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return err
@@ -307,19 +390,37 @@ func createConnection(
 		}); err != nil {
 		return fmt.Errorf("applying the ClusterConnection: %w", err)
 	}
-
-	logger.Info("applied the ClusterConnection; k2a-token-sync picks it up within one poll",
-		"object", namespace+"/"+cluster.Name)
 	return nil
 }
 
 // localClientFor builds a client for the cluster running ArgoCD and k2a-token-sync.
 // With no explicit context it falls back to normal kubeconfig resolution, which
 // also covers running this inside that cluster.
-func localClientFor(kubeconfig, contextName string) (kubernetes.Interface, error) {
+//
+// The rest.Config comes back so the cluster can be named in the output: a command
+// that writes to two clusters should say which one each step touched.
+func localClientFor(kubeconfig, contextName string) (kubernetes.Interface, *rest.Config, error) {
 	if kubeconfig == "" && contextName == "" {
-		return kubeclient.NewClient()
+		cfg, err := kubeclient.LocalRESTConfig()
+		if err != nil {
+			return nil, nil, err
+		}
+		client, err := kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, nil, fmt.Errorf("creating kubernetes client: %w", err)
+		}
+		return client, cfg, nil
 	}
-	client, _, err := kubeclient.ClientForContext(kubeconfig, contextName)
-	return client, err
+	return kubeclient.ClientForContext(kubeconfig, contextName)
+}
+
+// describeCluster names a cluster the way its operator would recognise it: by
+// context when one was given, since that is what they typed, with the server
+// address for confirmation. In-cluster there is no context, so the address stands
+// alone.
+func describeCluster(contextName, host string) string {
+	if contextName == "" {
+		return host
+	}
+	return fmt.Sprintf("context %s (%s)", contextName, host)
 }
