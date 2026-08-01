@@ -38,24 +38,3 @@ Secrets go here, and the daemon needs one Role there.
 {{- define "k2a-token-sync.argocdNamespace" -}}
 {{- .Values.argocdNamespace | default "argocd" }}
 {{- end }}
-
-{{/*
-Validates cluster entries early, so a typo fails at render time rather than in
-the daemon's crash loop. The daemon revalidates everything itself.
-*/}}
-{{- define "k2a-token-sync.validate" -}}
-{{- $secretNames := list }}
-{{- range $i, $c := .Values.clusters }}
-{{- if not $c.name }}
-{{- fail (printf "clusters[%d]: name is required" $i) }}
-{{- end }}
-{{- $secretName := $c.secretName | default (printf "cluster-%s" $c.name) }}
-{{- if has $secretName $secretNames }}
-{{- fail (printf "clusters[%d] (%s): secretName %q is already used by another cluster" $i $c.name $secretName) }}
-{{- end }}
-{{- $secretNames = append $secretNames $secretName }}
-{{- if not $c.endpoint }}
-{{- fail (printf "clusters[%d] (%s): endpoint is required" $i $c.name) }}
-{{- end }}
-{{- end }}
-{{- end }}

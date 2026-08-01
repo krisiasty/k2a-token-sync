@@ -16,13 +16,10 @@ spec:
     type: Recreate
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
       annotations:
-        # Restart on config change so a ConfigMap edit takes effect immediately
-        # rather than at the next reconciliation.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
       labels:
         {{- include "k2a-token-sync.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -43,18 +40,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: CONFIG_PATH
-              value: /etc/k2a-token-sync/config.yaml
+            # The inventory comes from ClusterConnection objects in this
+            # namespace, so there is no config file to point at.
+            - name: ARGOCD_NAMESPACE
+              value: {{ include "k2a-token-sync.argocdNamespace" . | quote }}
             - name: HEALTH_PORT
               value: {{ .Values.health.port | quote }}
           ports:
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
-          volumeMounts:
-            - name: config
-              mountPath: /etc/k2a-token-sync
-              readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -73,15 +68,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             # A cluster that cannot be reached leaves the pod unready; allow a
-            # generous window before that shows up, since the first pass has to
-            # reach every configured cluster.
+            # generous window before that shows up, since every cluster in the
+            # inventory has to reconcile once first.
             failureThreshold: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      volumes:
-        - name: config
-          configMap:
-            name: {{ include "k2a-token-sync.name" . }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

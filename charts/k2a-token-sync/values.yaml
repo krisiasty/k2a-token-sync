@@ -18,54 +18,6 @@ imagePullSecrets: []
 # One daemon serves one ArgoCD instance; deploy a second release for a second.
 argocdNamespace: argocd
 
-# Defaults applied to every cluster unless overridden per entry.
-#
-# These four measure unrelated things: the first two govern the credential the
-# daemon issues, the last two describe the downstream API server's own serving
-# certificate. Changing one does not imply changing the others.
-defaults:
-  # Lifetime requested for the credential written into each ArgoCD cluster
-  # Secret. Reissued at half life, so 30 days means a ~15-day grace period
-  # during which the control path can be broken with no impact on ArgoCD.
-  # The downstream API server may cap this via
-  # --service-account-max-token-expiration; the daemon warns and shortens its
-  # own cadence to match if that happens.
-  tokenTTL: 720h    # 30 days
-
-  # How often every cluster is reconciled. An upper bound: the daemon wakes
-  # sooner if a granted token turns out to be shorter lived than requested.
-  refreshInterval: 24h
-
-  # Remaining serving-certificate lifetime below which the daemon warns. 90 days
-  # is enough notice to schedule a certificate rotation or a control-plane
-  # restart properly rather than as an emergency.
-  expiryWarnThreshold: 2160h    # 90 days
-
-  # Downstream ServiceAccount ArgoCD authenticates as. Matches what
-  # `argocd cluster add` installs.
-  serviceAccount:
-    name: argocd-manager
-    namespace: kube-system
-
-# Downstream clusters to keep registered with ArgoCD. All generated Secrets
-# land in argocdNamespace above.
-#
-# clusters:
-#   - name: downstream-1
-#     endpoint: 10.0.0.10         # direct API address ArgoCD connects to; :6443 default
-#     secretName: cluster-downstream-1   # default: cluster-<name>
-#
-#   - name: standalone-1
-#     endpoint: 10.1.0.10
-#     # Bootstrap once with: k2a-token-sync bootstrap --cluster standalone-1 \
-#     #   --endpoint 10.1.0.10 --context standalone-1
-#     # If you would rather supply the credential yourself, reference it here and
-#     # the daemon will use it on the first pass:
-#     bootstrapSecret:
-#       name: standalone-1-bootstrap
-#       key: kubeconfig
-clusters: []
-
 health:
   port: 8080
 

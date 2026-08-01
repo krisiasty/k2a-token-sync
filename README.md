@@ -73,6 +73,47 @@ it belongs to whatever manages the cluster — worth automating with your existi
 control-plane node at a time. The cluster CA is deliberately out of scope too: rotating it would invalidate every
 kubeconfig and every ArgoCD `caData` at once.
 
+## Credentials
+
+Two credentials exist per cluster, and they are not interchangeable.
+
+| | ArgoCD's credential | The daemon's credential |
+| --- | --- | --- |
+| Identity | `argocd-manager` in `kube-system` | `k2a-token-sync`, same namespace |
+| Permissions | `cluster-admin` — ArgoCD applies arbitrary manifests | four rules, see below |
+| Form | bound token (TokenRequest) | bound token (TokenRequest) |
+| Lifetime | `tokenTTL`, default 720h (30d) | `agentTokenTTL`, default 2160h (90d) |
+| Renewed | by the daemon at half life, ~15d | by the daemon every pass, ~daily |
+| Stored in | `cluster-<name>` in ArgoCD's namespace | `<name>-credentials` in the daemon's namespace |
+| Used by | ArgoCD, connecting straight to the endpoint | the daemon, to mint the other one |
+| Created by | the daemon | bootstrap |
+| On expiry | the daemon mints another | the daemon is locked out; bootstrap again |
+
+**Why two.** The daemon never needs `cluster-admin`. Its own identity holds four rules: get and create ServiceAccounts,
+create `serviceaccounts/token`, get and create ClusterRoleBindings, and get exactly one ConfigMap — `kube-root-ca.crt`.
+That is enough to maintain ArgoCD's identity and read the cluster CA, and nothing else.
+
+Reusing ArgoCD's token for both would be simpler and worse. The daemon would hold `cluster-admin` on every cluster
+permanently, and it would not even remove the permanence: a credential you can always renew *is* a permanent credential,
+with extra steps. What would change is only the blast radius, in the wrong direction.
+
+**Lifecycle.** Bootstrap creates both identities and mints the first agent token. From then on the daemon mints ArgoCD's
+tokens and renews its own, verifying each replacement against the cluster before storing it — overwriting a working
+credential with a broken one would lock it out, and that is the one failure self-renewal could introduce.
+
+**The downtime budget.** `agentTokenTTL` measured from the *last successful pass*, so about 90 days by default. Nothing
+else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the cluster again — the
+`kubectl get ccon` output will say `CredentialExpired` rather than reporting a bare 401.
+
+**Revocation.** `TokenRequest` tokens cannot be revoked individually. Deleting the ServiceAccount invalidates all of its
+tokens, which is the only lever, and for the agent identity implies bootstrapping again.
+
+**One nuance worth knowing.** RBAC's escalation check means the agent identity cannot create the `argocd-manager`
+cluster-admin binding: creating a binding requires holding the role's permissions or `bind` on it, and it has neither. In
+steady state the binding already exists and is only read, so this never comes up. If someone deletes it, reconciliation
+fails with *"attempting to grant RBAC permissions not currently held"* until bootstrap is re-run. That is the escalation
+check working exactly as intended, and a confusing error to meet cold.
+
 ## Prerequisites
 
 - ArgoCD, and this daemon, running on a cluster that can reach each downstream API server directly.
@@ -90,39 +131,16 @@ distribution — and restart or reissue it.
 
 ## Deployment
 
-### Helm (recommended)
+### Helm
+
+The chart installs the daemon, its RBAC and the ClusterConnection CRD. It does not
+manage cluster objects — those are separate manifests, see
+[Adding a cluster](#adding-a-cluster).
 
 ```bash
 helm install k2a-token-sync ./charts/k2a-token-sync \
   --namespace k2a-token-sync --create-namespace \
-  --set image.tag=v0.0.1 \
-  --set 'clusters[0].name=downstream-1' \
-  --set 'clusters[0].endpoint=10.0.0.10'
-```
-
-Keep the inventory in a values file rather than in `--set` flags. It is the file you edit every time a cluster is added,
-and `clusters` drives both the ConfigMap and the RBAC the daemon needs — see
-[Adding or removing a cluster](#adding-or-removing-a-cluster).
-
-```yaml
-# k2a-values.yaml
-image:
-  tag: v0.0.1
-
-argocdNamespace: argocd
-
-clusters:
-  - name: downstream-1
-    endpoint: 10.0.0.10
-
-  - name: standalone-1
-    endpoint: cluster2.example.com:6443
-```
-
-```bash
-helm upgrade --install k2a-token-sync ./charts/k2a-token-sync \
-  --namespace k2a-token-sync --create-namespace \
-  -f k2a-values.yaml
+  --set image.tag=v0.0.1
 ```
 
 #### Key chart values
@@ -131,12 +149,19 @@ helm upgrade --install k2a-token-sync ./charts/k2a-token-sync \
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/krisiasty/k2a-token-sync` | Image repository |
 | `image.tag` | **required** | Released version to deploy, e.g. `v0.0.1`. Rendering fails if unset |
-| `defaults.tokenTTL` | `720h` (30d) | Requested lifetime of ArgoCD's credential, reissued at half life |
-| `defaults.refreshInterval` | `24h` | Upper bound on the reconciliation period |
-| `defaults.expiryWarnThreshold` | `2160h` (90d) | Warn below this much serving-certificate lifetime |
 | `argocdNamespace` | `argocd` | Namespace of the ArgoCD instance served; all cluster Secrets go here |
-| `clusters` | `[]` | Cluster inventory, see below |
 | `health.port` | `8080` | Port for `/livez`, `/readyz` and `/status` |
+
+There is nothing here about clusters, and that is the point: the inventory lives in the API, so adding one needs no
+release upgrade.
+
+#### Upgrading the CRD
+
+Helm installs `crds/` but never upgrades it. When a release changes the schema, apply it explicitly:
+
+```bash
+kubectl apply -f charts/k2a-token-sync/crds/
+```
 
 #### ArgoCD
 
@@ -159,13 +184,6 @@ spec:
       values: |
         image:
           tag: "v0.0.1"      # required; the release to deploy
-
-        clusters:
-          - name: downstream-1
-            endpoint: "10.0.0.10"
-
-          - name: standalone-1
-            endpoint: "10.1.0.10"
   destination:
     server: https://kubernetes.default.svc
     namespace: k2a-token-sync
@@ -177,129 +195,156 @@ spec:
       - CreateNamespace=true
 ```
 
+A second Application can own the ClusterConnection objects, so the fleet is declared in git alongside everything else.
+
 ### Without Helm
 
-There is no second set of hand-maintained manifests, deliberately: the chart derives the Role's `resourceNames` from
-the same `clusters` list that builds the ConfigMap, and validates the inventory at render time. A parallel copy would
-have to reproduce both by hand, and would drift.
-
-Render the chart instead, and apply or commit the output:
+There is no second set of hand-maintained manifests, deliberately: a parallel copy would have to reproduce the RBAC and
+the generated CRD by hand, and would drift. Render the chart instead, and apply or commit the output:
 
 ```bash
 helm template k2a-token-sync ./charts/k2a-token-sync \
-  --namespace k2a-token-sync -f k2a-values.yaml > k2a-token-sync.yaml
+  --namespace k2a-token-sync --set image.tag=v0.0.1 --include-crds > k2a-token-sync.yaml
 ```
 
 ## Configuration
 
-The daemon takes process settings from the environment and its cluster inventory from a YAML file, normally projected
-from a ConfigMap. Onboarding a cluster is a configuration change and never a code change, but it does touch RBAC as well
-as the inventory — see [Adding or removing a cluster](#adding-or-removing-a-cluster).
+The daemon takes three settings from the environment. Everything else about a cluster lives in its ClusterConnection.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `POD_NAMESPACE` | yes | | Namespace the daemon runs in; all referenced Secrets live here |
-| `CONFIG_PATH` | no | `/etc/k2a-token-sync/config.yaml` | Path to the cluster inventory |
+| `POD_NAMESPACE` | yes | | Namespace the daemon runs in; its inventory and credentials live here |
+| `ARGOCD_NAMESPACE` | no | `argocd` | Namespace of the ArgoCD instance served |
 | `HEALTH_PORT` | no | `8080` | Port for `/livez`, `/readyz` and `/status` |
 
-### Cluster inventory
+One daemon serves one ArgoCD instance, so `ARGOCD_NAMESPACE` is a process setting rather than a per-cluster one. Point a
+second release at a second ArgoCD if you need that.
 
-With the Helm chart you do not write this file — the chart renders it from `clusters` in your values. This is the
-resulting format, also kept as [`examples/config.yaml`](examples/config.yaml), which the test suite parses with the
-real loader so it cannot drift from the parser.
+### The ClusterConnection
+
+One object per cluster, in the daemon's namespace. The minimal form is a name and an endpoint; everything else has a
+default from the CRD schema, so `kubectl explain clusterconnection.spec` is the authoritative field reference.
 
 ```yaml
-argocdNamespace: argocd
-
-defaults:
-  tokenTTL: 720h                # 30d, credential the daemon issues
-  refreshInterval: 24h
-  expiryWarnThreshold: 2160h    # 90d, downstream serving certificate
-  serviceAccount:
-    name: argocd-manager
-    namespace: kube-system
-
-clusters:
-  - name: downstream-1
-    endpoint: 10.0.0.10        # :6443 assumed
-    secretName: cluster-downstream-1   # default: cluster-<name>
-
-  - name: standalone-1
-    endpoint: cluster2.example.com:6443
+apiVersion: k2a-token-sync.io/v1alpha1
+kind: ClusterConnection
+metadata:
+  name: standalone-1
+  namespace: k2a-token-sync
+spec:
+  endpoint: 10.1.0.10          # :6443 assumed
 ```
 
-One daemon serves one ArgoCD instance, so `argocdNamespace` is a single top-level setting rather than a per-cluster
-one. Point a second release at a second ArgoCD if you need that.
+[`examples/cluster-connection.yaml`](examples/cluster-connection.yaml) spells out every field, and the test suite parses
+it so it cannot drift from the API.
 
-Per-cluster fields: `name`, `endpoint`, `displayName`, `secretName`, `project`, `bootstrapSecret`, `serviceAccount`,
-`agentServiceAccountName`, `tokenTTL`, `expiryWarnThreshold`, `labels`, `annotations`. Unknown fields are rejected, so
-typos fail at startup rather than being silently ignored.
+Two things a schema cannot check are checked by the daemon and reported on the object: a name long enough to make the
+Secret names derived from it invalid, and two connections claiming one `secretName` — which would have them silently
+overwrite each other.
 
-Configuration is validated up front: duplicate cluster names, two clusters targeting one Secret, and malformed
-endpoints are all startup errors.
+### Adding a cluster
 
-### Adding or removing a cluster
+```bash
+# 1. Provision the cluster and store its credential; print the object to commit.
+k2a-token-sync bootstrap --cluster standalone-1 --endpoint 10.1.0.10 \
+  --from-kubeconfig ./standalone-1.kubeconfig > clusters/standalone-1.yaml
 
-A cluster spans two objects, not one: the ConfigMap the daemon reads, and the Role in `argocdNamespace` whose
-`resourceNames` list names the cluster Secrets the daemon may read and write. RBAC cannot scope `create` by name, so
-`create` is namespace-wide while `get`, `update` and `patch` are restricted to the Secrets this deployment manages —
-which is what keeps the daemon out of ArgoCD's own secrets, and what makes those two lists a matched pair.
+# 2. Apply it — or let ArgoCD apply it from git.
+kubectl apply -f clusters/standalone-1.yaml
+```
 
-Add the entry to `clusters` in your values file and run `helm upgrade`. The chart renders the ConfigMap and the Role
-from that single list, and the deployment's `checksum/config` annotation rolls the pod so the new inventory is read
-immediately.
+The daemon picks it up within one poll, roughly 30 seconds. No release upgrade, no restart, and no RBAC change: the
+chart's Role does not name individual Secrets, so nothing about it depends on how many clusters exist.
 
-Do not edit the ConfigMap directly. The daemon will pick the cluster up, but the Role will not name its Secret, so that
-one cluster fails with `secrets "cluster-<name>" is forbidden` while every other cluster keeps reconciling normally —
-and the next `helm upgrade` silently reverts the edit.
+The order does not matter. Apply the object first and it reports `Ready=False` with reason `AwaitingCredential` until
+bootstrap has run, which makes `kubectl get ccon` a worklist of what is still outstanding.
 
-Removing a cluster is the reverse, plus cleanup the daemon deliberately does not perform: it never deletes Secrets, so
-drop the generated `cluster-<name>` in ArgoCD's namespace and, for a standalone cluster, `<name>-credentials` in the
-daemon's namespace. The downstream `argocd-manager` and `k2a-token-sync` ServiceAccounts also outlive the entry and can
-be deleted once ArgoCD no longer needs the cluster.
+Editing works the same way: `kubectl edit ccon standalone-1`, and the change takes effect within a poll. The daemon
+compares the spec's generation against the one recorded in status, so an edit made while it was down is noticed too.
+
+### Removing a cluster
+
+```bash
+kubectl delete ccon standalone-1
+kubectl -n argocd delete secret cluster-standalone-1     # not done for you
+```
+
+Deleting the object stops maintenance. It deliberately does **not** delete the generated Secret: the daemon holds no
+delete permission in ArgoCD's namespace, so removing a registration ArgoCD is actively using stays an explicit act. Left
+alone, the credential in it expires within `tokenTTL`.
+
+Two more objects outlive the connection, and can be removed once ArgoCD no longer needs the cluster: the
+`argocd-manager` and `k2a-token-sync` ServiceAccounts downstream, along with their bindings.
+
+With no `list` permission in ArgoCD's namespace, the daemon cannot detect a Secret left behind by a connection that was
+removed while it was down. That is the cost of the RBAC posture below, and it is why cleanup is a documented step rather
+than a promise.
 
 ## One-time bootstrap per cluster
 
-The daemon has no way into a cluster until an identity exists for it there, so the first foothold has to come from
-somewhere. Bootstrap it once with the same binary, from a workstation that has a working kubeconfig for both clusters:
+The daemon has no way into a cluster until an identity exists for it there, and it deliberately never holds
+administrative material of its own. So the first foothold comes from a workstation, once per cluster:
 
 ```bash
-k2a-token-sync bootstrap \
-  --cluster standalone-1 \
-  --endpoint 10.1.0.10 \
-  --context standalone-1
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig > clusters/standalone-1.yaml
 ```
 
-This installs two identities downstream — `argocd-manager` with `cluster-admin`, and a narrowly-scoped
-`k2a-token-sync` identity for the daemon — then stores a durable credential for the latter in the daemon's namespace.
-Nothing sensitive passes through your shell, and nothing lands in git. Use `--dry-run` first to see what it would do.
+What it does, in order: resolve both clusters before changing anything; read the cluster CA; **probe the endpoint** and
+refuse if its certificate does not cover it; install the two identities; write the credential into the daemon's
+namespace; use that credential once against the endpoint to prove the whole path works; print the ClusterConnection.
 
-After that the cluster needs no `bootstrapSecret` at all: the daemon maintains the registration from then on.
-Bootstrapping only provisions the downstream identities and stores the credential — the cluster is not registered until
-it appears in the inventory, which is a separate step and includes the matching RBAC entry, see
-[Adding or removing a cluster](#adding-or-removing-a-cluster).
+The pre-flight is there because a certificate that does not cover the endpoint is the most common reason direct access
+fails, and it is far cheaper to learn before two identities exist than after. The final check is a warning rather than an
+error — the endpoint may be reachable from the daemon's cluster but not from your desk.
 
-If you would rather not run the CLI, set `bootstrapSecret` to a Secret holding a kubeconfig (key `kubeconfig`) or a
-bearer token (key `token`, optionally with `ca.crt`). The daemon will use it once on first contact, provision its own
-credential, and then no longer need it — so a short-lived token works well:
+Downstream access is a **file**, not a context: `--from-kubeconfig` takes one directly, and `--context` selects within it
+or within your ambient kubeconfig. Files are what you can copy off a control-plane node. Two separate files are supported
+on purpose, because merging kubeconfigs is unsafe when both define the same context name for different clusters.
 
-```bash
-kubectl -n kube-system create serviceaccount k2a-bootstrap
-kubectl create clusterrolebinding k2a-bootstrap \
-  --clusterrole=cluster-admin --serviceaccount=kube-system:k2a-bootstrap
-kubectl -n kube-system create token k2a-bootstrap --duration=1h
-```
+`--dry-run` reports what it would do and prints the object without touching anything. `--create` applies the object
+instead of printing it. `k2a-token-sync bootstrap --help` lists the rest.
 
-A kubeconfig written for use on the node itself points at `127.0.0.1`, so it needs its `server` rewritten to the
-reachable endpoint first.
+**The output split matters.** The credential goes from the downstream cluster into the daemon's namespace and never
+passes through your terminal. Only the ClusterConnection is printed, and it contains nothing secret — which is why the
+redirect above is safe to commit. Logs go to stderr so that redirect stays clean.
+
+### Provisioning it yourself
+
+The CLI is a convenience, not a requirement. Anything with administrative access can prepare a cluster by satisfying the
+same contract:
+
+- create the `argocd-manager` ServiceAccount and bind it to `cluster-admin`;
+- create the `k2a-token-sync` ServiceAccount and bind it to a ClusterRole with the four rules above;
+- mint a token for the second one;
+- write `<name>-credentials` in the daemon's namespace with keys `token`, `ca.crt` and `expires-at`.
+
+`expires-at` is RFC 3339 and may be omitted; the daemon then treats the deadline as unknown and replaces it with one it
+knows at the next renewal. That contract is worth automating alongside cluster creation, so a new cluster arrives ready
+and no administrative credential ever moves.
 
 ## Health and observability
 
 | Endpoint | Purpose |
 | --- | --- |
 | `/livez` | Liveness — fails if the reconciliation loop has stalled |
-| `/readyz` | Readiness — passes once every configured cluster has reconciled |
+| `/readyz` | Readiness — passes once every cluster in the inventory has reconciled |
 | `/status` | JSON detail per cluster, including observed certificate expiry. Carries no credential material |
+
+Per-cluster state is on the objects themselves, which is the readable view:
+
+```console
+$ kubectl -n k2a-token-sync get ccon
+NAME           ENDPOINT                       READY   TOKEN EXPIRES   AGENT EXPIRES   CERT DAYS   AGE
+downstream-1   10.0.0.10:6443                 True    29d             89d             364         12d
+standalone-1   cluster2.example.com:6443      True    22d             89d             211         12d
+standalone-2   10.2.0.10:6443                 False   <none>          <none>          <none>      2m
+```
+
+`kubectl describe ccon standalone-2` then gives the reason — `AwaitingCredential` for one that has not been bootstrapped,
+`CredentialExpired` for one whose daemon credential lapsed, `CertificateInvalid` for an endpoint whose certificate cannot
+work.
 
 Generated cluster Secrets also carry annotations you can read with `kubectl`:
 
@@ -315,20 +360,30 @@ Logs are JSON via `log/slog`. Credential material is never logged.
 
 ## Security notes
 
-The daemon holds no cluster-scoped permissions on the cluster it runs in. It gets one Role in its own namespace, and
-one in ArgoCD's namespace restricted with `resourceNames` to the Secrets it generates — so it cannot read ArgoCD's own
-Secrets. Kubernetes RBAC forbids combining `resourceNames` with `create`, so `create` on secrets is namespace-scoped
-rather than name-scoped.
+The daemon holds no cluster-scoped permissions on the cluster it runs in. Its objects are namespaced and only its own
+namespace is listed, so a Role suffices everywhere.
 
-Downstream, the `k2a-token-sync` identity used for standalone clusters is granted only what it needs: get/create
-ServiceAccounts, create ServiceAccount tokens, get/create ClusterRoleBindings, and read the `kube-root-ca.crt`
-ConfigMap. It holds no direct access to Secrets.
+**In ArgoCD's namespace it holds `create` and `patch` on Secrets, and nothing else.** It cannot read — not the Secrets it
+writes, and not ArgoCD's own. It learns the result of its own writes from what an apply returns, and keeps everything
+else in each ClusterConnection's status.
 
-Be clear-eyed about what that does and does not buy. The right to mint a token for a `cluster-admin` ServiceAccount is
-equivalent to `cluster-admin` by one hop — the narrow grant is for auditability and to avoid blanket Secret access,
-not because the identity is unprivileged. What the design genuinely achieves is a **bounded leak window for the
-credential ArgoCD holds**: the ArgoCD namespace is the broadly-exposed one, and a 30-day rotating token there is worth
-considerably more than a non-expiring `cluster-admin` JWT that stays valid forever once leaked.
+Those two verbs are namespace-wide because they have to be: cluster names are not known when the Role is created, which
+is the whole point of an inventory that changes at runtime, and RBAC cannot scope `resourceNames` by prefix. Be
+clear-eyed about what that permits — `patch` on any Secret in that namespace means the daemon *could* overwrite ArgoCD's
+repository credentials. Two things bound it. `secretName` must begin with `cluster-`, so no connection can be aimed at
+them; and the absence of `delete` means nothing there can be removed.
+
+The cost of that posture is stated under [Removing a cluster](#removing-a-cluster): with no `list`, the daemon cannot
+notice an orphaned Secret.
+
+Downstream, the `k2a-token-sync` identity is granted only what it needs: get/create ServiceAccounts, create ServiceAccount
+tokens, get/create ClusterRoleBindings, and read the `kube-root-ca.crt` ConfigMap. It holds no access to Secrets at all.
+
+Be equally clear-eyed there. The right to mint a token for a `cluster-admin` ServiceAccount is equivalent to
+`cluster-admin` by one hop — the narrow grant is for auditability and to avoid blanket Secret access, not because the
+identity is unprivileged. What the design genuinely achieves is that **no non-expiring credential exists anywhere in the
+system**: ArgoCD's token lasts 30 days and the daemon's own 90, both renewed automatically. That bounds the value of any
+leak, which a permanent `cluster-admin` JWT does not.
 
 An existing `ClusterRoleBinding` that points at a different role, or omits the expected ServiceAccount, is reported as
 an error rather than silently rewritten — an unannounced privilege change is not something a daemon should make.
@@ -385,4 +440,8 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
 - One replica, `Recreate` strategy. Two instances reconciling the same clusters would race to publish credentials.
 - The CA bundle is never rotated. Rotating a cluster CA is a deliberate, disruptive operation and out of scope.
 - Token lifetime is capped by the downstream API server's `--service-account-max-token-expiration`. The daemon logs a
-  warning when it is granted materially less than it requested.
+  warning when it is granted materially less than it requested — which matters more for its own credential than for
+  ArgoCD's, since that lifetime is the outage it can survive.
+- The daemon cannot detect a generated Secret left behind by a cluster removed while it was down, because it holds no
+  `list` permission in ArgoCD's namespace. Cleanup is a documented step.
+- No metrics endpoint. `/status` and the objects' own status carry the same information for now.
