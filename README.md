@@ -88,7 +88,7 @@ Two credentials exist per cluster, and they are not interchangeable.
 | Permissions | `cluster-admin` — ArgoCD applies arbitrary manifests | four rules, see below |
 | Form | bound token (TokenRequest) | bound token (TokenRequest) |
 | Lifetime | `tokenTTL`, default 720h (30d) | `selfTokenTTL`, default 2160h (90d) |
-| Renewed | by k2a-token-sync at half life, ~15d | by k2a-token-sync daily |
+| Renewed | at half its granted life, ~15d | daily, or at half its granted life if that comes first |
 | Stored in | `cluster-<name>` in ArgoCD's namespace | `<name>-credentials` in k2a-token-sync's namespace |
 | Used by | ArgoCD, connecting straight to the endpoint | k2a-token-sync, to mint the other one |
 | Created by | k2a-token-sync | bootstrap |
@@ -543,7 +543,8 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
 - The CA bundle is never rotated. Rotating a cluster CA is a deliberate, disruptive operation and out of scope.
 - Token lifetime is capped by the downstream API server's `--service-account-max-token-expiration`. k2a-token-sync
   logs a warning when it is granted materially less than it requested — which matters more for its own credential than
-  for ArgoCD's, since that lifetime is the outage it can survive.
+  for ArgoCD's, since that lifetime is the outage it can survive. Both credentials are then renewed against what was
+  actually granted rather than what was asked for, so a capped cluster works; it just has a shorter downtime budget.
 - k2a-token-sync cannot detect a generated Secret left behind by a cluster removed while it was down, because it holds no
   `list` permission in ArgoCD's namespace. Cleanup is a documented step.
 - No metrics endpoint. `/status` and the objects' own status carry the same information for now.

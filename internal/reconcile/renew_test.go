@@ -52,45 +52,52 @@ func TestSelfCredentialDue(t *testing.T) {
 
 	cases := []struct {
 		name      string
+		issuedAgo time.Duration // zero means no issue time recorded
 		expiresIn time.Duration
-		zero      bool
+		noExpiry  bool
 		want      bool
 	}{
 		{
 			// Nothing recorded: mint one, so there is an expiry to reason from.
-			name: "no recorded expiry",
-			zero: true,
-			want: true,
+			name:     "no recorded expiry",
+			noExpiry: true,
+			want:     true,
 		},
 		{
 			// Just minted. The old behaviour renewed here too, on every pass.
 			name:      "freshly minted",
+			issuedAgo: time.Minute,
 			expiresIn: 2160 * time.Hour,
 			want:      false,
 		},
 		{
 			name:      "not quite a day old",
+			issuedAgo: 23 * time.Hour,
 			expiresIn: 2160*time.Hour - 23*time.Hour,
 			want:      false,
 		},
 		{
 			name:      "a day old",
+			issuedAgo: selfRenewInterval,
 			expiresIn: 2160*time.Hour - selfRenewInterval,
 			want:      true,
 		},
 		{
-			// The lock-out case. Whatever else is true, an aged credential must be
-			// replaced while it still works.
-			name:      "near the end of its life",
-			expiresIn: time.Hour,
+			// The case that makes the second test necessary. A credential granted an
+			// hour is nowhere near a day old, so age alone would leave it alone until
+			// long after it expired — and an expired self credential is a lock-out
+			// that only a human re-running bootstrap can undo. Half of what was
+			// granted is what applies.
+			name:      "granted an hour, half of it gone",
+			issuedAgo: 31 * time.Minute,
+			expiresIn: 29 * time.Minute,
 			want:      true,
 		},
 		{
-			// A capped lifetime reads as older than it is, so it renews on every
-			// pass. That is the safe direction, and it already logs a warning.
-			name:      "lifetime capped far below the request",
-			expiresIn: 30 * time.Minute,
-			want:      true,
+			name:      "granted an hour, not yet half gone",
+			issuedAgo: 20 * time.Minute,
+			expiresIn: 40 * time.Minute,
+			want:      false,
 		},
 	}
 
@@ -98,14 +105,35 @@ func TestSelfCredentialDue(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			var expiresAt time.Time
-			if !tc.zero {
+			var issuedAt, expiresAt time.Time
+			if tc.issuedAgo != 0 {
+				issuedAt = now.Add(-tc.issuedAgo)
+			}
+			if !tc.noExpiry {
 				expiresAt = now.Add(tc.expiresIn)
 			}
-			if got := selfCredentialDue(cluster, expiresAt, now); got != tc.want {
-				t.Errorf("selfCredentialDue(expires in %v) = %v, want %v", tc.expiresIn, got, tc.want)
+			if got := selfCredentialDue(cluster, issuedAt, expiresAt, now); got != tc.want {
+				t.Errorf("selfCredentialDue(issued %v ago, expires in %v) = %v, want %v",
+					tc.issuedAgo, tc.expiresIn, got, tc.want)
 			}
 		})
+	}
+}
+
+// A credential written before the issue time was recorded — by an older release, or
+// by bootstrap — must still be renewed. Age is then inferred from what is left of
+// the requested lifetime, which is exactly what the previous version did.
+func TestSelfCredentialDueWithoutARecordedIssueTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster() // selfTokenTTL is 2160h
+
+	if selfCredentialDue(cluster, time.Time{}, now.Add(2160*time.Hour), now) {
+		t.Error("a credential with the full lifetime remaining was renewed")
+	}
+	if !selfCredentialDue(cluster, time.Time{}, now.Add(2160*time.Hour-selfRenewInterval), now) {
+		t.Error("a day-old credential was not renewed")
 	}
 }
 
@@ -185,7 +213,7 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
 
-	r.renewSelfCredential(ctx, cluster, access, &status, r.logger)
+	r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now())
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -199,6 +227,11 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	}
 	if !status.SelfCredentialExpiresAt.Time.Equal(expires) {
 		t.Errorf("status expiry = %v, want %v unchanged", status.SelfCredentialExpiresAt, expires)
+	}
+	// An issue time here would date the credential that is actually in use to a
+	// renewal that never happened, ageing out a working one a day later.
+	if status.SelfCredentialIssuedAt != nil {
+		t.Errorf("a discarded renewal recorded an issue time: %v", status.SelfCredentialIssuedAt)
 	}
 }
 
@@ -223,7 +256,7 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: oldExpiry}
 
-	r.renewSelfCredential(ctx, cluster, access, &status, r.logger)
+	r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now())
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -243,6 +276,11 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 	if status.SelfCredentialExpiresAt == nil || !status.SelfCredentialExpiresAt.Time.Equal(newExpiry) {
 		t.Errorf("status expiry = %v, want %v so the lockout clock is visible",
 			status.SelfCredentialExpiresAt, newExpiry)
+	}
+	// Without this, the next pass has no age to judge and would renew again
+	// immediately — every five minutes, indefinitely.
+	if status.SelfCredentialIssuedAt == nil || !status.SelfCredentialIssuedAt.Time.Equal(r.now()) {
+		t.Errorf("status issue time = %v, want %v", status.SelfCredentialIssuedAt, r.now())
 	}
 }
 

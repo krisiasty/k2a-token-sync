@@ -200,11 +200,28 @@ type ClusterConnectionStatus struct {
 	// +optional
 	TokenExpiresAt *metav1.Time `json:"tokenExpiresAt,omitempty"`
 
+	// TokenIssuedAt is when ArgoCD's credential was minted.
+	//
+	// Recorded because the granted lifetime is not the requested one whenever an
+	// API server caps it with --service-account-max-token-expiration, and half of
+	// the granted lifetime is what a reissue is actually due at. Without this,
+	// nothing here says how long the token was ever meant to live.
+	//
+	// +optional
+	TokenIssuedAt *metav1.Time `json:"tokenIssuedAt,omitempty"`
+
 	// SelfCredentialExpiresAt is when k2a-token-sync's own credential expires, and
 	// so when it would lock itself out if it stopped running.
 	//
 	// +optional
 	SelfCredentialExpiresAt *metav1.Time `json:"selfCredentialExpiresAt,omitempty"`
+
+	// SelfCredentialIssuedAt is when k2a-token-sync's own credential was minted, and
+	// therefore how old it is — which is what decides a renewal, rather than being
+	// inferred from what is left of the requested lifetime.
+	//
+	// +optional
+	SelfCredentialIssuedAt *metav1.Time `json:"selfCredentialIssuedAt,omitempty"`
 
 	// +optional
 	ServingCertExpiresAt *metav1.Time `json:"servingCertExpiresAt,omitempty"`
