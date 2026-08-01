@@ -159,6 +159,18 @@ Flags:
 	out.stepf("reached via", "%s", downstreamCfg.Host)
 	out.stepf("ArgoCD endpoint", "%s", cluster.ServerURL())
 
+	// Pre-flight before provisioning. A certificate that does not cover the
+	// endpoint is the most common reason direct access fails, and it is far cheaper
+	// to learn now than after two identities exist downstream. It runs in a dry run
+	// too — it reads a ConfigMap and opens a TLS connection, changing nothing, and
+	// a plan that omits the precondition most likely to fail is worth little.
+	cert, err := preflight(ctx, downstreamClient, cluster)
+	if err != nil {
+		return err
+	}
+	out.stepf("endpoint certificate", "valid until %s (%d days left)",
+		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
+
 	if *dryRun {
 		out.stepf("identities", "would create %s and %s",
 			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
@@ -173,16 +185,6 @@ Flags:
 		out.blank()
 		return printConnection(cluster, *namespace)
 	}
-
-	// Pre-flight before provisioning. A certificate that does not cover the
-	// endpoint is the most common reason direct access fails, and it is far
-	// cheaper to learn now than after two identities exist downstream.
-	cert, err := preflight(ctx, downstreamClient, cluster)
-	if err != nil {
-		return err
-	}
-	out.stepf("endpoint certificate", "valid until %s (%d days left)",
-		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
 
 	provisioned, err := reconcile.Provision(ctx, downstreamClient, cluster)
 	if err != nil {

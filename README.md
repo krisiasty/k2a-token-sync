@@ -342,6 +342,11 @@ directly. Progress goes to stderr, so `--print` can send the manifest to stdout 
 | `--print` | yes | yes | written to stdout, not applied |
 | `--dry-run` | no | no | shown as a preview |
 
+Every mode checks the endpoint first: that a certificate is served there, that it covers the address ArgoCD will use, and
+that it verifies against the cluster's own CA. A missing SAN is the usual reason direct access fails, so `--dry-run` is
+worth running against a new cluster before anything is created — it changes nothing and still answers that question,
+along with when the certificate expires.
+
 `k2a-token-sync bootstrap --help` lists the rest.
 
 ### Keeping the objects in git

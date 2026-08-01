@@ -267,31 +267,48 @@ func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*Serving
 		return nil, fmt.Errorf("parsing endpoint %q: %w", endpoint, err)
 	}
 
+	// The cluster CA is the only trust anchor that means anything here: ArgoCD will
+	// be handed exactly this bundle as caData, so the host's own trust store is
+	// beside the point. When no bundle is supplied the pool stays empty, and the
+	// handshake fails as untrusted — which is precisely the finding to report.
+	roots := x509.NewCertPool()
+	if len(ca) > 0 && !roots.AppendCertsFromPEM(ca) {
+		return nil, errors.New("cluster CA bundle contains no usable certificates")
+	}
+
 	dialCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 
-	// Verification is performed manually below so that a certificate which is
-	// untrusted, or whose SANs do not cover the endpoint, still yields a usable
-	// expiry reading instead of a bare handshake failure.
 	dialer := &tls.Dialer{
 		NetDialer: &net.Dialer{},
 		Config: &tls.Config{
-			InsecureSkipVerify: true, //nolint:gosec // verified explicitly against the cluster CA below
-			MinVersion:         tls.VersionTLS12,
+			RootCAs:    roots,
+			ServerName: host,
+			MinVersion: tls.VersionTLS12,
 		},
 	}
 	conn, err := dialer.DialContext(dialCtx, "tcp", endpoint)
-	if err != nil {
+
+	// A refused certificate is a diagnosis, not a dead end. Go returns the chain it
+	// rejected, so a certificate that is untrusted, misnamed or expired still
+	// yields an expiry reading and a precise explanation — without this probe ever
+	// having to accept one.
+	var refused *tls.CertificateVerificationError
+	var chain []*x509.Certificate
+	switch {
+	case err == nil:
+		defer func() { _ = conn.Close() }()
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			return nil, fmt.Errorf("unexpected connection type %T for %s", conn, endpoint)
+		}
+		chain = tlsConn.ConnectionState().PeerCertificates
+	case errors.As(err, &refused):
+		chain = refused.UnverifiedCertificates
+	default:
 		return nil, fmt.Errorf("TLS handshake with %s failed: %w", endpoint, err)
 	}
-	defer func() { _ = conn.Close() }()
 
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return nil, fmt.Errorf("unexpected connection type %T for %s", conn, endpoint)
-	}
-
-	chain := tlsConn.ConnectionState().PeerCertificates
 	if len(chain) == 0 {
 		return nil, fmt.Errorf("%s presented no certificates", endpoint)
 	}
@@ -302,31 +319,32 @@ func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*Serving
 		Subject:  leaf.Subject.String(),
 		Serial:   leaf.SerialNumber.String(),
 	}
+	if err == nil {
+		out.TrustedByCA = true
+		return out, nil
+	}
 
-	if err := leaf.VerifyHostname(host); err != nil {
+	// Go's verifier stops at the first problem, and checks the hostname before it
+	// builds a chain. Both answers matter to whoever has to fix the cluster, so
+	// both are established here rather than inferred from one error.
+	if hostErr := leaf.VerifyHostname(host); hostErr != nil {
 		out.HostnameError = fmt.Errorf(
 			"the API server certificate at %s carries no SAN for %q (SANs: %v); "+
 				"add this name to the API server's serving certificate, "+
 				"otherwise ArgoCD cannot verify this endpoint: %w",
-			endpoint, host, sans(leaf), err)
+			endpoint, host, sans(leaf), hostErr)
 	}
 
-	if len(ca) > 0 {
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(ca) {
-			return out, errors.New("cluster CA bundle contains no usable certificates")
-		}
-		intermediates := x509.NewCertPool()
-		for _, cert := range chain[1:] {
-			intermediates.AddCert(cert)
-		}
-		_, verifyErr := leaf.Verify(x509.VerifyOptions{
-			Roots:         pool,
-			Intermediates: intermediates,
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		})
-		out.TrustedByCA = verifyErr == nil
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
 	}
+	_, verifyErr := leaf.Verify(x509.VerifyOptions{
+		Roots:         roots,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	})
+	out.TrustedByCA = verifyErr == nil
 
 	return out, nil
 }
