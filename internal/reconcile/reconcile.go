@@ -34,13 +34,28 @@ type Reconciler struct {
 	local  kubernetes.Interface
 	logger *slog.Logger
 
+	// applied records what was last published for each cluster, keyed by
+	// cluster name. The daemon holds no read permission on Secrets in ArgoCD's
+	// namespace, so this is how drift is detected.
+	//
+	// In memory for now, which means a restart reissues once per cluster —
+	// harmless, and self-correcting. It moves into ClusterConnection status,
+	// where it survives restarts, when the inventory does.
+	applied map[string]argocd.Fingerprint
+
 	// now is injectable for tests.
 	now func() time.Time
 }
 
 // New builds a Reconciler.
 func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *Reconciler {
-	return &Reconciler{cfg: cfg, local: local, logger: logger, now: time.Now}
+	return &Reconciler{
+		cfg:     cfg,
+		local:   local,
+		logger:  logger,
+		applied: make(map[string]argocd.Fingerprint, len(cfg.Clusters)),
+		now:     time.Now,
+	}
 }
 
 // ClusterStatus is the outcome of reconciling one cluster.
@@ -168,25 +183,35 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 		ExtraAnnotations:     cluster.Annotations,
 	}
 
-	observed, err := argocd.Observe(ctx, r.local, r.cfg.ArgoCDNamespace, cluster.SecretName)
-	if err != nil {
-		return r.argocdSecretError(cluster, err)
+	now := r.now()
+	applied := r.applied[cluster.Name]
+	first := applied == (argocd.Fingerprint{})
+
+	// Carry the recorded expiry into the desired state so the registration
+	// re-applies with the annotation it already had, rather than dropping it.
+	desired.TokenExpiresAt = applied.TokenExpiresAt
+
+	// Applying the registration is how the daemon observes what it published: an
+	// apply returns the object and needs only the patch verb. Skipped on the
+	// first pass for a cluster, where the credential has to be minted anyway and
+	// applying the label first would briefly show ArgoCD a cluster with no
+	// credential.
+	var hasCredential bool
+	if !first {
+		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
+			return r.argocdSecretError(cluster, err)
+		}
 	}
 
-	now := r.now()
-	reason := argocd.NeedsRefresh(observed, desired, cluster.TokenTTL, now)
+	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
 	if reason == "" {
 		status.Action = "up-to-date"
-		status.TokenExpiresAt = observed.TokenExpiresAt
+		status.TokenExpiresAt = applied.TokenExpiresAt
 		logger.Info("registration current",
-			"token_expires_at", observed.TokenExpiresAt.UTC().Format(time.RFC3339),
+			"token_expires_at", applied.TokenExpiresAt.UTC().Format(time.RFC3339),
 			"serving_cert_days_left", status.ServingCertDaysLeft,
 		)
-		// Refresh the observed serving-cert annotation without reissuing the
-		// credential, so expiry stays visible on the object.
-		desired.BearerToken = ""
-		desired.TokenExpiresAt = observed.TokenExpiresAt
-		return r.argocdSecretError(cluster, r.annotate(ctx, desired, now))
+		return nil
 	}
 
 	created, err := downstream.EnsureArgoCDIdentity(ctx, access.client, cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
@@ -215,9 +240,17 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 	desired.BearerToken = token.Value
 	desired.TokenExpiresAt = token.ExpiresAt
 
-	if err := argocd.Apply(ctx, r.local, desired, now); err != nil {
+	// The credential goes on first when the Secret is new. A Secret carrying no
+	// argocd.argoproj.io/secret-type label is invisible to ArgoCD, so writing the
+	// credential before the registration means ArgoCD never sees a cluster it
+	// cannot authenticate to — not even for the moment between two applies.
+	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
+	if _, err := argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
+		return r.argocdSecretError(cluster, err)
+	}
+	r.applied[cluster.Name] = desired.Fingerprint()
 
 	status.Action = string(reason)
 	status.TokenExpiresAt = token.ExpiresAt
@@ -231,32 +264,17 @@ func (r *Reconciler) reconcileCluster(ctx context.Context, cluster config.Cluste
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.
 //
-// The Role in ArgoCD's namespace scopes get, update and patch to an explicit
-// resourceNames list, because the daemon must not be able to read ArgoCD's own
-// secrets. A cluster added to the inventory without that list being extended
-// therefore fails here, and the raw API error names neither the Role nor the
-// remedy — so the whole failure mode looks like a bug in the daemon.
+// The daemon needs create and patch on Secrets in ArgoCD's namespace and holds
+// nothing else there. The raw API error names neither the Role nor the remedy, so
+// a missing or narrowed Role otherwise looks like a bug in the daemon.
 //
 // Passing a nil error through keeps the call sites free of extra branching.
 func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error {
 	if err == nil || !apierrors.IsForbidden(err) {
 		return err
 	}
-	return fmt.Errorf("%w; the daemon's Role in namespace %s must list %q under resourceNames — "+
-		"add this cluster to .Values.clusters and run 'helm upgrade', which renders the ConfigMap "+
-		"and the Role from the same list",
-		err, r.cfg.ArgoCDNamespace, cluster.SecretName)
-}
-
-// annotate refreshes the bookkeeping annotations on an otherwise current Secret.
-func (r *Reconciler) annotate(ctx context.Context, desired argocd.ClusterSecret, now time.Time) error {
-	secret, err := desired.Render(now)
-	if err != nil {
-		return err
-	}
-	// Leave credential material alone; only the annotations are being updated.
-	delete(secret.Data, "config")
-	return k8s.UpsertSecret(ctx, r.local, secret)
+	return fmt.Errorf("%w; the daemon's Role in namespace %s must allow create and patch on secrets "+
+		"so it can maintain %q", err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 
 // probe inspects the serving certificate at the direct endpoint and records what

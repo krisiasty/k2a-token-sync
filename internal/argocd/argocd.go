@@ -8,16 +8,16 @@ package argocd
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/krisiasty/k2a-token-sync/internal/k8s"
 )
 
 const (
@@ -25,6 +25,19 @@ const (
 	// Secret.
 	SecretTypeLabel   = "argocd.argoproj.io/secret-type" //nolint:gosec // a label key, not a credential
 	secretTypeCluster = "cluster"
+
+	// FieldManagerRegistration owns everything except the credential.
+	//
+	// The split from FieldManagerCredential is what makes a write-only design
+	// possible. Server-side apply removes fields a manager owns and then omits,
+	// so a single manager applying the registration without a credential in hand
+	// would strip the credential. With two, the registration can be re-applied on
+	// every pass — a no-op when nothing changed — while the credential is written
+	// only when one is minted.
+	FieldManagerRegistration = "k2a-token-sync"
+
+	// FieldManagerCredential owns data.config and nothing else.
+	FieldManagerCredential = "k2a-token-sync-credential" //nolint:gosec // a field manager name, not a credential
 
 	managedByLabel = "app.kubernetes.io/managed-by"
 	managedByValue = "k2a-token-sync"
@@ -99,20 +112,10 @@ type ClusterSecret struct {
 	ExtraAnnotations map[string]string
 }
 
-// Render builds the Secret ArgoCD expects.
-func (c ClusterSecret) Render(now time.Time) (*corev1.Secret, error) {
-	// The credential is the point of this payload: ArgoCD reads bearerToken out
-	// of the Secret's "config" key. It goes only into that Secret, never a log.
-	payload, err := json.Marshal(clusterConfig{ //nolint:gosec // G117: serialising the credential here is intended
-		BearerToken: c.BearerToken,
-		TLSClientConfig: tlsClientConfig{
-			CAData: c.CAData,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("encoding cluster config: %w", err)
-	}
-
+// registrationConfig is everything except the credential: the labels that make
+// ArgoCD notice the Secret at all, the bookkeeping annotations, and the server,
+// name and project it reads.
+func (c ClusterSecret) registrationConfig(now time.Time) *applycorev1.SecretApplyConfiguration {
 	labels := map[string]string{
 		SecretTypeLabel: secretTypeCluster,
 		managedByLabel:  managedByValue,
@@ -138,78 +141,117 @@ func (c ClusterSecret) Render(now time.Time) (*corev1.Secret, error) {
 	data := map[string][]byte{
 		nameKey:   []byte(c.DisplayName),
 		serverKey: []byte(c.Server),
-		configKey: payload,
 	}
 	if c.Project != "" {
 		data[projectKey] = []byte(c.Project)
 	}
 
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.Name,
-			Namespace:   c.Namespace,
-			Labels:      labels,
-			Annotations: annotations,
-		},
-		Type: corev1.SecretTypeOpaque,
-		Data: data,
-	}, nil
+	return applycorev1.Secret(c.Name, c.Namespace).
+		WithType(corev1.SecretTypeOpaque).
+		WithLabels(labels).
+		WithAnnotations(annotations).
+		WithData(data)
 }
 
-// Apply writes the cluster Secret, creating it when absent.
-func Apply(ctx context.Context, client kubernetes.Interface, desired ClusterSecret, now time.Time) error {
-	secret, err := desired.Render(now)
+// credentialConfig is the credential half, and nothing else.
+func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration, error) {
+	// ArgoCD reads bearerToken out of the Secret's "config" key. It goes only
+	// into that Secret, never a log.
+	payload, err := json.Marshal(clusterConfig{ //nolint:gosec // G117: serialising the credential here is intended
+		BearerToken: c.BearerToken,
+		TLSClientConfig: tlsClientConfig{
+			CAData: c.CAData,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encoding cluster config: %w", err)
+	}
+
+	return applycorev1.Secret(c.Name, c.Namespace).
+		WithType(corev1.SecretTypeOpaque).
+		WithData(map[string][]byte{configKey: payload}), nil
+}
+
+// ApplyRegistration writes everything except the credential and reports whether
+// the credential is present on the server afterwards.
+//
+// An apply returns the object it produced, and needs only the patch verb, so
+// this doubles as the daemon's only view of what it has published: no get, list
+// or watch permission in ArgoCD's namespace is required anywhere. That is what
+// makes a deleted or emptied Secret self-healing — the next pass recreates the
+// registration and sees that the credential is gone.
+func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret, now time.Time) (bool, error) {
+	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(now), metav1.ApplyOptions{
+		FieldManager: FieldManagerRegistration,
+		Force:        true,
+	})
+	if err != nil {
+		return false, fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+	return hasBearerToken(applied), nil
+}
+
+// ApplyCredential writes the credential half.
+func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) error {
+	config, err := desired.credentialConfig()
 	if err != nil {
 		return err
 	}
-	return k8s.UpsertSecret(ctx, client, secret)
+	if _, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, config, metav1.ApplyOptions{
+		FieldManager: FieldManagerCredential,
+		Force:        true,
+	}); err != nil {
+		return fmt.Errorf("applying credential for %s/%s: %w", desired.Namespace, desired.Name, err)
+	}
+	return nil
 }
 
-// Observed is the current state of a cluster Secret, used to decide whether a
-// new credential is needed.
-type Observed struct {
-	Exists         bool
+func hasBearerToken(secret *corev1.Secret) bool {
+	raw, ok := secret.Data[configKey]
+	if !ok {
+		return false
+	}
+	var parsed clusterConfig
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return false
+	}
+	return parsed.BearerToken != ""
+}
+
+// Fingerprint is what a previous pass wrote, as recorded in the owning
+// ClusterConnection's status.
+//
+// The daemon cannot read the generated Secret back, so this is how it knows
+// whether the published registration still matches what is wanted. A zero value
+// means nothing has been published, which is why it reads as "reissue".
+type Fingerprint struct {
 	Server         string
 	DisplayName    string
 	Project        string
-	CAData         []byte
-	HasBearerToken bool
+	CAHash         string
 	TokenExpiresAt time.Time
 }
 
-// Observe reads the existing cluster Secret. A missing Secret is not an error —
-// it simply means nothing has been generated yet.
-func Observe(ctx context.Context, client kubernetes.Interface, namespace, name string) (*Observed, error) {
-	secret, err := k8s.GetSecret(ctx, client, namespace, name)
-	if err != nil {
-		if isNotFound(err) {
-			return &Observed{}, nil
-		}
-		return nil, err
+// Fingerprint describes what applying this ClusterSecret would publish, for
+// recording in status after a successful write.
+func (c ClusterSecret) Fingerprint() Fingerprint {
+	return Fingerprint{
+		Server:         c.Server,
+		DisplayName:    c.DisplayName,
+		Project:        c.Project,
+		CAHash:         HashCA(c.CAData),
+		TokenExpiresAt: c.TokenExpiresAt,
 	}
+}
 
-	out := &Observed{
-		Exists:      true,
-		Server:      string(secret.Data[serverKey]),
-		DisplayName: string(secret.Data[nameKey]),
-		Project:     string(secret.Data[projectKey]),
+// HashCA reduces a CA bundle to a comparable digest, so drift can be detected
+// from status without storing the bundle twice.
+func HashCA(ca []byte) string {
+	if len(ca) == 0 {
+		return ""
 	}
-
-	if raw, ok := secret.Data[configKey]; ok {
-		var parsed clusterConfig
-		if err := json.Unmarshal(raw, &parsed); err == nil {
-			out.HasBearerToken = parsed.BearerToken != ""
-			out.CAData = parsed.TLSClientConfig.CAData
-		}
-	}
-
-	if value, ok := secret.Annotations[TokenExpiryAnnotation]; ok {
-		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
-			out.TokenExpiresAt = parsed
-		}
-	}
-
-	return out, nil
+	sum := sha256.Sum256(ca)
+	return hex.EncodeToString(sum[:])
 }
 
 // RefreshReason explains why a credential is being reissued. An empty reason
@@ -231,31 +273,31 @@ const (
 
 // NeedsRefresh decides whether to mint a new credential.
 //
-// Reissuing on every cycle would work but writes to the Secret churn ArgoCD's
-// cluster cache, so a refresh happens only once the token is past half its
-// lifetime or something has drifted.
-func NeedsRefresh(observed *Observed, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
+// applied is what the last pass recorded in status; hasCredential is what the
+// server reported when the registration was applied this pass. Minting on every
+// cycle would work, but each write churns ArgoCD's cluster cache, so a
+// credential is reissued only when it is past half its lifetime, when something
+// it depends on has drifted, or when it has gone missing entirely.
+func NeedsRefresh(applied Fingerprint, hasCredential bool, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
 	switch {
-	case !observed.Exists:
+	case applied == (Fingerprint{}):
+		// Nothing recorded: either this cluster has never been published, or
+		// status was lost. Reissuing is the safe reading of both.
 		return ReasonMissing
-	case !observed.HasBearerToken:
+	case !hasCredential:
 		return ReasonNoToken
-	case observed.Server != desired.Server:
+	case applied.Server != desired.Server:
 		return ReasonServerDrift
-	case observed.DisplayName != desired.DisplayName:
+	case applied.DisplayName != desired.DisplayName:
 		return ReasonNameDrift
-	case observed.Project != desired.Project:
+	case applied.Project != desired.Project:
 		return ReasonProjectDrift
-	case len(desired.CAData) > 0 && string(observed.CAData) != string(desired.CAData):
+	case len(desired.CAData) > 0 && applied.CAHash != HashCA(desired.CAData):
 		return ReasonCADrift
-	case observed.TokenExpiresAt.IsZero():
+	case applied.TokenExpiresAt.IsZero():
 		return ReasonUnknownExpiry
-	case observed.TokenExpiresAt.Sub(now) < ttl/2:
+	case applied.TokenExpiresAt.Sub(now) < ttl/2:
 		return ReasonExpiring
 	}
 	return ""
-}
-
-func isNotFound(err error) bool {
-	return errors.Is(err, k8s.ErrNotFound)
 }

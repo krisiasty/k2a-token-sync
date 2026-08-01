@@ -5,6 +5,10 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 const testCA = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
@@ -21,9 +25,17 @@ func testSecret() ClusterSecret {
 	}
 }
 
-func TestRenderProducesArgoCDClusterSecret(t *testing.T) {
+// newClient returns a fake with server-side apply support. NewSimpleClientset
+// tracks no managed fields, so it cannot model what these tests are about.
+func newClient() kubernetes.Interface {
+	return fake.NewClientset()
+}
+
+func TestApplyProducesArgoCDClusterSecret(t *testing.T) {
 	t.Parallel()
 
+	ctx := t.Context()
+	client := newClient()
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	expires := now.Add(720 * time.Hour)
 
@@ -31,9 +43,16 @@ func TestRenderProducesArgoCDClusterSecret(t *testing.T) {
 	desired.TokenExpiresAt = expires
 	desired.ServingCertExpiresAt = now.Add(200 * 24 * time.Hour)
 
-	secret, err := desired.Render(now)
+	if err := ApplyCredential(ctx, client, desired); err != nil {
+		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
+	}
+	if _, err := ApplyRegistration(ctx, client, desired, now); err != nil {
+		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
+	}
+
+	secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("Render returned unexpected error: %v", err)
+		t.Fatalf("the applied secret cannot be read back: %v", err)
 	}
 
 	// Without this label ArgoCD ignores the Secret entirely.
@@ -87,16 +106,82 @@ func TestRenderProducesArgoCDClusterSecret(t *testing.T) {
 	}
 }
 
-func TestRenderMergesExtraLabelsAndAnnotations(t *testing.T) {
+// TestApplyRegistrationKeepsTheCredential is the reason there are two field
+// managers. Server-side apply removes fields a manager owns and then omits, so a
+// single manager re-applying the registration with no token in hand would strip
+// the credential and silently break the cluster.
+func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	t.Parallel()
+
+	ctx := t.Context()
+	client := newClient()
+	now := time.Now()
+
+	desired := testSecret()
+	if err := ApplyCredential(ctx, client, desired); err != nil {
+		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
+	}
+
+	// A later pass has no token to write — only the registration.
+	registrationOnly := testSecret()
+	registrationOnly.BearerToken = ""
+
+	hasCredential, err := ApplyRegistration(ctx, client, registrationOnly, now)
+	if err != nil {
+		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
+	}
+	if !hasCredential {
+		t.Error("ApplyRegistration reported no credential, but one was applied before it")
+	}
+
+	secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading the secret back: %v", err)
+	}
+	if !hasBearerToken(secret) {
+		t.Fatal("re-applying the registration stripped the credential")
+	}
+}
+
+// The apply response is the daemon's only view of what it published, since it
+// holds no read permission in ArgoCD's namespace. A Secret that lost its
+// credential must therefore be reported as such.
+func TestApplyRegistrationReportsAMissingCredential(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	client := newClient()
+	now := time.Now()
+
+	desired := testSecret()
+	desired.BearerToken = ""
+
+	hasCredential, err := ApplyRegistration(ctx, client, desired, now)
+	if err != nil {
+		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
+	}
+	if hasCredential {
+		t.Error("ApplyRegistration reported a credential on a Secret that has none")
+	}
+}
+
+func TestApplyMergesExtraLabelsAndAnnotations(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	client := newClient()
 
 	desired := testSecret()
 	desired.ExtraLabels = map[string]string{"env": "prod"}
 	desired.ExtraAnnotations = map[string]string{"owner": "platform"}
 
-	secret, err := desired.Render(time.Now())
+	if _, err := ApplyRegistration(ctx, client, desired, time.Now()); err != nil {
+		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
+	}
+
+	secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
 	if err != nil {
-		t.Fatalf("Render returned unexpected error: %v", err)
+		t.Fatalf("reading the secret back: %v", err)
 	}
 	if secret.Labels["env"] != "prod" {
 		t.Error("extra label was not merged")
@@ -116,53 +201,91 @@ func TestNeedsRefresh(t *testing.T) {
 	ttl := 720 * time.Hour
 	desired := testSecret()
 
-	current := func() *Observed {
-		return &Observed{
-			Exists:         true,
+	current := func() Fingerprint {
+		return Fingerprint{
 			Server:         desired.Server,
 			DisplayName:    desired.DisplayName,
 			Project:        desired.Project,
-			CAData:         desired.CAData,
-			HasBearerToken: true,
+			CAHash:         HashCA(desired.CAData),
 			TokenExpiresAt: now.Add(ttl),
 		}
 	}
 
 	cases := []struct {
-		name     string
-		mutate   func(*Observed)
-		want     RefreshReason
-		wantSkip bool
+		name          string
+		mutate        func(*Fingerprint)
+		hasCredential bool
+		want          RefreshReason
+		wantSkip      bool
 	}{
-		{name: "fresh registration needs nothing", mutate: func(*Observed) {}, wantSkip: true},
-		{name: "missing secret", mutate: func(o *Observed) { o.Exists = false }, want: ReasonMissing},
-		{name: "no token", mutate: func(o *Observed) { o.HasBearerToken = false }, want: ReasonNoToken},
-		{name: "server drift", mutate: func(o *Observed) { o.Server = "https://10.9.9.9:6443" }, want: ReasonServerDrift},
-		{name: "name drift", mutate: func(o *Observed) { o.DisplayName = "renamed" }, want: ReasonNameDrift},
-		{name: "project drift", mutate: func(o *Observed) { o.Project = "other" }, want: ReasonProjectDrift},
-		{name: "ca drift", mutate: func(o *Observed) { o.CAData = []byte("different") }, want: ReasonCADrift},
-		{name: "unrecorded expiry", mutate: func(o *Observed) { o.TokenExpiresAt = time.Time{} }, want: ReasonUnknownExpiry},
+		{name: "fresh registration needs nothing", mutate: func(*Fingerprint) {}, hasCredential: true, wantSkip: true},
+		{
+			// Also the status-was-lost case: nothing recorded reads as reissue.
+			name:          "nothing published yet",
+			mutate:        func(f *Fingerprint) { *f = Fingerprint{} },
+			hasCredential: true,
+			want:          ReasonMissing,
+		},
+		{
+			// The self-healing path: someone deleted or emptied the Secret.
+			name:          "credential gone from the secret",
+			mutate:        func(*Fingerprint) {},
+			hasCredential: false,
+			want:          ReasonNoToken,
+		},
+		{
+			name:          "server drift",
+			mutate:        func(f *Fingerprint) { f.Server = "https://10.9.9.9:6443" },
+			hasCredential: true,
+			want:          ReasonServerDrift,
+		},
+		{
+			name:          "name drift",
+			mutate:        func(f *Fingerprint) { f.DisplayName = "renamed" },
+			hasCredential: true,
+			want:          ReasonNameDrift,
+		},
+		{
+			name:          "project drift",
+			mutate:        func(f *Fingerprint) { f.Project = "other" },
+			hasCredential: true,
+			want:          ReasonProjectDrift,
+		},
+		{
+			name:          "ca drift",
+			mutate:        func(f *Fingerprint) { f.CAHash = HashCA([]byte("different")) },
+			hasCredential: true,
+			want:          ReasonCADrift,
+		},
+		{
+			name:          "unrecorded expiry",
+			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = time.Time{} },
+			hasCredential: true,
+			want:          ReasonUnknownExpiry,
+		},
 		{
 			// Half the lifetime is the refresh point, so a long outage still
 			// leaves a wide margin before ArgoCD's credential dies.
-			name:   "past half its lifetime",
-			mutate: func(o *Observed) { o.TokenExpiresAt = now.Add(ttl/2 - time.Minute) },
-			want:   ReasonExpiring,
+			name:          "past half its lifetime",
+			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 - time.Minute) },
+			hasCredential: true,
+			want:          ReasonExpiring,
 		},
 		{
-			name:     "just inside half its lifetime",
-			mutate:   func(o *Observed) { o.TokenExpiresAt = now.Add(ttl/2 + time.Minute) },
-			wantSkip: true,
+			name:          "just inside half its lifetime",
+			mutate:        func(f *Fingerprint) { f.TokenExpiresAt = now.Add(ttl/2 + time.Minute) },
+			hasCredential: true,
+			wantSkip:      true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			observed := current()
-			tc.mutate(observed)
+			applied := current()
+			tc.mutate(&applied)
 
-			got := NeedsRefresh(observed, desired, ttl, now)
+			got := NeedsRefresh(applied, tc.hasCredential, desired, ttl, now)
 			if tc.wantSkip {
 				if got != "" {
 					t.Fatalf("NeedsRefresh = %q, want no refresh", got)
@@ -173,5 +296,19 @@ func TestNeedsRefresh(t *testing.T) {
 				t.Fatalf("NeedsRefresh = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFingerprintRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// A fingerprint taken from what was applied must compare equal against the
+	// same desired state, or every pass would reissue.
+	desired := testSecret()
+	desired.TokenExpiresAt = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+
+	applied := desired.Fingerprint()
+	if got := NeedsRefresh(applied, true, desired, 720*time.Hour, desired.TokenExpiresAt.Add(-700*time.Hour)); got != "" {
+		t.Fatalf("NeedsRefresh = %q immediately after applying, want no refresh", got)
 	}
 }

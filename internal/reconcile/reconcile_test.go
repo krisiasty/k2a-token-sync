@@ -121,17 +121,17 @@ func TestArgoCDSecretError(t *testing.T) {
 		}
 	})
 
-	// The hint must survive the wrapping GetSecret applies, which is how the
+	// The hint must survive the wrapping the apply helpers add, which is how the
 	// error actually arrives here.
 	t.Run("wrapped forbidden gains the remedy", func(t *testing.T) {
 		t.Parallel()
-		wrapped := fmt.Errorf("getting secret argocd/%s: %w", cluster.SecretName, forbidden)
+		wrapped := fmt.Errorf("applying cluster secret argocd/%s: %w", cluster.SecretName, forbidden)
 		got := r.argocdSecretError(cluster, wrapped)
 
 		if !errors.Is(got, forbidden) {
 			t.Error("the original API error is no longer unwrappable")
 		}
-		for _, want := range []string{"resourceNames", "argocd", cluster.SecretName, ".Values.clusters", "helm upgrade"} {
+		for _, want := range []string{"create and patch", "argocd", cluster.SecretName} {
 			if !strings.Contains(got.Error(), want) {
 				t.Errorf("error %q does not mention %q", got, want)
 			}
