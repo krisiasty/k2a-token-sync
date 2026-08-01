@@ -6,7 +6,7 @@
 #
 # controller-gen is invoked with 'go run pkg@version', which resolves in
 # isolation and touches neither go.mod nor the module graph: a codegen tool run
-# twice a year should not get a vote on the versions the daemon is built with.
+# twice a year should not get a vote on the versions k2a-token-sync is built with.
 set -euo pipefail
 
 CONTROLLER_GEN_VERSION=v0.19.0

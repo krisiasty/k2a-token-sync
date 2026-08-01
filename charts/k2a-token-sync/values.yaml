@@ -13,9 +13,9 @@ image:
 
 imagePullSecrets: []
 
-# Namespace of the ArgoCD instance this daemon serves. Every generated cluster
+# Namespace of the ArgoCD instance k2a-token-sync serves. Every generated cluster
 # Secret is written here, and the chart renders a Role in this namespace.
-# One daemon serves one ArgoCD instance; deploy a second release for a second.
+# One instance serves one ArgoCD; deploy a second release for a second.
 argocdNamespace: argocd
 
 health:

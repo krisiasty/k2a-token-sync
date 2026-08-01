@@ -23,8 +23,8 @@ const (
 	// A watch would make this sub-second, at the cost of a cache with a
 	// lifecycle, reconnect handling and a queue to deduplicate events. The
 	// inventory changes when a human adds a cluster, so that trade is the wrong
-	// way round — and a list doubles as the recovery path, since whatever the
-	// daemon believed, the next poll replaces it.
+	// way round — and a list doubles as the recovery path: whatever was believed
+	// before, the next poll replaces it.
 	pollInterval = 30 * time.Second
 
 	// maxPassInterval caps how long a healthy cluster goes unreconciled, so a
@@ -151,7 +151,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		// An edited spec is due immediately, so 'kubectl edit' takes effect
 		// within a poll rather than at the next scheduled pass. The comparison is
 		// against the generation recorded in status, so it survives a restart:
-		// an edit made while the daemon was down is still noticed.
+		// an edit made while k2a-token-sync was down is still noticed.
 		if entry.Edited() {
 			state.dueAt = now
 		}
@@ -165,7 +165,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 	for name := range s.state {
 		if _, still := seen[name]; !still {
 			delete(s.state, name)
-			// The generated Secret is deliberately left behind: the daemon holds
+			// The generated Secret is deliberately left behind: k2a-token-sync holds
 			// no delete permission in ArgoCD's namespace, and removing a
 			// registration is an operator's decision.
 			s.logger.Info("cluster removed from the inventory; its ArgoCD Secret is left in place",

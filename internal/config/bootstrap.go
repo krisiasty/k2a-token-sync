@@ -12,7 +12,7 @@ type BootstrapClusterInput struct {
 	Endpoint                string
 	ServiceAccountName      string
 	ServiceAccountNamespace string
-	AgentServiceAccountName string
+	SelfServiceAccountName  string
 }
 
 // BootstrapCluster builds a Cluster from command-line input, applying the same
@@ -34,11 +34,11 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 	}
 
 	return Cluster{
-		Name:                    in.Name,
-		Endpoint:                endpoint,
-		DisplayName:             in.Name,
-		SecretName:              "cluster-" + in.Name,
-		AgentServiceAccountName: orDefault(in.AgentServiceAccountName, defaultAgentServiceAccount),
+		Name:                   in.Name,
+		Endpoint:               endpoint,
+		DisplayName:            in.Name,
+		SecretName:             "cluster-" + in.Name,
+		SelfServiceAccountName: orDefault(in.SelfServiceAccountName, defaultSelfServiceAccount),
 		ServiceAccount: ServiceAccountRef{
 			Name:      orDefault(in.ServiceAccountName, defaultServiceAccountName),
 			Namespace: orDefault(in.ServiceAccountNamespace, defaultServiceAccountNS),

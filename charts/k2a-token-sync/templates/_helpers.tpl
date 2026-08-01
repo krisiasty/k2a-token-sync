@@ -33,7 +33,7 @@ stated explicitly rather than implied.
 
 {{/*
 Namespace of the ArgoCD instance this release serves. All generated cluster
-Secrets go here, and the daemon needs one Role there.
+Secrets go here, and k2a-token-sync needs one Role there.
 */}}
 {{- define "k2a-token-sync.argocdNamespace" -}}
 {{- .Values.argocdNamespace | default "argocd" }}

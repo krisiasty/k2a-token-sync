@@ -12,12 +12,12 @@ imagePullSecrets:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 ---
-# In its own namespace the daemon reads its inventory and holds the credential it
-# provisioned for each cluster. This namespace contains nothing but the daemon's
+# In its own namespace k2a-token-sync reads its inventory and holds the credential it
+# provisioned for each cluster. This namespace contains nothing but k2a-token-sync's
 # own objects.
 #
 # ClusterConnections are namespaced and only this namespace is listed, so a Role
-# suffices: the daemon holds no cluster-scoped permission anywhere.
+# suffices: k2a-token-sync holds no cluster-scoped permission anywhere.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -55,7 +55,7 @@ subjects:
 ---
 # ArgoCD's namespace, where the generated cluster Secrets live.
 #
-# The daemon holds create and patch here, and nothing else. In particular it
+# k2a-token-sync holds create and patch here, and nothing else. In particular it
 # cannot read: not the Secrets it writes, not ArgoCD's own. It learns the result
 # of its own writes from what an apply returns, and records everything else in
 # each ClusterConnection's status.
@@ -65,7 +65,7 @@ subjects:
 # changes at runtime — and RBAC cannot scope resourceNames by prefix. Two things
 # limit what that permits: secretName must begin with "cluster-", so a connection
 # cannot be aimed at ArgoCD's own Secrets, and the absence of delete means nothing
-# here can be removed by the daemon.
+# here can be removed by k2a-token-sync.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

@@ -36,7 +36,7 @@ const (
 // authenticate to it, and how long the credentials it publishes should live.
 //
 // Deleting one stops maintenance. It deliberately does not delete the generated
-// ArgoCD Secret: the daemon holds no delete permission in ArgoCD's namespace, so
+// ArgoCD Secret: k2a-token-sync holds no delete permission in ArgoCD's namespace, so
 // removing that Secret stays an explicit operator action.
 //
 // +kubebuilder:object:root=true
@@ -45,7 +45,7 @@ const (
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.spec.endpoint`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Token Expires",type=date,JSONPath=`.status.tokenExpiresAt`
-// +kubebuilder:printcolumn:name="Agent Expires",type=date,JSONPath=`.status.agentCredentialExpiresAt`
+// +kubebuilder:printcolumn:name="Self Expires",type=date,JSONPath=`.status.selfCredentialExpiresAt`
 // +kubebuilder:printcolumn:name="Cert Days",type=integer,JSONPath=`.status.servingCertDaysRemaining`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type ClusterConnection struct {
@@ -75,7 +75,7 @@ type ClusterConnectionSpec struct {
 	// Endpoint is the address ArgoCD connects to, as "host" or "host:port".
 	// Port 6443 is assumed when omitted. This must be an address that bypasses
 	// any management-plane proxy, and it must appear in the API server's
-	// serving-certificate SANs — the daemon refuses to publish a registration
+	// serving-certificate SANs — k2a-token-sync refuses to publish a registration
 	// whose certificate does not cover it.
 	//
 	// +kubebuilder:validation:Required
@@ -89,9 +89,9 @@ type ClusterConnectionSpec struct {
 	DisplayName string `json:"displayName,omitempty"`
 
 	// SecretName is the ArgoCD cluster Secret this connection maintains, in the
-	// namespace the daemon serves. Defaults to "cluster-<name>".
+	// namespace k2a-token-sync serves. Defaults to "cluster-<name>".
 	//
-	// The cluster- prefix is required rather than conventional. The daemon holds
+	// The cluster- prefix is required rather than conventional. k2a-token-sync holds
 	// namespace-wide patch on Secrets in ArgoCD's namespace, because cluster
 	// names are not known when its RBAC is created and RBAC cannot scope by
 	// prefix. The prefix is what keeps a connection from being pointed at
@@ -114,35 +114,35 @@ type ClusterConnectionSpec struct {
 	// +kubebuilder:default={name: "argocd-manager", namespace: "kube-system"}
 	ServiceAccount *ServiceAccountRef `json:"serviceAccount,omitempty"`
 
-	// AgentServiceAccountName is the downstream identity the daemon itself
+	// SelfServiceAccountName is the downstream identity k2a-token-sync itself
 	// authenticates as, in the same namespace as ServiceAccount. It is narrowly
 	// scoped: it can mint tokens and read the cluster CA, nothing more.
 	//
 	// +optional
 	// +kubebuilder:default="k2a-token-sync"
-	AgentServiceAccountName string `json:"agentServiceAccountName,omitempty"`
+	SelfServiceAccountName string `json:"selfServiceAccountName,omitempty"`
 
 	// TokenTTL is the lifetime requested for ArgoCD's credential, reissued at
-	// half life. The API server may cap it; the granted lifetime is what the
-	// daemon schedules against, and a shortened one is reported.
+	// half life. The API server may cap it; the granted lifetime is what is
+	// scheduled against, and a shortened one is reported.
 	//
 	// +optional
 	// +kubebuilder:default="720h"
 	// +kubebuilder:validation:Pattern=`^([0-9]+h)?([0-9]+m)?([0-9]+s)?$`
 	TokenTTL string `json:"tokenTTL,omitempty"`
 
-	// AgentTokenTTL is the lifetime requested for the daemon's own credential,
+	// SelfTokenTTL is the lifetime requested for k2a-token-sync's own credential,
 	// renewed on every successful pass. It is therefore also the downtime
-	// budget: if the daemon does not run for this long, it locks itself out and
+	// budget: if k2a-token-sync does not run for this long, it locks itself out and
 	// the cluster must be bootstrapped again.
 	//
 	// +optional
 	// +kubebuilder:default="2160h"
 	// +kubebuilder:validation:Pattern=`^([0-9]+h)?([0-9]+m)?([0-9]+s)?$`
-	AgentTokenTTL string `json:"agentTokenTTL,omitempty"`
+	SelfTokenTTL string `json:"selfTokenTTL,omitempty"`
 
 	// ExpiryWarnThreshold is the remaining serving-certificate lifetime below
-	// which the daemon starts warning.
+	// which k2a-token-sync starts warning.
 	//
 	// +optional
 	// +kubebuilder:default="2160h"
@@ -169,9 +169,9 @@ type ServiceAccountRef struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// ClusterConnectionStatus is what the daemon observed and published.
+// ClusterConnectionStatus is what k2a-token-sync observed and published.
 //
-// It is also the daemon's memory. Holding no read permission on Secrets in
+// It is also k2a-token-sync's memory. Holding no read permission on Secrets in
 // ArgoCD's namespace, it cannot inspect what it published, so the applied
 // fingerprint below is how drift is detected on the next pass.
 type ClusterConnectionStatus struct {
@@ -196,11 +196,11 @@ type ClusterConnectionStatus struct {
 	// +optional
 	TokenExpiresAt *metav1.Time `json:"tokenExpiresAt,omitempty"`
 
-	// AgentCredentialExpiresAt is when the daemon's own credential expires, and
+	// SelfCredentialExpiresAt is when k2a-token-sync's own credential expires, and
 	// so when it would lock itself out if it stopped running.
 	//
 	// +optional
-	AgentCredentialExpiresAt *metav1.Time `json:"agentCredentialExpiresAt,omitempty"`
+	SelfCredentialExpiresAt *metav1.Time `json:"selfCredentialExpiresAt,omitempty"`
 
 	// +optional
 	ServingCertExpiresAt *metav1.Time `json:"servingCertExpiresAt,omitempty"`

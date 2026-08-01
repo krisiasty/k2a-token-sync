@@ -1,6 +1,6 @@
 # Example ClusterConnection.
 #
-# One object per downstream cluster, in the namespace the daemon runs in. Apply it
+# One object per downstream cluster, in the namespace k2a-token-sync runs in. Apply it
 # with kubectl, commit it to git for ArgoCD to apply, or let
 # 'k2a-token-sync bootstrap' print it for you.
 #
@@ -16,10 +16,10 @@ metadata:
 spec:
   # The address ArgoCD connects to, bypassing any management-plane proxy. Port
   # 6443 is assumed when none is given. This name must appear in the API server's
-  # serving-certificate SANs, or the daemon refuses to publish the registration.
+  # serving-certificate SANs, or k2a-token-sync refuses to publish the registration.
   endpoint: "10.1.0.10"
 
-  # The ArgoCD cluster Secret to maintain, in the namespace the daemon serves.
+  # The ArgoCD cluster Secret to maintain, in the namespace k2a-token-sync serves.
   # Defaults to "cluster-<name>"; the "cluster-" prefix is required.
   secretName: cluster-standalone-1
 
@@ -32,17 +32,17 @@ spec:
     name: argocd-manager
     namespace: kube-system
 
-  # The downstream identity the daemon itself uses. Narrowly scoped: it can mint
+  # The downstream identity k2a-token-sync itself uses. Narrowly scoped: it can mint
   # tokens and read the cluster CA, nothing else.
-  agentServiceAccountName: k2a-token-sync
+  selfServiceAccountName: k2a-token-sync
 
   # ArgoCD's credential, reissued at half life.
   tokenTTL: "720h" # 30d
 
-  # The daemon's own credential, renewed on every pass. Also the downtime budget:
-  # if the daemon does not run for this long, the cluster needs bootstrapping
+  # k2a-token-sync's own credential, renewed on every pass. Also the downtime budget:
+  # if k2a-token-sync does not run for this long, the cluster needs bootstrapping
   # again.
-  agentTokenTTL: "2160h" # 90d
+  selfTokenTTL: "2160h" # 90d
 
-  # How much serving-certificate lifetime remains before the daemon warns.
+  # How much serving-certificate lifetime remains before k2a-token-sync warns.
   expiryWarnThreshold: "2160h" # 90d

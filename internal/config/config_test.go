@@ -22,10 +22,10 @@ func minimalSpec() v1alpha1.ClusterConnectionSpec {
 			Name:      defaultServiceAccountName,
 			Namespace: defaultServiceAccountNS,
 		},
-		AgentServiceAccountName: defaultAgentServiceAccount,
-		TokenTTL:                "720h",
-		AgentTokenTTL:           "2160h",
-		ExpiryWarnThreshold:     "2160h",
+		SelfServiceAccountName: defaultSelfServiceAccount,
+		TokenTTL:               "720h",
+		SelfTokenTTL:           "2160h",
+		ExpiryWarnThreshold:    "2160h",
 	}
 }
 
@@ -58,8 +58,8 @@ func TestFromSpecDerivesNamesAndEndpoint(t *testing.T) {
 	if cluster.TokenTTL != 720*time.Hour {
 		t.Errorf("TokenTTL = %v", cluster.TokenTTL)
 	}
-	if cluster.AgentTokenTTL != 2160*time.Hour {
-		t.Errorf("AgentTokenTTL = %v", cluster.AgentTokenTTL)
+	if cluster.SelfTokenTTL != 2160*time.Hour {
+		t.Errorf("SelfTokenTTL = %v", cluster.SelfTokenTTL)
 	}
 	if cluster.ServiceAccount.Name != defaultServiceAccountName {
 		t.Errorf("ServiceAccount.Name = %q", cluster.ServiceAccount.Name)
@@ -79,15 +79,15 @@ func TestFromSpecToleratesUndefaultedSpec(t *testing.T) {
 	if cluster.TokenTTL != defaultTokenTTL {
 		t.Errorf("TokenTTL = %v, want the package default", cluster.TokenTTL)
 	}
-	if cluster.AgentTokenTTL != defaultAgentTokenTTL {
-		t.Errorf("AgentTokenTTL = %v, want the package default", cluster.AgentTokenTTL)
+	if cluster.SelfTokenTTL != defaultSelfTokenTTL {
+		t.Errorf("SelfTokenTTL = %v, want the package default", cluster.SelfTokenTTL)
 	}
 	if cluster.ServiceAccount.Name != defaultServiceAccountName ||
 		cluster.ServiceAccount.Namespace != defaultServiceAccountNS {
 		t.Errorf("ServiceAccount = %+v, want the argocd-manager default", cluster.ServiceAccount)
 	}
-	if cluster.AgentServiceAccountName != defaultAgentServiceAccount {
-		t.Errorf("AgentServiceAccountName = %q", cluster.AgentServiceAccountName)
+	if cluster.SelfServiceAccountName != defaultSelfServiceAccount {
+		t.Errorf("SelfServiceAccountName = %q", cluster.SelfServiceAccountName)
 	}
 }
 
@@ -175,9 +175,9 @@ func TestFromSpecRejects(t *testing.T) {
 			want:    "must be at least",
 		},
 		{
-			name:    "agent token ttl below the floor",
+			name:    "self token ttl below the floor",
 			objName: "a",
-			mutate:  func(s *v1alpha1.ClusterConnectionSpec) { s.AgentTokenTTL = "1s" },
+			mutate:  func(s *v1alpha1.ClusterConnectionSpec) { s.SelfTokenTTL = "1s" },
 			want:    "must be at least",
 		},
 		{
@@ -271,8 +271,8 @@ func TestBootstrapClusterMatchesFromSpec(t *testing.T) {
 	if fromFlags.ServiceAccount != fromAPI.ServiceAccount {
 		t.Errorf("ServiceAccount: bootstrap %+v, API %+v", fromFlags.ServiceAccount, fromAPI.ServiceAccount)
 	}
-	if fromFlags.AgentServiceAccountName != fromAPI.AgentServiceAccountName {
-		t.Errorf("AgentServiceAccountName: bootstrap %q, API %q",
-			fromFlags.AgentServiceAccountName, fromAPI.AgentServiceAccountName)
+	if fromFlags.SelfServiceAccountName != fromAPI.SelfServiceAccountName {
+		t.Errorf("SelfServiceAccountName: bootstrap %q, API %q",
+			fromFlags.SelfServiceAccountName, fromAPI.SelfServiceAccountName)
 	}
 }

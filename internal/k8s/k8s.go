@@ -1,5 +1,5 @@
-// Package k8s wraps the Kubernetes client construction and the Secret I/O the
-// daemon performs against the cluster it runs in.
+// Package k8s wraps the Kubernetes client construction and the Secret I/O
+// k2a-token-sync performs against the cluster it runs in.
 package k8s
 
 import (
@@ -28,18 +28,18 @@ var ErrNotFound = errors.New("not found")
 // created between our Get and our Create, so the retry loop takes the update path.
 var errConcurrentCreate = errors.New("secret appeared concurrently")
 
-// Credentials is the credential the daemon holds for one downstream cluster,
-// stored as a Secret in the daemon's own namespace.
+// Credentials is the credential k2a-token-sync holds for one downstream cluster,
+// stored as a Secret in k2a-token-sync's own namespace.
 type Credentials struct {
-	// Token authenticates as the daemon's downstream ServiceAccount.
+	// Token authenticates as k2a-token-sync's downstream ServiceAccount.
 	Token string
 
 	// CA is the PEM bundle for the downstream API server.
 	CA []byte
 
 	// ExpiresAt is when Token stops working. It is stored alongside the token so
-	// the daemon knows its own deadline without decoding a JWT, and can report it
-	// on the ClusterConnection: this is the daemon's own lockout clock, not
+	// k2a-token-sync knows its own deadline without decoding a JWT, and can report it
+	// on the ClusterConnection: this is k2a-token-sync's own lockout clock, not
 	// ArgoCD's.
 	//
 	// Zero means unknown, which is what a credential written by an older version
@@ -57,7 +57,7 @@ const (
 // secretsResource names the Secret resource for synthesised conflict errors.
 var secretsResource = schema.GroupResource{Group: "", Resource: "secrets"}
 
-// NewClient builds a client for the cluster the daemon runs in, falling back to
+// NewClient builds a client for the cluster k2a-token-sync runs in, falling back to
 // the ambient kubeconfig so the bootstrap subcommand works off-cluster.
 func NewClient() (kubernetes.Interface, error) {
 	cfg, err := LocalRESTConfig()
@@ -71,9 +71,9 @@ func NewClient() (kubernetes.Interface, error) {
 	return client, nil
 }
 
-// NewDynamicClient builds a dynamic client for the cluster the daemon runs in.
-// It is used for ClusterConnection objects, which need no typed client: the
-// daemon converts them with runtime.DefaultUnstructuredConverter.
+// NewDynamicClient builds a dynamic client for the cluster k2a-token-sync runs in.
+// It is used for ClusterConnection objects, which need no typed client: they are
+// converted with runtime.DefaultUnstructuredConverter.
 func NewDynamicClient() (dynamic.Interface, error) {
 	cfg, err := LocalRESTConfig()
 	if err != nil {
@@ -130,7 +130,7 @@ func LocalRESTConfig() (*rest.Config, error) {
 }
 
 // ClientForContext builds a client from a named kubeconfig context. Used by the
-// bootstrap subcommand, which runs against a cluster the daemon cannot yet reach.
+// bootstrap subcommand, which runs against a cluster k2a-token-sync cannot yet reach.
 func ClientForContext(kubeconfigPath, contextName string) (kubernetes.Interface, *rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfigPath != "" {
@@ -182,8 +182,8 @@ func GetSecret(ctx context.Context, client kubernetes.Interface, namespace, name
 	return secret, nil
 }
 
-// ReadCredentials loads the downstream credential previously stored by the
-// daemon, by the bootstrap subcommand, or by external automation.
+// ReadCredentials loads the downstream credential previously stored by
+// k2a-token-sync, by the bootstrap subcommand, or by external automation.
 func ReadCredentials(ctx context.Context, client kubernetes.Interface, namespace, name string) (*Credentials, error) {
 	secret, err := GetSecret(ctx, client, namespace, name)
 	if err != nil {
@@ -211,7 +211,7 @@ func ReadCredentials(ctx context.Context, client kubernetes.Interface, namespace
 	return creds, nil
 }
 
-// WriteCredentials stores the daemon's downstream credential, creating the Secret
+// WriteCredentials stores k2a-token-sync's downstream credential, creating the Secret
 // if it does not exist.
 func WriteCredentials(ctx context.Context, client kubernetes.Interface, namespace, name string, creds *Credentials, labels map[string]string) error {
 	data := map[string][]byte{
@@ -229,7 +229,7 @@ func WriteCredentials(ctx context.Context, client kubernetes.Interface, namespac
 }
 
 // UpsertSecret creates the Secret, or updates the labels, annotations and data
-// of an existing one. Fields the daemon does not manage are left untouched so
+// of an existing one. Fields k2a-token-sync does not manage are left untouched so
 // that other controllers can annotate the object freely.
 func UpsertSecret(ctx context.Context, client kubernetes.Interface, desired *corev1.Secret) error {
 	secrets := client.CoreV1().Secrets(desired.Namespace)

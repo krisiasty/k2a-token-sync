@@ -143,7 +143,7 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	}
 }
 
-// The apply response is the daemon's only view of what it published, since it
+// The apply response is k2a-token-sync's only view of what it published, since it
 // holds no read permission in ArgoCD's namespace. A Secret that lost its
 // credential must therefore be reported as such.
 func TestApplyRegistrationReportsAMissingCredential(t *testing.T) {
