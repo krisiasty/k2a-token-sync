@@ -32,32 +32,24 @@ Two paths, and keeping them apart is the whole design:
 If k2a-token-sync is down, reconciliation pauses; ArgoCD keeps working. With the default 30-day token lifetime
 reissued at half life, k2a-token-sync can be down for a fortnight before anything degrades.
 
-```mermaid
-graph TD
-    A[k2a-token-sync] -->|control path, every 5m| D[stored credential per cluster]
-    D --> E[downstream API server]
-    E --> F[ensure argocd-manager ServiceAccount]
-    F --> G[TokenRequest: 30-day token]
-    G --> H[read cluster CA]
-    H --> I[probe direct endpoint serving cert]
-    I --> J[write ArgoCD cluster Secret]
-    J -.->|request path, continuous| K[ArgoCD → downstream API directly]
-```
+Per cluster, every pass:
 
-Per cluster, each pass:
-
-1. Connects with the credential provisioned for that cluster at bootstrap.
-2. Ensures the `argocd-manager` ServiceAccount and its `cluster-admin` binding exist, creating them if absent. This is
-   the same identity `argocd cluster add` installs.
-3. Mints a bound token via the TokenRequest API, honouring whatever lifetime the API server grants.
-4. Reads the cluster CA from the `kube-root-ca.crt` ConfigMap.
-5. Probes the direct endpoint's TLS certificate, verifying it against that CA and checking the SANs cover the
+1. Connects with the credential provisioned for that cluster at bootstrap, replacing that credential if it is a day old.
+2. Reads the cluster CA from the `kube-root-ca.crt` ConfigMap.
+3. Probes the direct endpoint's TLS certificate, verifying it against that CA and checking the SANs cover the
    configured address.
-6. Writes the ArgoCD cluster Secret. ArgoCD re-reads cluster Secrets on every reconcile, so credentials swap with no
-   restart of any ArgoCD component.
+4. Applies everything in the ArgoCD cluster Secret except the credential. The apply's response is also how it learns
+   whether ArgoCD still holds one, since it cannot read that Secret. Nothing changed means nothing written.
 
-A credential is only reissued once it is past half its lifetime, or when something has drifted — so routine passes
-write nothing and do not churn ArgoCD's cluster cache.
+ArgoCD's credential is reissued only once it is past half its lifetime, or when something it depends on has drifted —
+so the great majority of passes stop there, having written nothing at all. When one is due, the pass continues:
+
+1. Ensures the `argocd-manager` ServiceAccount and its `cluster-admin` binding exist, creating them if absent. This is
+   the same identity `argocd cluster add` installs.
+2. Mints a bound token via the TokenRequest API, honouring whatever lifetime the API server grants.
+3. Writes the credential, then re-applies the registration. That order means ArgoCD never sees a cluster it cannot
+   authenticate to, not even briefly between two applies. It re-reads cluster Secrets on every reconcile, so credentials
+   swap with no restart of any ArgoCD component.
 
 ### How drift is noticed
 
@@ -436,15 +428,20 @@ Per-cluster state is on the objects themselves, which is the readable view:
 
 ```console
 $ kubectl -n k2a-token-sync get ccon
-NAME           ENDPOINT                       READY   TOKEN EXPIRES   SELF EXPIRES   CERT DAYS   AGE
-downstream-1   10.0.0.10:6443                 True    29d             89d             364         12d
-standalone-1   cluster2.example.com:6443      True    22d             89d             211         12d
-standalone-2   10.2.0.10:6443                 False   <none>          <none>          <none>      2m
+NAME           ENDPOINT                    READY   TOKEN EXPIRES          SELF EXPIRES           CERT DAYS   AGE
+downstream-1   10.0.0.10:6443              True    2026-08-31T16:25:26Z   2026-10-30T16:25:26Z   364         12d
+standalone-1   cluster2.example.com:6443   True    2026-08-24T09:12:44Z   2026-10-30T17:01:09Z   211         12d
+standalone-2   10.2.0.10:6443              False   <none>                 <none>                 <none>      2m
 ```
 
-`kubectl describe ccon standalone-2` then gives the reason — `AwaitingCredential` for one that has not been bootstrapped,
+Both expiries are timestamps rather than "in 29 days" for a dull reason worth knowing if you ever add a column: kubectl
+renders a date column as time *elapsed*, which for anything in the future is negative and prints as `<invalid>`.
+
+When a cluster is not `Ready`, three things answer it, in this order. The listing above says which cluster and for how
+long. `kubectl describe ccon <name>` gives the reason — `AwaitingCredential` for one that has not been bootstrapped,
 `CredentialExpired` for one whose own credential lapsed, `CertificateInvalid` for an endpoint whose certificate cannot
-work.
+work — alongside `lastAction`, which says what the most recent pass actually did. The logs then carry the underlying
+error, usually the downstream API server's own words.
 
 Generated cluster Secrets also carry annotations you can read with `kubectl`:
 
