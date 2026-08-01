@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -244,8 +245,14 @@ func TestBootstrapClusterMatchesFromSpec(t *testing.T) {
 	t.Parallel()
 
 	// The bootstrap subcommand and an object resolved from the API must agree on
-	// names, endpoints and Secret locations, or a bootstrapped cluster will not
-	// match the ClusterConnection that describes it.
+	// every field, or a bootstrapped cluster will not match the ClusterConnection
+	// that describes it.
+	//
+	// Compared whole, deliberately. An earlier version listed the fields it cared
+	// about, so when SelfTokenTTL was added to Cluster and left unset on the
+	// bootstrap path this test stayed green and bootstrap asked the API server for
+	// a token with expirationSeconds: 0. Comparing the struct means the next field
+	// cannot be forgotten the same way.
 	fromFlags, err := BootstrapCluster(BootstrapClusterInput{Name: "standalone-1", Endpoint: "10.1.0.10"})
 	if err != nil {
 		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
@@ -258,21 +265,51 @@ func TestBootstrapClusterMatchesFromSpec(t *testing.T) {
 		t.Fatalf("FromSpec returned unexpected error: %v", err)
 	}
 
-	if fromFlags.Endpoint != fromAPI.Endpoint {
-		t.Errorf("Endpoint: bootstrap %q, API %q", fromFlags.Endpoint, fromAPI.Endpoint)
+	if !reflect.DeepEqual(fromFlags, fromAPI) {
+		t.Errorf("the two paths disagree:\nbootstrap %+v\nAPI       %+v", fromFlags, fromAPI)
 	}
-	if fromFlags.SecretName != fromAPI.SecretName {
-		t.Errorf("SecretName: bootstrap %q, API %q", fromFlags.SecretName, fromAPI.SecretName)
+
+	// Nothing may be left at its zero value: every duration reaches an API server,
+	// where zero is not "unset" but a rejected request.
+	if fromFlags.TokenTTL <= 0 || fromFlags.SelfTokenTTL <= 0 || fromFlags.ExpiryWarnThreshold <= 0 {
+		t.Errorf("a duration was left unset: tokenTTL=%s selfTokenTTL=%s expiryWarnThreshold=%s",
+			fromFlags.TokenTTL, fromFlags.SelfTokenTTL, fromFlags.ExpiryWarnThreshold)
 	}
-	if fromFlags.CredentialsSecretName() != fromAPI.CredentialsSecretName() {
-		t.Errorf("CredentialsSecretName: bootstrap %q, API %q",
-			fromFlags.CredentialsSecretName(), fromAPI.CredentialsSecretName())
+}
+
+// The flags exist to override the defaults, so check they still arrive.
+func TestBootstrapClusterHonoursItsFlags(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := BootstrapCluster(BootstrapClusterInput{
+		Name:                    "standalone-1",
+		Endpoint:                "10.1.0.10",
+		ServiceAccountName:      "argo",
+		ServiceAccountNamespace: "platform",
+		SelfServiceAccountName:  "sync",
+	})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
 	}
-	if fromFlags.ServiceAccount != fromAPI.ServiceAccount {
-		t.Errorf("ServiceAccount: bootstrap %+v, API %+v", fromFlags.ServiceAccount, fromAPI.ServiceAccount)
+
+	if cluster.ServiceAccount.Name != "argo" || cluster.ServiceAccount.Namespace != "platform" {
+		t.Errorf("ServiceAccount is %+v, want argo/platform", cluster.ServiceAccount)
 	}
-	if fromFlags.SelfServiceAccountName != fromAPI.SelfServiceAccountName {
-		t.Errorf("SelfServiceAccountName: bootstrap %q, API %q",
-			fromFlags.SelfServiceAccountName, fromAPI.SelfServiceAccountName)
+	if cluster.SelfServiceAccountName != "sync" {
+		t.Errorf("SelfServiceAccountName is %q, want %q", cluster.SelfServiceAccountName, "sync")
+	}
+
+	// A partially-specified reference must still default the other half, exactly as
+	// the schema's per-field defaults do.
+	cluster, err = BootstrapCluster(BootstrapClusterInput{
+		Name:               "standalone-1",
+		Endpoint:           "10.1.0.10",
+		ServiceAccountName: "argo",
+	})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
+	}
+	if cluster.ServiceAccount.Namespace != defaultServiceAccountNS {
+		t.Errorf("Namespace is %q, want the default %q", cluster.ServiceAccount.Namespace, defaultServiceAccountNS)
 	}
 }
