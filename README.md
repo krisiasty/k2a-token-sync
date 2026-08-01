@@ -298,18 +298,25 @@ k2a-token-sync bootstrap --cluster standalone-1 \
 
 ```text
 Bootstrapping standalone-1
-  downstream cluster    https://standalone-1.example.com:6443
-  ArgoCD endpoint       https://standalone-1.example.com:6443
 
+Downstream cluster — standalone-1
+  reached via           https://standalone-1.example.com:6443
+  ArgoCD endpoint       https://standalone-1.example.com:6443
   endpoint certificate  valid until 2027-07-31 (364 days left)
   identities            kube-system/argocd-manager, kube-system/k2a-token-sync
+  verified              the new credential works against the endpoint
+
+Cluster running ArgoCD — context gitops (https://gitops.example.com:6443)
   credential            k2a-token-sync/standalone-1-credentials, expires 2026-10-30
-  verified              the credential works against the ArgoCD endpoint
   registration          k2a-token-sync/standalone-1
 
 Done. k2a-token-sync publishes ArgoCD's credential within 30 seconds:
   kubectl -n k2a-token-sync get ccon standalone-1
 ```
+
+Output is grouped by cluster, because "where did that happen" is the first question when one command writes to two of
+them. Registering the cluster ArgoCD itself runs on is a normal case, and the second heading then says "the same cluster
+as above" rather than leaving you to compare two addresses.
 
 In order: resolve both clusters before changing anything; read the cluster CA; **probe the endpoint** and refuse if its
 certificate does not cover it; install the two identities; store the credential; use that credential once against the
