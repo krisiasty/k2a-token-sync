@@ -54,6 +54,21 @@ const (
 
 	// clusterTimeout bounds one cluster's reconciliation.
 	clusterTimeout = 5 * time.Minute
+
+	// dueSlack lets a cluster due within half a tick count as due now.
+	//
+	// Scheduling is quantised to the poll, so an interval can only ever land on a
+	// tick. The question is which one, and without slack the answer was always the
+	// tick *after* the interval elapsed: dueAt is computed from a clock read that
+	// happens a little after a tick — the inventory list comes first — so it sits a
+	// few milliseconds beyond the tick that should have caught it, and every
+	// interval silently became one tick longer than the one configured. Five and a
+	// half minutes for a configured five, measured live.
+	//
+	// Reading the clock earlier only moves that hazard around; anything between the
+	// tick and the comparison reintroduces it. Rounding to the nearest tick instead
+	// of the next one is insensitive to all of it.
+	dueSlack = pollInterval / 2
 )
 
 // clusterState is what the scheduler remembers between passes. The durable half
@@ -189,10 +204,10 @@ func (s *scheduler) refresh(ctx context.Context) error {
 // dueClusters lists the clusters whose time has come, in a stable order so logs
 // read consistently.
 func (s *scheduler) dueClusters() []string {
-	now := s.now()
+	cutoff := s.now().Add(dueSlack)
 	var due []string
 	for name, state := range s.state {
-		if state.invalidReason == "" && !state.dueAt.After(now) {
+		if state.invalidReason == "" && !state.dueAt.After(cutoff) {
 			due = append(due, name)
 		}
 	}
