@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,18 +28,30 @@ var ErrNotFound = errors.New("not found")
 // created between our Get and our Create, so the retry loop takes the update path.
 var errConcurrentCreate = errors.New("secret appeared concurrently")
 
-// Credentials is the durable credential the daemon provisions for itself in a
-// standalone downstream cluster, stored as a Secret in the daemon's namespace.
+// Credentials is the credential the daemon holds for one downstream cluster,
+// stored as a Secret in the daemon's own namespace.
 type Credentials struct {
 	// Token authenticates as the daemon's downstream ServiceAccount.
 	Token string
+
 	// CA is the PEM bundle for the downstream API server.
 	CA []byte
+
+	// ExpiresAt is when Token stops working. It is stored alongside the token so
+	// the daemon knows its own deadline without decoding a JWT, and can report it
+	// on the ClusterConnection: this is the daemon's own lockout clock, not
+	// ArgoCD's.
+	//
+	// Zero means unknown, which is what a credential written by an older version
+	// or by external automation looks like. That is treated as "renew now" rather
+	// than "never expires".
+	ExpiresAt time.Time
 }
 
 const (
-	credentialsTokenKey = "token"
-	credentialsCAKey    = "ca.crt"
+	credentialsTokenKey     = "token"
+	credentialsCAKey        = "ca.crt"
+	credentialsExpiresAtKey = "expires-at"
 )
 
 // secretsResource names the Secret resource for synthesised conflict errors.
@@ -145,8 +158,8 @@ func GetSecret(ctx context.Context, client kubernetes.Interface, namespace, name
 	return secret, nil
 }
 
-// ReadCredentials loads a durable downstream credential previously stored by
-// the daemon or by the bootstrap subcommand.
+// ReadCredentials loads the downstream credential previously stored by the
+// daemon, by the bootstrap subcommand, or by external automation.
 func ReadCredentials(ctx context.Context, client kubernetes.Interface, namespace, name string) (*Credentials, error) {
 	secret, err := GetSecret(ctx, client, namespace, name)
 	if err != nil {
@@ -160,15 +173,29 @@ func ReadCredentials(ctx context.Context, client kubernetes.Interface, namespace
 	if len(ca) == 0 {
 		return nil, fmt.Errorf("credentials secret %s/%s key %q is blank: %w", namespace, name, credentialsCAKey, ErrNotFound)
 	}
-	return &Credentials{Token: string(token), CA: ca}, nil
+
+	creds := &Credentials{Token: string(token), CA: ca}
+
+	// An unparseable or absent expiry is left zero rather than rejected: the
+	// token may well still work, and a caller that renews on every pass will
+	// replace it with one whose deadline is known.
+	if raw := bytes.TrimSpace(secret.Data[credentialsExpiresAtKey]); len(raw) > 0 {
+		if parsed, err := time.Parse(time.RFC3339, string(raw)); err == nil {
+			creds.ExpiresAt = parsed
+		}
+	}
+	return creds, nil
 }
 
-// WriteCredentials stores a durable downstream credential, creating the Secret
+// WriteCredentials stores the daemon's downstream credential, creating the Secret
 // if it does not exist.
 func WriteCredentials(ctx context.Context, client kubernetes.Interface, namespace, name string, creds *Credentials, labels map[string]string) error {
 	data := map[string][]byte{
 		credentialsTokenKey: []byte(creds.Token),
 		credentialsCAKey:    creds.CA,
+	}
+	if !creds.ExpiresAt.IsZero() {
+		data[credentialsExpiresAtKey] = []byte(creds.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	return UpsertSecret(ctx, client, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels},

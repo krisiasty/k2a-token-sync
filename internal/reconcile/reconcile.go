@@ -39,13 +39,23 @@ type Reconciler struct {
 	local  kubernetes.Interface
 	logger *slog.Logger
 
-	// now is injectable for tests.
-	now func() time.Time
+	// now and clientForToken are injectable for tests. clientForToken exists so
+	// credential renewal can be exercised without a live API server, which is
+	// worth a seam: the property it guards is that a credential which fails
+	// verification never replaces one that works.
+	now            func() time.Time
+	clientForToken func(server, token string, ca []byte) (kubernetes.Interface, error)
 }
 
 // New builds a Reconciler.
 func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *Reconciler {
-	return &Reconciler{cfg: cfg, local: local, logger: logger, now: time.Now}
+	return &Reconciler{
+		cfg:            cfg,
+		local:          local,
+		logger:         logger,
+		now:            time.Now,
+		clientForToken: clientFromToken,
+	}
 }
 
 // Cluster reconciles one cluster and returns the status to record on its
@@ -94,11 +104,20 @@ func (r *Reconciler) reconcile(
 	if err != nil {
 		return err
 	}
+	if !access.expiresAt.IsZero() {
+		status.AgentCredentialExpiresAt = &metav1.Time{Time: access.expiresAt}
+	}
 
 	ca, err := downstream.ClusterCA(ctx, access.client, cluster.ServiceAccount.Namespace)
 	if err != nil {
 		return err
 	}
+
+	// Renewing here rather than at the end means a failure further down does not
+	// cost the daemon its own credential's headroom: reaching this point proves
+	// the current credential works, which is the only precondition for replacing
+	// it.
+	r.renewAgentCredential(ctx, cluster, access, status, logger)
 
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
 		return err
@@ -237,6 +256,8 @@ func reasonFor(err error) string {
 	switch {
 	case errors.Is(err, errNoCredential):
 		return v1alpha1.ReasonAwaitingCredential
+	case errors.Is(err, errCredentialExpired):
+		return v1alpha1.ReasonCredentialExpired
 	case errors.Is(err, errCertificateInvalid):
 		return v1alpha1.ReasonCertificateInvalid
 	default:
@@ -247,6 +268,11 @@ func reasonFor(err error) string {
 var (
 	// errNoCredential means the cluster has never been bootstrapped.
 	errNoCredential = errors.New("no stored credential")
+
+	// errCredentialExpired means the daemon was down for longer than its own
+	// token's lifetime and has locked itself out. Only a bootstrap recovers it,
+	// which is why the condition reason says so rather than reporting a 401.
+	errCredentialExpired = errors.New("stored credential expired")
 
 	// errCertificateInvalid means the endpoint's certificate cannot work for
 	// ArgoCD, whatever the credential.
@@ -326,6 +352,14 @@ func (r *Reconciler) probe(
 // clusterAccess is a connection to a downstream cluster.
 type clusterAccess struct {
 	client kubernetes.Interface
+
+	// ca is the bundle the stored credential was verified against, kept so a
+	// renewed credential can be stored with the same one.
+	ca []byte
+
+	// expiresAt is when the credential in use stops working, or zero if the
+	// stored credential does not record it.
+	expiresAt time.Time
 }
 
 // access reaches a cluster at its own endpoint with the credential provisioned
@@ -346,19 +380,27 @@ func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clust
 		return nil, err
 	}
 
-	client, err := clientFromToken(cluster.ServerURL(), creds.Token, creds.CA)
+	if !creds.ExpiresAt.IsZero() && !creds.ExpiresAt.After(r.now()) {
+		return nil, fmt.Errorf("%w: the daemon's credential for this cluster expired at %s; "+
+			"bootstrap it again to issue a new one",
+			errCredentialExpired, creds.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+
+	client, err := r.clientForToken(cluster.ServerURL(), creds.Token, creds.CA)
 	if err != nil {
 		return nil, err
 	}
-	return &clusterAccess{client: client}, nil
+	return &clusterAccess{client: client, ca: creds.CA, expiresAt: creds.ExpiresAt}, nil
 }
 
 // Provision installs the daemon's own identity in a downstream cluster and
-// returns a durable credential for it.
+// returns a credential for it.
 //
 // The identity is narrowly scoped — see downstream.EnsureAgentIdentity — so the
 // credential this returns can do little beyond minting tokens and reading the
-// cluster CA.
+// cluster CA. The token is bound and therefore expires: the daemon renews it on
+// every successful pass, and its lifetime is the length of an outage it can
+// recover from unaided.
 func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
 	namespace := cluster.ServiceAccount.Namespace
 
@@ -369,8 +411,7 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 		return nil, err
 	}
 
-	token, err := downstream.CreateLegacyToken(ctx, admin, namespace,
-		cluster.AgentServiceAccountName, cluster.AgentServiceAccountName+"-token")
+	token, err := downstream.MintToken(ctx, admin, namespace, cluster.AgentServiceAccountName, cluster.AgentTokenTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -380,7 +421,74 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 		return nil, err
 	}
 
-	return &k8s.Credentials{Token: token, CA: ca}, nil
+	return &k8s.Credentials{Token: token.Value, CA: ca, ExpiresAt: token.ExpiresAt}, nil
+}
+
+// renewAgentCredential mints a replacement for the daemon's own credential using
+// the credential it currently holds, and stores it once it is proven to work.
+//
+// Renewing on every successful pass rather than at half life is deliberate: the
+// write is one API call against a Secret nothing watches, and it keeps the
+// remaining lifetime near the full TTL at all times. Renewing at half life would
+// halve the outage the daemon can survive, for no saving worth having.
+//
+// The verification is what makes self-renewal safe. Overwriting a working
+// credential with a broken one would lock the daemon out of the cluster with no
+// way back except a human re-running bootstrap, so the new token is used for one
+// call before it replaces the old one.
+func (r *Reconciler) renewAgentCredential(
+	ctx context.Context,
+	cluster config.Cluster,
+	access *clusterAccess,
+	status *v1alpha1.ClusterConnectionStatus,
+	logger *slog.Logger,
+) {
+	namespace := cluster.ServiceAccount.Namespace
+
+	token, err := downstream.MintToken(ctx, access.client, namespace, cluster.AgentServiceAccountName, cluster.AgentTokenTTL)
+	if err != nil {
+		logger.Warn("could not renew the daemon's own credential; the current one still works",
+			"expires_at", formatTime(status.AgentCredentialExpiresAt), "error", err)
+		return
+	}
+
+	granted := token.ExpiresAt.Sub(r.now())
+	if granted < cluster.AgentTokenTTL*9/10 {
+		logger.Warn("API server shortened the daemon's own token lifetime, which shortens the outage it can survive",
+			"requested", cluster.AgentTokenTTL.String(),
+			"granted", granted.Round(time.Minute).String(),
+			"hint", "raise --service-account-max-token-expiration on the downstream API server, or lower agentTokenTTL")
+	}
+
+	probe, err := r.clientForToken(cluster.ServerURL(), token.Value, access.ca)
+	if err != nil {
+		logger.Warn("could not build a client for the renewed credential; keeping the current one", "error", err)
+		return
+	}
+	if _, err := downstream.ClusterCA(ctx, probe, namespace); err != nil {
+		logger.Warn("the renewed credential does not work; keeping the current one", "error", err)
+		return
+	}
+
+	if err := k8s.WriteCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName(),
+		&k8s.Credentials{Token: token.Value, CA: access.ca, ExpiresAt: token.ExpiresAt},
+		map[string]string{
+			"app.kubernetes.io/managed-by": "k2a-token-sync",
+			"k2a-token-sync.io/cluster":    cluster.Name,
+		}); err != nil {
+		logger.Warn("could not store the renewed credential; keeping the current one", "error", err)
+		return
+	}
+
+	status.AgentCredentialExpiresAt = &metav1.Time{Time: token.ExpiresAt}
+	logger.Debug("renewed the daemon's own credential", "expires_at", token.ExpiresAt.UTC().Format(time.RFC3339))
+}
+
+func formatTime(t *metav1.Time) string {
+	if t == nil {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 func clientFromToken(server, token string, ca []byte) (kubernetes.Interface, error) {
