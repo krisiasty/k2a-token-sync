@@ -1,6 +1,6 @@
 // Package reconcile brings one cluster's ArgoCD registration up to date.
 //
-// The reconciler is the whole daemon in outline. For a cluster it connects with
+// The reconciler is the whole of k2a-token-sync in outline. For a cluster it connects with
 // the credential provisioned for it, ensures ArgoCD's downstream identity exists,
 // mints a short-lived credential, and publishes it in an ArgoCD cluster Secret
 // pointing at the cluster's own endpoint. It also probes that endpoint's serving
@@ -61,7 +61,7 @@ func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *R
 // Cluster reconciles one cluster and returns the status to record on its
 // ClusterConnection.
 //
-// prior is the status from the previous pass, and is the daemon's only memory:
+// prior is the status from the previous pass, and is k2a-token-sync's only memory:
 // holding no read permission on the generated Secret, it cannot inspect what it
 // published, so the applied fingerprint in prior is how drift is detected.
 //
@@ -105,7 +105,7 @@ func (r *Reconciler) reconcile(
 		return err
 	}
 	if !access.expiresAt.IsZero() {
-		status.AgentCredentialExpiresAt = &metav1.Time{Time: access.expiresAt}
+		status.SelfCredentialExpiresAt = &metav1.Time{Time: access.expiresAt}
 	}
 
 	ca, err := downstream.ClusterCA(ctx, access.client, cluster.ServiceAccount.Namespace)
@@ -114,10 +114,10 @@ func (r *Reconciler) reconcile(
 	}
 
 	// Renewing here rather than at the end means a failure further down does not
-	// cost the daemon its own credential's headroom: reaching this point proves
+	// cost k2a-token-sync its own credential's headroom: reaching this point proves
 	// the current credential works, which is the only precondition for replacing
 	// it.
-	r.renewAgentCredential(ctx, cluster, access, status, logger)
+	r.renewSelfCredential(ctx, cluster, access, status, logger)
 
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
 		return err
@@ -142,7 +142,7 @@ func (r *Reconciler) reconcile(
 	desired.TokenExpiresAt = applied.TokenExpiresAt
 	first := applied == (argocd.Fingerprint{})
 
-	// Applying the registration is how the daemon observes what it published: an
+	// Applying the registration is how k2a-token-sync observes what it published: an
 	// apply returns the object and needs only the patch verb. Skipped on a
 	// cluster's first pass, where a credential has to be minted anyway and
 	// applying the label first would briefly show ArgoCD a cluster it cannot
@@ -269,7 +269,7 @@ var (
 	// errNoCredential means the cluster has never been bootstrapped.
 	errNoCredential = errors.New("no stored credential")
 
-	// errCredentialExpired means the daemon was down for longer than its own
+	// errCredentialExpired means k2a-token-sync was down for longer than its own
 	// token's lifetime and has locked itself out. Only a bootstrap recovers it,
 	// which is why the condition reason says so rather than reporting a 401.
 	errCredentialExpired = errors.New("stored credential expired")
@@ -281,16 +281,16 @@ var (
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.
 //
-// The daemon needs create and patch on Secrets in ArgoCD's namespace and holds
+// k2a-token-sync needs create and patch on Secrets in ArgoCD's namespace and holds
 // nothing else there. The raw API error names neither the Role nor the remedy, so
-// a missing or narrowed Role otherwise looks like a bug in the daemon.
+// a missing or narrowed Role otherwise looks like a bug in k2a-token-sync.
 //
 // Passing a nil error through keeps the call sites free of extra branching.
 func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error {
 	if err == nil || !apierrors.IsForbidden(err) {
 		return err
 	}
-	return fmt.Errorf("%w; the daemon's Role in namespace %s must allow create and patch on secrets "+
+	return fmt.Errorf("%w; k2a-token-sync's Role in namespace %s must allow create and patch on secrets "+
 		"so it can maintain %q", err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 
@@ -365,7 +365,7 @@ type clusterAccess struct {
 // access reaches a cluster at its own endpoint with the credential provisioned
 // for it at bootstrap.
 //
-// There is deliberately no fallback: the daemon never holds administrative
+// There is deliberately no fallback: k2a-token-sync never holds administrative
 // material for a downstream cluster, so a cluster with no credential is reported
 // as awaiting bootstrap rather than bootstrapped from something lying around.
 func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clusterAccess, error) {
@@ -381,7 +381,7 @@ func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clust
 	}
 
 	if !creds.ExpiresAt.IsZero() && !creds.ExpiresAt.After(r.now()) {
-		return nil, fmt.Errorf("%w: the daemon's credential for this cluster expired at %s; "+
+		return nil, fmt.Errorf("%w: k2a-token-sync's credential for this cluster expired at %s; "+
 			"bootstrap it again to issue a new one",
 			errCredentialExpired, creds.ExpiresAt.UTC().Format(time.RFC3339))
 	}
@@ -393,25 +393,25 @@ func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clust
 	return &clusterAccess{client: client, ca: creds.CA, expiresAt: creds.ExpiresAt}, nil
 }
 
-// Provision installs the daemon's own identity in a downstream cluster and
+// Provision installs k2a-token-sync's own identity in a downstream cluster and
 // returns a credential for it.
 //
-// The identity is narrowly scoped — see downstream.EnsureAgentIdentity — so the
+// The identity is narrowly scoped — see downstream.EnsureSelfIdentity — so the
 // credential this returns can do little beyond minting tokens and reading the
-// cluster CA. The token is bound and therefore expires: the daemon renews it on
+// cluster CA. The token is bound and therefore expires: k2a-token-sync renews it on
 // every successful pass, and its lifetime is the length of an outage it can
 // recover from unaided.
 func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
 	namespace := cluster.ServiceAccount.Namespace
 
-	if err := downstream.EnsureAgentIdentity(ctx, admin, namespace, cluster.AgentServiceAccountName); err != nil {
+	if err := downstream.EnsureSelfIdentity(ctx, admin, namespace, cluster.SelfServiceAccountName); err != nil {
 		return nil, err
 	}
 	if _, err := downstream.EnsureArgoCDIdentity(ctx, admin, namespace, cluster.ServiceAccount.Name); err != nil {
 		return nil, err
 	}
 
-	token, err := downstream.MintToken(ctx, admin, namespace, cluster.AgentServiceAccountName, cluster.AgentTokenTTL)
+	token, err := downstream.MintToken(ctx, admin, namespace, cluster.SelfServiceAccountName, cluster.SelfTokenTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -424,19 +424,19 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 	return &k8s.Credentials{Token: token.Value, CA: ca, ExpiresAt: token.ExpiresAt}, nil
 }
 
-// renewAgentCredential mints a replacement for the daemon's own credential using
+// renewSelfCredential mints a replacement for k2a-token-sync's own credential using
 // the credential it currently holds, and stores it once it is proven to work.
 //
 // Renewing on every successful pass rather than at half life is deliberate: the
 // write is one API call against a Secret nothing watches, and it keeps the
 // remaining lifetime near the full TTL at all times. Renewing at half life would
-// halve the outage the daemon can survive, for no saving worth having.
+// halve the outage k2a-token-sync can survive, for no saving worth having.
 //
 // The verification is what makes self-renewal safe. Overwriting a working
-// credential with a broken one would lock the daemon out of the cluster with no
+// credential with a broken one would lock k2a-token-sync out of the cluster with no
 // way back except a human re-running bootstrap, so the new token is used for one
 // call before it replaces the old one.
-func (r *Reconciler) renewAgentCredential(
+func (r *Reconciler) renewSelfCredential(
 	ctx context.Context,
 	cluster config.Cluster,
 	access *clusterAccess,
@@ -445,19 +445,19 @@ func (r *Reconciler) renewAgentCredential(
 ) {
 	namespace := cluster.ServiceAccount.Namespace
 
-	token, err := downstream.MintToken(ctx, access.client, namespace, cluster.AgentServiceAccountName, cluster.AgentTokenTTL)
+	token, err := downstream.MintToken(ctx, access.client, namespace, cluster.SelfServiceAccountName, cluster.SelfTokenTTL)
 	if err != nil {
-		logger.Warn("could not renew the daemon's own credential; the current one still works",
-			"expires_at", formatTime(status.AgentCredentialExpiresAt), "error", err)
+		logger.Warn("could not renew k2a-token-sync's own credential; the current one still works",
+			"expires_at", formatTime(status.SelfCredentialExpiresAt), "error", err)
 		return
 	}
 
 	granted := token.ExpiresAt.Sub(r.now())
-	if granted < cluster.AgentTokenTTL*9/10 {
-		logger.Warn("API server shortened the daemon's own token lifetime, which shortens the outage it can survive",
-			"requested", cluster.AgentTokenTTL.String(),
+	if granted < cluster.SelfTokenTTL*9/10 {
+		logger.Warn("API server shortened k2a-token-sync's own token lifetime, which shortens the outage it can survive",
+			"requested", cluster.SelfTokenTTL.String(),
 			"granted", granted.Round(time.Minute).String(),
-			"hint", "raise --service-account-max-token-expiration on the downstream API server, or lower agentTokenTTL")
+			"hint", "raise --service-account-max-token-expiration on the downstream API server, or lower selfTokenTTL")
 	}
 
 	probe, err := r.clientForToken(cluster.ServerURL(), token.Value, access.ca)
@@ -480,8 +480,8 @@ func (r *Reconciler) renewAgentCredential(
 		return
 	}
 
-	status.AgentCredentialExpiresAt = &metav1.Time{Time: token.ExpiresAt}
-	logger.Debug("renewed the daemon's own credential", "expires_at", token.ExpiresAt.UTC().Format(time.RFC3339))
+	status.SelfCredentialExpiresAt = &metav1.Time{Time: token.ExpiresAt}
+	logger.Debug("renewed k2a-token-sync's own credential", "expires_at", token.ExpiresAt.UTC().Format(time.RFC3339))
 }
 
 func formatTime(t *metav1.Time) string {
@@ -492,7 +492,7 @@ func formatTime(t *metav1.Time) string {
 }
 
 // ClientFromCredentials builds a client for a downstream cluster from a stored
-// credential, so the bootstrap subcommand can verify one exactly as the daemon
+// credential, so the bootstrap subcommand can verify one exactly as k2a-token-sync
 // will use it.
 func ClientFromCredentials(server string, creds *k8s.Credentials) (kubernetes.Interface, error) {
 	return clientFromToken(server, creds.Token, creds.CA)

@@ -43,7 +43,7 @@ const (
 	managedByValue = "k2a-token-sync"
 
 	// TokenExpiryAnnotation records when the credential we wrote expires. It is
-	// what lets the daemon decide whether a refresh is due without having to
+	// what lets k2a-token-sync decide whether a refresh is due without having to
 	// decode the token itself.
 	TokenExpiryAnnotation = "k2a-token-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
 
@@ -176,7 +176,7 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 // the credential is present on the server afterwards.
 //
 // An apply returns the object it produced, and needs only the patch verb, so
-// this doubles as the daemon's only view of what it has published: no get, list
+// this doubles as k2a-token-sync's only view of what it has published: no get, list
 // or watch permission in ArgoCD's namespace is required anywhere. That is what
 // makes a deleted or emptied Secret self-healing — the next pass recreates the
 // registration and sees that the credential is gone.
@@ -221,7 +221,7 @@ func hasBearerToken(secret *corev1.Secret) bool {
 // Fingerprint is what a previous pass wrote, as recorded in the owning
 // ClusterConnection's status.
 //
-// The daemon cannot read the generated Secret back, so this is how it knows
+// k2a-token-sync cannot read the generated Secret back, so this is how it knows
 // whether the published registration still matches what is wanted. A zero value
 // means nothing has been published, which is why it reads as "reissue".
 type Fingerprint struct {

@@ -21,7 +21,7 @@ import (
 func main() {
 	// Subcommands log to stderr, because stdout is their output: the bootstrap
 	// subcommand prints a manifest there, and log lines mixed into it would break
-	// a redirect or a pipe into kubectl. The daemon has no such output, and its
+	// a redirect or a pipe into kubectl. k2a-token-sync has no such output, and its
 	// logs belong on stdout where a collector expects them.
 	if len(os.Args) > 1 {
 		logger := newLogger(os.Stderr)
@@ -33,8 +33,8 @@ func main() {
 	}
 
 	logger := newLogger(os.Stdout)
-	if err := runDaemon(logger); err != nil {
-		logger.Error("daemon failed", "error", err)
+	if err := runSync(logger); err != nil {
+		logger.Error("k2a-token-sync failed", "error", err)
 		os.Exit(1)
 	}
 }
@@ -70,15 +70,15 @@ func printUsage() {
 	fmt.Fprint(os.Stderr, `k2a-token-sync — keeps ArgoCD's downstream cluster registrations valid.
 
 Usage:
-  k2a-token-sync                 run the reconciliation daemon (default)
-  k2a-token-sync bootstrap ...   provision a standalone cluster for the daemon
+  k2a-token-sync                 run the reconciliation loop (default)
+  k2a-token-sync bootstrap ...   provision a standalone cluster for k2a-token-sync
   k2a-token-sync version         print version information
 
 Run 'k2a-token-sync bootstrap --help' for bootstrap options.
 `)
 }
 
-func runDaemon(logger *slog.Logger) error {
+func runSync(logger *slog.Logger) error {
 	cfg, err := config.Load(logger)
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)

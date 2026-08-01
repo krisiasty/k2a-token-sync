@@ -31,12 +31,12 @@ var testCA = []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE----
 
 func testCluster() config.Cluster {
 	return config.Cluster{
-		Name:                    "standalone-1",
-		Endpoint:                "10.1.0.10:6443",
-		SecretName:              "cluster-standalone-1",
-		AgentServiceAccountName: "k2a-token-sync",
-		AgentTokenTTL:           2160 * time.Hour,
-		ServiceAccount:          config.ServiceAccountRef{Name: "argocd-manager", Namespace: "kube-system"},
+		Name:                   "standalone-1",
+		Endpoint:               "10.1.0.10:6443",
+		SecretName:             "cluster-standalone-1",
+		SelfServiceAccountName: "k2a-token-sync",
+		SelfTokenTTL:           2160 * time.Hour,
+		ServiceAccount:         config.ServiceAccountRef{Name: "argocd-manager", Namespace: "kube-system"},
 	}
 }
 
@@ -56,7 +56,7 @@ func mintsTokens(client *fake.Clientset, token string, expiresAt time.Time) {
 	})
 }
 
-// rootCA is the one ConfigMap the agent identity may read, and therefore what
+// rootCA is the one ConfigMap its own identity may read, and therefore what
 // verifying a renewed credential actually calls.
 func rootCA() *corev1.ConfigMap {
 	return &corev1.ConfigMap{
@@ -92,7 +92,7 @@ func newReconciler(local kubernetes.Interface, verify func() (kubernetes.Interfa
 }
 
 // The property this guards: overwriting a working credential with a broken one
-// would lock the daemon out of the cluster, recoverable only by a human
+// would lock k2a-token-sync out of the cluster, recoverable only by a human
 // re-running bootstrap. So a renewal that cannot be verified must be discarded.
 func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	t.Parallel()
@@ -112,11 +112,11 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	})
 
 	status := v1alpha1.ClusterConnectionStatus{
-		AgentCredentialExpiresAt: &metav1.Time{Time: expires},
+		SelfCredentialExpiresAt: &metav1.Time{Time: expires},
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
 
-	r.renewAgentCredential(ctx, cluster, access, &status, r.logger)
+	r.renewSelfCredential(ctx, cluster, access, &status, r.logger)
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -128,8 +128,8 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	if !creds.ExpiresAt.Equal(expires) {
 		t.Errorf("stored expiry = %v, want %v unchanged", creds.ExpiresAt, expires)
 	}
-	if !status.AgentCredentialExpiresAt.Time.Equal(expires) {
-		t.Errorf("status expiry = %v, want %v unchanged", status.AgentCredentialExpiresAt, expires)
+	if !status.SelfCredentialExpiresAt.Time.Equal(expires) {
+		t.Errorf("status expiry = %v, want %v unchanged", status.SelfCredentialExpiresAt, expires)
 	}
 }
 
@@ -150,11 +150,11 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 	})
 
 	status := v1alpha1.ClusterConnectionStatus{
-		AgentCredentialExpiresAt: &metav1.Time{Time: oldExpiry},
+		SelfCredentialExpiresAt: &metav1.Time{Time: oldExpiry},
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: oldExpiry}
 
-	r.renewAgentCredential(ctx, cluster, access, &status, r.logger)
+	r.renewSelfCredential(ctx, cluster, access, &status, r.logger)
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -171,13 +171,13 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 	if !bytes.Equal(creds.CA, bytes.TrimSpace(testCA)) {
 		t.Errorf("the CA bundle was not carried over to the renewed credential: got %q", creds.CA)
 	}
-	if status.AgentCredentialExpiresAt == nil || !status.AgentCredentialExpiresAt.Time.Equal(newExpiry) {
+	if status.SelfCredentialExpiresAt == nil || !status.SelfCredentialExpiresAt.Time.Equal(newExpiry) {
 		t.Errorf("status expiry = %v, want %v so the lockout clock is visible",
-			status.AgentCredentialExpiresAt, newExpiry)
+			status.SelfCredentialExpiresAt, newExpiry)
 	}
 }
 
-// An expired credential cannot be renewed with itself, so the daemon must say so
+// An expired credential cannot be renewed with itself, so k2a-token-sync must say so
 // rather than reporting an opaque 401 from the API server.
 func TestAccessReportsAnExpiredCredential(t *testing.T) {
 	t.Parallel()

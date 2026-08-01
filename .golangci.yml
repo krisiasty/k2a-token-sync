@@ -8,7 +8,7 @@ linters:
     - staticcheck
     - ineffassign
     - unused
-    - bodyclose      # HTTP response bodies closed — this daemon talks to the Rancher API
+    - bodyclose      # HTTP response bodies closed, should an HTTP client ever return
     - nilerr         # returning nil after a non-nil error
     - errorlint      # %w vs %v, errors.Is/As over comparison
     - durationcheck  # suspicious duration arithmetic; the scheduler does plenty

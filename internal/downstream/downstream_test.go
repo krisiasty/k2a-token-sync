@@ -59,7 +59,7 @@ func TestEnsureClusterRoleBindingRefusesToRewriteForeignBinding(t *testing.T) {
 	t.Parallel()
 
 	// Silently rewriting an existing binding would be an unannounced privilege
-	// change, so the daemon must refuse and surface it.
+	// change, so k2a-token-sync must refuse and surface it.
 	client := fake.NewSimpleClientset(&rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager-role-binding"},
 		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "view"},
@@ -153,14 +153,14 @@ func TestClusterCA(t *testing.T) {
 	}
 }
 
-func TestEnsureAgentIdentityGrantsOnlyWhatTheDaemonNeeds(t *testing.T) {
+func TestEnsureSelfIdentityGrantsOnlyWhatIsNeeded(t *testing.T) {
 	t.Parallel()
 
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
 
-	if err := EnsureAgentIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
-		t.Fatalf("EnsureAgentIdentity returned unexpected error: %v", err)
+	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
+		t.Fatalf("EnsureSelfIdentity returned unexpected error: %v", err)
 	}
 
 	role, err := client.RbacV1().ClusterRoles().Get(ctx, "k2a-token-sync", metav1.GetOptions{})
@@ -168,25 +168,25 @@ func TestEnsureAgentIdentityGrantsOnlyWhatTheDaemonNeeds(t *testing.T) {
 		t.Fatalf("clusterrole was not created: %v", err)
 	}
 
-	// The daemon must never hold blanket secret access in a downstream cluster.
+	// k2a-token-sync must never hold blanket secret access in a downstream cluster.
 	for _, rule := range role.Rules {
 		for _, resource := range rule.Resources {
 			if resource == "secrets" {
-				t.Error("agent clusterrole grants access to secrets")
+				t.Error("the self clusterrole grants access to secrets")
 			}
 			if resource == "*" {
-				t.Error("agent clusterrole uses a wildcard resource")
+				t.Error("the self clusterrole uses a wildcard resource")
 			}
 		}
 		for _, verb := range rule.Verbs {
 			if verb == "*" {
-				t.Error("agent clusterrole uses a wildcard verb")
+				t.Error("the self clusterrole uses a wildcard verb")
 			}
 		}
 	}
 
 	// Idempotent: this runs on the bootstrap path and must tolerate re-runs.
-	if err := EnsureAgentIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
-		t.Fatalf("second EnsureAgentIdentity returned unexpected error: %v", err)
+	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
+		t.Fatalf("second EnsureSelfIdentity returned unexpected error: %v", err)
 	}
 }

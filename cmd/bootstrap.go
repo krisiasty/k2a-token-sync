@@ -25,14 +25,14 @@ import (
 
 const bootstrapTimeout = 2 * time.Minute
 
-// runBootstrap provisions a downstream cluster for the daemon.
+// runBootstrap provisions a downstream cluster for k2a-token-sync.
 //
-// It exists because something has to establish the first foothold: the daemon has
-// no way into a cluster until an identity exists for it there, and it deliberately
-// never holds administrative material of its own.
+// It exists because something has to establish the first foothold: k2a-token-sync
+// has no way into a cluster until an identity exists for it there, and it
+// deliberately never holds administrative material of its own.
 //
 // The split of outputs is the point. The credential goes straight from the
-// downstream cluster into the daemon's namespace, never through the terminal; the
+// downstream cluster into its own namespace, never through the terminal; the
 // ClusterConnection goes to stdout, where it carries nothing secret and can be
 // committed. So the operator's shell sees only what is safe to keep.
 func runBootstrap(logger *slog.Logger, args []string) error {
@@ -45,18 +45,21 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 
 		fromKubeconfig = fs.String("from-kubeconfig", "",
 			"path to a kubeconfig granting admin access to the downstream cluster")
-		downstreamCtx = fs.String("context", "",
+		fromContext = fs.String("from-context", "",
 			"context to use within --from-kubeconfig, or within the ambient kubeconfig when that is unset")
 
-		homeKube = fs.String("home-kubeconfig", "",
-			"path to the kubeconfig for the cluster running ArgoCD and the daemon (default: normal resolution)")
-		homeCtx = fs.String("home-context", "",
-			"context of the cluster running ArgoCD and the daemon (default: current context)")
+		// The unprefixed pair means what it means in any kubectl-like tool: the
+		// cluster this command works against. For bootstrap that is where the
+		// output lands — the credential and the ClusterConnection.
+		kubeconfig = fs.String("kubeconfig", "",
+			"path to the kubeconfig for the cluster running ArgoCD and k2a-token-sync (default: normal resolution)")
+		kubeContext = fs.String("context", "",
+			"context of the cluster running ArgoCD and k2a-token-sync (default: current context)")
 
-		namespace   = fs.String("namespace", "k2a-token-sync", "namespace the daemon runs in; the credential is written here")
+		namespace   = fs.String("namespace", "k2a-token-sync", "namespace k2a-token-sync runs in; the credential is written here")
 		saName      = fs.String("serviceaccount", "argocd-manager", "downstream ServiceAccount ArgoCD authenticates as")
 		saNamespace = fs.String("serviceaccount-namespace", "kube-system", "namespace for the downstream ServiceAccounts")
-		agentSAName = fs.String("agent-serviceaccount", "k2a-token-sync", "downstream ServiceAccount the daemon authenticates as")
+		selfSAName  = fs.String("self-serviceaccount", "k2a-token-sync", "downstream ServiceAccount k2a-token-sync authenticates as")
 
 		create = fs.Bool("create", false, "apply the ClusterConnection instead of printing it")
 		dryRun = fs.Bool("dry-run", false, "report what would be done without changing anything")
@@ -65,16 +68,20 @@ func runBootstrap(logger *slog.Logger, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: k2a-token-sync bootstrap --cluster NAME --endpoint HOST[:PORT] [flags]
 
-Provisions a downstream cluster so the daemon can maintain its ArgoCD
+Provisions a downstream cluster so k2a-token-sync can maintain its ArgoCD
 registration. Installs two downstream identities — one for ArgoCD (cluster-admin)
-and one narrowly-scoped for the daemon — stores a credential for the latter in the
-daemon's namespace, and prints the ClusterConnection to apply.
+and one narrowly-scoped for k2a-token-sync — stores a credential for the latter in
+its namespace, and prints the ClusterConnection to apply.
 
-Run this once per cluster. Afterwards the daemon needs no administrative access.
+Run this once per cluster. Afterwards k2a-token-sync needs no administrative
+access.
 
-Downstream access comes from --from-kubeconfig, a --context within the ambient
-kubeconfig, or both. Two files are supported deliberately: merging kubeconfigs is
-unsafe when they define the same context name for different clusters.
+Two clusters are involved. --kubeconfig and --context select the one running
+ArgoCD and k2a-token-sync, where the credential is stored and the object created;
+both default to your usual kubeconfig and current context. --from-kubeconfig and
+--from-context select the downstream cluster being onboarded, and one of them is
+required. Separate files are supported deliberately: merging kubeconfigs is unsafe
+when they define the same context name for different clusters.
 
 The credential never passes through your shell. Only the ClusterConnection is
 printed, and it contains nothing secret:
@@ -101,9 +108,9 @@ Flags:
 	case *endpoint == "":
 		fs.Usage()
 		return errors.New("--endpoint is required")
-	case *fromKubeconfig == "" && *downstreamCtx == "":
+	case *fromKubeconfig == "" && *fromContext == "":
 		fs.Usage()
-		return errors.New("one of --from-kubeconfig or --context is required, to reach the downstream cluster")
+		return errors.New("one of --from-kubeconfig or --from-context is required, to reach the downstream cluster")
 	}
 
 	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{
@@ -111,7 +118,7 @@ Flags:
 		Endpoint:                *endpoint,
 		ServiceAccountName:      *saName,
 		ServiceAccountNamespace: *saNamespace,
-		AgentServiceAccountName: *agentSAName,
+		SelfServiceAccountName:  *selfSAName,
 	})
 	if err != nil {
 		return err
@@ -123,11 +130,11 @@ Flags:
 	// Both connections are resolved before anything is created. Provisioning a
 	// cluster and then discovering there is nowhere to put the result would leave
 	// identities behind with no credential stored for them.
-	downstreamClient, downstreamCfg, err := kubeclient.ClientForContext(*fromKubeconfig, *downstreamCtx)
+	downstreamClient, downstreamCfg, err := kubeclient.ClientForContext(*fromKubeconfig, *fromContext)
 	if err != nil {
 		return err
 	}
-	localClient, err := localClientFor(*homeKube, *homeCtx)
+	localClient, err := localClientFor(*kubeconfig, *kubeContext)
 	if err != nil {
 		return err
 	}
@@ -141,7 +148,7 @@ Flags:
 	if *dryRun {
 		logger.Info("dry run; no changes made",
 			"would_create_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
-			"would_create_agent_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.AgentServiceAccountName,
+			"would_create_self_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName,
 			"would_write_secret", *namespace+"/"+cluster.CredentialsSecretName(),
 		)
 		return printConnection(cluster, *namespace)
@@ -160,8 +167,8 @@ Flags:
 	}
 	logger.Info("provisioned downstream identities",
 		"argocd_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
-		"agent_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.AgentServiceAccountName,
-		"agent_credential_expires_at", provisioned.ExpiresAt.UTC().Format(time.RFC3339),
+		"self_serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName,
+		"self_credential_expires_at", provisioned.ExpiresAt.UTC().Format(time.RFC3339),
 	)
 
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), provisioned,
@@ -175,15 +182,15 @@ Flags:
 
 	// Prove the whole path ArgoCD will use, with the credential just minted. This
 	// is a warning rather than a failure: the endpoint may be reachable from the
-	// daemon's cluster but not from here.
+	// cluster k2a-token-sync runs on but not from here.
 	verifyCredential(ctx, cluster, provisioned, logger)
 
 	if *create {
-		return createConnection(ctx, cluster, *namespace, *homeKube, *homeCtx, logger)
+		return createConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext, logger)
 	}
 
 	fmt.Fprintf(os.Stderr, "\nApply the ClusterConnection below to register %q. "+
-		"The daemon picks it up within one poll.\n\n", cluster.Name)
+		"k2a-token-sync picks it up within one poll.\n\n", cluster.Name)
 	return printConnection(cluster, *namespace)
 }
 
@@ -214,7 +221,7 @@ func preflight(ctx context.Context, client kubernetes.Interface, cluster config.
 	return nil
 }
 
-// verifyCredential uses the stored credential exactly as the daemon will, to
+// verifyCredential uses the stored credential exactly as k2a-token-sync will, to
 // prove endpoint, certificate, token and downstream RBAC work together.
 func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubeclient.Credentials, logger *slog.Logger) {
 	client, err := reconcile.ClientFromCredentials(cluster.ServerURL(), creds)
@@ -224,14 +231,14 @@ func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubecl
 	}
 	if _, err := downstream.ClusterCA(ctx, client, cluster.ServiceAccount.Namespace); err != nil {
 		logger.Warn("could not verify the credential against the endpoint from here; "+
-			"the daemon may still succeed if it can reach the endpoint",
+			"k2a-token-sync may still succeed if it can reach the endpoint",
 			"endpoint", cluster.Endpoint, "error", err)
 		return
 	}
 	logger.Info("verified the credential against the endpoint ArgoCD will use", "endpoint", cluster.Endpoint)
 }
 
-// connectionFor builds the object that declares this cluster to the daemon.
+// connectionFor builds the object that declares this cluster to k2a-token-sync.
 //
 // Only the fields the operator chose are set. Everything else is left to the
 // schema's defaults, so the printed manifest stays short and does not freeze
@@ -256,9 +263,9 @@ func connectionFor(cluster config.Cluster, namespace string) *v1alpha1.ClusterCo
 // printConnection writes the object to stdout. Logs go to stderr, so the output
 // can be redirected into a file or piped into kubectl.
 //
-// Only apiVersion, kind, metadata and spec are printed: status belongs to the
-// daemon, and a "status: {}" stanza in a committed file is noise at best and an
-// invitation to edit it at worst.
+// Only apiVersion, kind, metadata and spec are printed: status belongs to
+// k2a-token-sync, and a "status: {}" stanza in a committed file is noise at best
+// and an invitation to edit it at worst.
 func printConnection(cluster config.Cluster, namespace string) error {
 	conn := connectionFor(cluster, namespace)
 	raw, err := yaml.Marshal(struct {
@@ -276,15 +283,15 @@ func printConnection(cluster config.Cluster, namespace string) error {
 }
 
 // createConnection applies the object directly, for people who would rather not
-// pipe YAML around. It uses the dynamic client for the same reason the daemon
+// pipe YAML around. It uses the dynamic client for the same reason k2a-token-sync
 // does: no generated clientset is needed to write one object.
 func createConnection(
 	ctx context.Context,
 	cluster config.Cluster,
-	namespace, homeKube, homeCtx string,
+	namespace, kubeconfig, kubeContext string,
 	logger *slog.Logger,
 ) error {
-	dyn, err := kubeclient.DynamicClientForContext(homeKube, homeCtx)
+	dyn, err := kubeclient.DynamicClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return err
 	}
@@ -301,12 +308,12 @@ func createConnection(
 		return fmt.Errorf("applying the ClusterConnection: %w", err)
 	}
 
-	logger.Info("applied the ClusterConnection; the daemon picks it up within one poll",
+	logger.Info("applied the ClusterConnection; k2a-token-sync picks it up within one poll",
 		"object", namespace+"/"+cluster.Name)
 	return nil
 }
 
-// localClientFor builds a client for the cluster running ArgoCD and the daemon.
+// localClientFor builds a client for the cluster running ArgoCD and k2a-token-sync.
 // With no explicit context it falls back to normal kubeconfig resolution, which
 // also covers running this inside that cluster.
 func localClientFor(kubeconfig, contextName string) (kubernetes.Interface, error) {

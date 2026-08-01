@@ -1,10 +1,10 @@
-// Package config resolves the daemon's runtime configuration.
+// Package config resolves k2a-token-sync's runtime configuration.
 //
 // There are two sources and they are deliberately different in kind. Process
-// settings — which namespace the daemon runs in, which ArgoCD instance it serves,
+// settings — which namespace k2a-token-sync runs in, which ArgoCD instance it serves,
 // which port serves health — come from the environment, because they are fixed
 // for the lifetime of a deployment. The cluster inventory comes from
-// ClusterConnection objects, because it changes while the daemon runs.
+// ClusterConnection objects, because it changes while k2a-token-sync runs.
 //
 // This package owns the runtime Cluster type and the normalisation applied to it,
 // so an object resolved from the API and a cluster prepared by the bootstrap
@@ -27,18 +27,18 @@ import (
 const (
 	defaultAPIPort = "6443"
 
-	defaultTokenTTL      = 720 * time.Hour  // 30 days
-	defaultAgentTokenTTL = 2160 * time.Hour // 90 days
+	defaultTokenTTL     = 720 * time.Hour  // 30 days
+	defaultSelfTokenTTL = 2160 * time.Hour // 90 days
 
 	// defaultExpiryWarnThreshold gives three months' notice, which is enough to
 	// schedule a certificate rotation or a control-plane restart properly rather
 	// than as an emergency.
 	defaultExpiryWarnThreshold = 2160 * time.Hour // 90 days
 
-	defaultArgoCDNamespace     = "argocd"
-	defaultServiceAccountName  = "argocd-manager"
-	defaultServiceAccountNS    = "kube-system"
-	defaultAgentServiceAccount = "k2a-token-sync"
+	defaultArgoCDNamespace    = "argocd"
+	defaultServiceAccountName = "argocd-manager"
+	defaultServiceAccountNS   = "kube-system"
+	defaultSelfServiceAccount = "k2a-token-sync"
 
 	minTokenTTL = 1 * time.Hour
 
@@ -50,12 +50,12 @@ const (
 
 // Config is the resolved process configuration.
 type Config struct {
-	// Namespace the daemon runs in. Its ClusterConnection objects and every
+	// Namespace k2a-token-sync runs in. Its ClusterConnection objects and every
 	// credential Secret it owns live here.
 	Namespace string
 
 	// ArgoCDNamespace is where every generated cluster Secret is written. One
-	// daemon serves one ArgoCD instance, so this is a single value rather than a
+	// instance serves one ArgoCD, so this is a single value rather than a
 	// per-cluster setting.
 	ArgoCDNamespace string
 
@@ -80,11 +80,11 @@ type Cluster struct {
 	// ServiceAccount is the downstream identity ArgoCD authenticates as.
 	ServiceAccount ServiceAccountRef
 
-	// AgentServiceAccountName is the downstream identity the daemon itself
+	// SelfServiceAccountName is the downstream identity k2a-token-sync itself
 	// authenticates as after bootstrap.
-	AgentServiceAccountName string
+	SelfServiceAccountName string
 
-	// SecretName is the ArgoCD cluster Secret this daemon generates and
+	// SecretName is the ArgoCD cluster Secret k2a-token-sync generates and
 	// maintains, in Config.ArgoCDNamespace.
 	SecretName string
 
@@ -92,12 +92,12 @@ type Cluster struct {
 	// ArgoCD Secret. The API server may shorten it.
 	TokenTTL time.Duration
 
-	// AgentTokenTTL is the requested lifetime of the daemon's own credential,
+	// SelfTokenTTL is the requested lifetime of k2a-token-sync's own credential,
 	// renewed on every successful pass, and therefore also the length of an
-	// outage the daemon can recover from unaided.
-	AgentTokenTTL time.Duration
+	// outage k2a-token-sync can recover from unaided.
+	SelfTokenTTL time.Duration
 
-	// ExpiryWarnThreshold controls when the daemon starts warning about the
+	// ExpiryWarnThreshold controls when k2a-token-sync starts warning about the
 	// downstream API server's serving certificate.
 	ExpiryWarnThreshold time.Duration
 
@@ -115,7 +115,7 @@ type ServiceAccountRef struct {
 	Namespace string
 }
 
-// CredentialsSecretName is the Secret in the daemon's namespace holding the
+// CredentialsSecretName is the Secret in k2a-token-sync's namespace holding the
 // durable credential provisioned for this cluster.
 func (c Cluster) CredentialsSecretName() string {
 	return c.Name + "-credentials"
@@ -180,7 +180,7 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 
 	out.DisplayName = orDefault(spec.DisplayName, name)
 	out.SecretName = orDefault(spec.SecretName, "cluster-"+name)
-	out.AgentServiceAccountName = orDefault(spec.AgentServiceAccountName, defaultAgentServiceAccount)
+	out.SelfServiceAccountName = orDefault(spec.SelfServiceAccountName, defaultSelfServiceAccount)
 	out.Labels = spec.Labels
 	out.Annotations = spec.Annotations
 	out.Project = spec.Project
@@ -194,7 +194,7 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 	if out.TokenTTL, err = parseDuration("tokenTTL", spec.TokenTTL, defaultTokenTTL, minTokenTTL); err != nil {
 		return out, err
 	}
-	if out.AgentTokenTTL, err = parseDuration("agentTokenTTL", spec.AgentTokenTTL, defaultAgentTokenTTL, minTokenTTL); err != nil {
+	if out.SelfTokenTTL, err = parseDuration("selfTokenTTL", spec.SelfTokenTTL, defaultSelfTokenTTL, minTokenTTL); err != nil {
 		return out, err
 	}
 	if out.ExpiryWarnThreshold, err = parseDuration("expiryWarnThreshold", spec.ExpiryWarnThreshold, defaultExpiryWarnThreshold, 0); err != nil {

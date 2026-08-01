@@ -1,5 +1,5 @@
 // Package downstream performs the work that happens inside a managed
-// cluster: provisioning the identities ArgoCD and the daemon authenticate as,
+// cluster: provisioning the identities ArgoCD and k2a-token-sync authenticate as,
 // minting bound tokens, reading the cluster CA, and probing the API server's
 // serving certificate.
 package downstream
@@ -179,7 +179,7 @@ func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name
 	}, nil
 }
 
-// agentRules are the only permissions the daemon needs in a downstream cluster
+// selfRules are the only permissions k2a-token-sync needs in a downstream cluster
 // after bootstrap: maintain ArgoCD's identity, mint tokens for it, and read the
 // cluster CA.
 //
@@ -190,7 +190,7 @@ func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name
 //
 // These are ClusterRole rules, so they carry no namespace: the binding needs to
 // cover kube-root-ca.crt in whichever namespace the ServiceAccounts live in.
-func agentRules() []rbacv1.PolicyRule {
+func selfRules() []rbacv1.PolicyRule {
 	return []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{""},
@@ -216,16 +216,16 @@ func agentRules() []rbacv1.PolicyRule {
 	}
 }
 
-// EnsureAgentIdentity provisions the identity the daemon itself uses in a
+// EnsureSelfIdentity provisions the identity k2a-token-sync itself uses in a
 // standalone cluster, together with its ClusterRole and binding.
-func EnsureAgentIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+func EnsureSelfIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
 	if _, err := EnsureServiceAccount(ctx, client, namespace, name); err != nil {
 		return err
 	}
 
 	role := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: ManagedByLabel},
-		Rules:      agentRules(),
+		Rules:      selfRules(),
 	}
 	if _, err := client.RbacV1().ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {

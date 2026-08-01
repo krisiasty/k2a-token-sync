@@ -1,4 +1,4 @@
-k2a-token-sync - kubernetes daemon that keeps ArgoCD's registrations for downstream RKE2 clusters valid, letting ArgoCD connect directly to each cluster's API server instead of through the Rancher proxy.
+k2a-token-sync - keeps ArgoCD's registrations for downstream Kubernetes clusters valid with short-lived ServiceAccount tokens it mints and rotates itself, letting ArgoCD connect directly to each cluster's API server.
 
 Copyright 2026 Krzysztof Ciepłucha
 

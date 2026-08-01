@@ -4,7 +4,7 @@
 // changes when a human adds a cluster — a few times a year — so a watch would
 // buy sub-second pickup in exchange for a cache with a lifecycle, watch
 // reconnects and a workqueue to deduplicate events. A list has none of that, and
-// it doubles as the recovery mechanism: whatever the daemon's view was, the next
+// it doubles as the recovery mechanism: whatever k2a-token-sync's view was, the next
 // poll replaces it.
 package inventory
 
@@ -32,18 +32,18 @@ var GroupVersionResource = schema.GroupVersionResource{
 }
 
 // Entry is one inventory entry: the resolved cluster, plus the object bookkeeping
-// the daemon needs to write status back and to notice edits.
+// k2a-token-sync needs to write status back and to notice edits.
 type Entry struct {
 	Cluster config.Cluster
 
 	// Generation and ObservedGeneration are compared to decide whether the spec
-	// has changed since the daemon last acted on it. A spec ahead of its status
+	// has changed since k2a-token-sync last acted on it. A spec ahead of its status
 	// is due immediately, which is what makes an edit take effect within one poll
 	// rather than at the next scheduled pass.
 	Generation         int64
 	ObservedGeneration int64
 
-	// Status is the last status the daemon wrote, and the only record of what it
+	// Status is the last status k2a-token-sync wrote, and the only record of what it
 	// published: it holds no read permission on the generated Secrets.
 	Status v1alpha1.ClusterConnectionStatus
 
@@ -54,7 +54,7 @@ type Entry struct {
 	InvalidReason string
 }
 
-// Edited reports whether the spec has changed since the daemon last recorded a
+// Edited reports whether the spec has changed since k2a-token-sync last recorded a
 // status for it.
 func (e Entry) Edited() bool {
 	return e.Generation != e.ObservedGeneration
@@ -65,9 +65,9 @@ type Client struct {
 	resource dynamic.ResourceInterface
 }
 
-// NewClient binds a dynamic client to the daemon's own namespace.
+// NewClient binds a dynamic client to k2a-token-sync's own namespace.
 //
-// Objects are namespaced and only this namespace is watched, so the daemon needs
+// Objects are namespaced and only this namespace is watched, so k2a-token-sync needs
 // a Role rather than a ClusterRole and holds no cluster-scoped permission.
 func NewClient(dyn dynamic.Interface, namespace string) *Client {
 	return &Client{resource: dyn.Resource(GroupVersionResource).Namespace(namespace)}
