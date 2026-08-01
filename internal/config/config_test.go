@@ -181,7 +181,7 @@ func TestFromSpecRejects(t *testing.T) {
 			want:    "must be at least",
 		},
 		{
-			name:    "unparseable duration",
+			name:    "unparsable duration",
 			objName: "a",
 			mutate:  func(s *v1alpha1.ClusterConnectionSpec) { s.TokenTTL = "soon" },
 			want:    "not a valid duration",

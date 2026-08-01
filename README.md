@@ -1,6 +1,6 @@
 # k2a-token-sync
 
-`k2a-token-sync` (**K**ubernetes-**to**-**A**rgoCD **Token Sync**) keeps ArgoCD's registrations for downstream
+`k2a-token-sync` — Kubernetes to ArgoCD, token sync — keeps ArgoCD's registrations for downstream
 Kubernetes clusters valid, using short-lived ServiceAccount tokens it mints and rotates itself.
 
 It replaces the permanent, non-expiring credential `argocd cluster add` leaves behind, without changing anything about

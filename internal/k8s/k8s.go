@@ -200,7 +200,7 @@ func ReadCredentials(ctx context.Context, client kubernetes.Interface, namespace
 
 	creds := &Credentials{Token: string(token), CA: ca}
 
-	// An unparseable or absent expiry is left zero rather than rejected: the
+	// An unparsable or absent expiry is left zero rather than rejected: the
 	// token may well still work, and a caller that renews on every pass will
 	// replace it with one whose deadline is known.
 	if raw := bytes.TrimSpace(secret.Data[credentialsExpiresAtKey]); len(raw) > 0 {
