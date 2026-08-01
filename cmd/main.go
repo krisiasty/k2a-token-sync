@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -19,28 +18,28 @@ import (
 )
 
 func main() {
-	// Subcommands log to stderr, because stdout is their output: the bootstrap
-	// subcommand prints a manifest there, and log lines mixed into it would break
-	// a redirect or a pipe into kubectl. k2a-token-sync has no such output, and its
-	// logs belong on stdout where a collector expects them.
+	// Subcommands are run by a person and report in plain text on stderr, keeping
+	// stdout for their output — bootstrap writes a manifest there, and log lines
+	// mixed into it would break a redirect or a pipe into kubectl.
 	if len(os.Args) > 1 {
-		logger := newLogger(os.Stderr)
-		if err := runSubcommand(logger, os.Args[1], os.Args[2:]); err != nil {
-			logger.Error("command failed", "error", err)
+		if err := runSubcommand(os.Args[1], os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	logger := newLogger(os.Stdout)
+	// The reconciliation loop has no such output, and its logs are read by a
+	// collector rather than a person, so they stay structured and on stdout.
+	logger := newLogger()
 	if err := runSync(logger); err != nil {
 		logger.Error("k2a-token-sync failed", "error", err)
 		os.Exit(1)
 	}
 }
 
-func newLogger(w io.Writer) *slog.Logger {
-	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{
+func newLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
 			if attr.Key == slog.TimeKey && attr.Value.Kind() == slog.KindTime {
 				return slog.String(attr.Key, attr.Value.Time().UTC().Format("2006-01-02T15:04:05.000Z07:00"))
@@ -50,10 +49,10 @@ func newLogger(w io.Writer) *slog.Logger {
 	}))
 }
 
-func runSubcommand(logger *slog.Logger, name string, args []string) error {
+func runSubcommand(name string, args []string) error {
 	switch name {
 	case "bootstrap":
-		return runBootstrap(logger, args)
+		return runBootstrap(args)
 	case "version":
 		fmt.Println(versionString())
 		return nil
