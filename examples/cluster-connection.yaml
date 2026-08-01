@@ -1,0 +1,48 @@
+# Example ClusterConnection.
+#
+# One object per downstream cluster, in the namespace the daemon runs in. Apply it
+# with kubectl, commit it to git for ArgoCD to apply, or let
+# 'k2a-token-sync bootstrap' print it for you.
+#
+# Every field below except endpoint has a default from the CRD schema, so the
+# minimal object is a name plus an endpoint. They are spelled out here to document
+# them, and internal/config parses this file in a test so the example cannot drift
+# from the loader.
+apiVersion: k2a-token-sync.io/v1alpha1
+kind: ClusterConnection
+metadata:
+  name: standalone-1
+  namespace: k2a-token-sync
+spec:
+  # The address ArgoCD connects to, bypassing any management-plane proxy. Port
+  # 6443 is assumed when none is given. This name must appear in the API server's
+  # serving-certificate SANs, or the daemon refuses to publish the registration.
+  endpoint: "10.1.0.10"
+
+  # The ArgoCD cluster Secret to maintain, in the namespace the daemon serves.
+  # Defaults to "cluster-<name>"; the "cluster-" prefix is required.
+  secretName: cluster-standalone-1
+
+  # The name ArgoCD shows. Defaults to the object's name.
+  displayName: standalone-1
+
+  # The downstream identity ArgoCD authenticates as. This default matches what
+  # 'argocd cluster add' installs, so an existing registration can be taken over.
+  serviceAccount:
+    name: argocd-manager
+    namespace: kube-system
+
+  # The downstream identity the daemon itself uses. Narrowly scoped: it can mint
+  # tokens and read the cluster CA, nothing else.
+  agentServiceAccountName: k2a-token-sync
+
+  # ArgoCD's credential, reissued at half life.
+  tokenTTL: "720h" # 30d
+
+  # The daemon's own credential, renewed on every pass. Also the downtime budget:
+  # if the daemon does not run for this long, the cluster needs bootstrapping
+  # again.
+  agentTokenTTL: "2160h" # 90d
+
+  # How much serving-certificate lifetime remains before the daemon warns.
+  expiryWarnThreshold: "2160h" # 90d

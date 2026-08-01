@@ -1,4 +1,4 @@
-// Package downstream performs the work that happens inside a managed RKE2
+// Package downstream performs the work that happens inside a managed
 // cluster: provisioning the identities ArgoCD and the daemon authenticate as,
 // minting bound tokens, reading the cluster CA, and probing the API server's
 // serving certificate.
@@ -31,16 +31,11 @@ const (
 	clusterAdminRole = "cluster-admin"
 
 	handshakeTimeout = 10 * time.Second
-
-	// legacyTokenTimeout bounds the wait for the token controller to populate a
-	// service-account-token Secret.
-	legacyTokenTimeout = 30 * time.Second
-	legacyTokenPoll    = time.Second
 )
 
 // ManagedByLabel marks every object this tool creates in a downstream cluster,
 // so an operator can find and remove them.
-var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "r2a-cert-sync"}
+var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "k2a-token-sync"}
 
 // Token is a freshly minted ServiceAccount token.
 type Token struct {
@@ -61,8 +56,9 @@ type ServingCert struct {
 
 	// HostnameError is set when the certificate carries no SAN matching the
 	// configured endpoint. This is the single most common reason direct access
-	// fails on RKE2: the serving cert only covers node addresses plus whatever
-	// is listed under tls-san in the RKE2 config.
+	// fails: a serving certificate typically covers the node addresses and
+	// in-cluster names, but not a VIP, load balancer or FQDN unless it was
+	// explicitly included when the certificate was issued.
 	HostnameError error
 }
 
@@ -183,54 +179,6 @@ func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name
 	}, nil
 }
 
-// CreateLegacyToken provisions a non-expiring token for a ServiceAccount by
-// creating a service-account-token Secret and waiting for the token controller
-// to populate it.
-//
-// This is used only for the daemon's own credential in a standalone cluster.
-// Bound tokens cannot serve that purpose: their lifetime is capped by the API
-// server, so a daemon that relied on one would eventually lock itself out with
-// no way back in. The identity it authenticates as is narrowly scoped — see
-// EnsureAgentIdentity — rather than cluster-admin.
-func CreateLegacyToken(ctx context.Context, client kubernetes.Interface, namespace, saName, secretName string) (string, error) {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        secretName,
-			Namespace:   namespace,
-			Labels:      ManagedByLabel,
-			Annotations: map[string]string{corev1.ServiceAccountNameKey: saName},
-		},
-		Type: corev1.SecretTypeServiceAccountToken,
-	}
-
-	if _, err := client.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{}); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("creating token secret %s/%s: %w", namespace, secretName, err)
-		}
-	}
-
-	deadline := time.Now().Add(legacyTokenTimeout)
-	for {
-		current, err := client.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
-		if err != nil {
-			return "", fmt.Errorf("getting token secret %s/%s: %w", namespace, secretName, err)
-		}
-		if token := current.Data[corev1.ServiceAccountTokenKey]; len(token) > 0 {
-			return string(token), nil
-		}
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("token controller did not populate secret %s/%s within %s",
-				namespace, secretName, legacyTokenTimeout)
-		}
-
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(legacyTokenPoll):
-		}
-	}
-}
-
 // agentRules are the only permissions the daemon needs in a downstream cluster
 // after bootstrap: maintain ArgoCD's identity, mint tokens for it, and read the
 // cluster CA.
@@ -312,7 +260,7 @@ func ClusterCA(ctx context.Context, client kubernetes.Interface, namespace strin
 //
 // This is deliberately independent of the credential path: it is the only way to
 // observe what ArgoCD will actually encounter when it connects directly, and the
-// only way to see the RKE2 serving certificate's expiry.
+// only way to see the serving certificate's expiry.
 func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*ServingCert, error) {
 	host, _, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -358,7 +306,7 @@ func ProbeServingCert(ctx context.Context, endpoint string, ca []byte) (*Serving
 	if err := leaf.VerifyHostname(host); err != nil {
 		out.HostnameError = fmt.Errorf(
 			"the API server certificate at %s carries no SAN for %q (SANs: %v); "+
-				"add it to tls-san in the RKE2 config and restart rke2-server, "+
+				"add this name to the API server's serving certificate, "+
 				"otherwise ArgoCD cannot verify this endpoint: %w",
 			endpoint, host, sans(leaf), err)
 	}

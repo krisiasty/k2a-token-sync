@@ -1,11 +1,11 @@
 version: 2
 
-project_name: r2a-cert-sync
+project_name: k2a-token-sync
 
 builds:
-  - id: r2a-cert-sync
+  - id: k2a-token-sync
     main: ./cmd
-    binary: r2a-cert-sync
+    binary: k2a-token-sync
     env:
       - CGO_ENABLED=0
     goos:
@@ -26,14 +26,14 @@ dockers:
     dockerfile: Dockerfile.goreleaser
     use: buildx
     image_templates:
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-amd64"
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/r2a-cert-sync"
+      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/k2a-token-sync"
 
   - id: arm64
     goos: linux
@@ -41,24 +41,24 @@ dockers:
     dockerfile: Dockerfile.goreleaser
     use: buildx
     image_templates:
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-arm64"
     build_flag_templates:
       - "--platform=linux/arm64"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/r2a-cert-sync"
+      - "--label=org.opencontainers.image.source=https://github.com/krisiasty/k2a-token-sync"
 
 docker_manifests:
-  - name_template: "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}"
+  - name_template: "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}"
     image_templates:
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
-  - name_template: "ghcr.io/krisiasty/r2a-cert-sync:latest"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-amd64"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-arm64"
+  - name_template: "ghcr.io/krisiasty/k2a-token-sync:latest"
     image_templates:
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-amd64"
-      - "ghcr.io/krisiasty/r2a-cert-sync:{{ .Tag }}-arm64"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-amd64"
+      - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-arm64"
 
 archives:
   - formats: [tar.gz]

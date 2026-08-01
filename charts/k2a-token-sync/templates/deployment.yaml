@@ -1,60 +1,55 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "r2a-cert-sync.name" . }}
+  name: {{ include "k2a-token-sync.name" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "r2a-cert-sync.labels" . | nindent 4 }}
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "r2a-cert-sync.selectorLabels" . | nindent 6 }}
+      {{- include "k2a-token-sync.selectorLabels" . | nindent 6 }}
   # Recreate, not RollingUpdate: two instances reconciling the same clusters
   # would race to mint and publish credentials.
   strategy:
     type: Recreate
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
       annotations:
-        # Restart on config change so a ConfigMap edit takes effect immediately
-        # rather than at the next reconciliation.
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-        {{- end }}
+      {{- end }}
       labels:
-        {{- include "r2a-cert-sync.labels" . | nindent 8 }}
+        {{- include "k2a-token-sync.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
-      serviceAccountName: {{ include "r2a-cert-sync.name" . }}
+      serviceAccountName: {{ include "k2a-token-sync.name" . }}
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: r2a-cert-sync
-          image: {{ include "r2a-cert-sync.image" . }}
+        - name: k2a-token-sync
+          image: {{ include "k2a-token-sync.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: CONFIG_PATH
-              value: /etc/r2a-cert-sync/config.yaml
+            # The inventory comes from ClusterConnection objects in this
+            # namespace, so there is no config file to point at.
+            - name: ARGOCD_NAMESPACE
+              value: {{ include "k2a-token-sync.argocdNamespace" . | quote }}
             - name: HEALTH_PORT
               value: {{ .Values.health.port | quote }}
           ports:
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
-          volumeMounts:
-            - name: config
-              mountPath: /etc/r2a-cert-sync
-              readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -73,15 +68,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             # A cluster that cannot be reached leaves the pod unready; allow a
-            # generous window before that shows up, since the first pass has to
-            # reach every configured cluster.
+            # generous window before that shows up, since every cluster in the
+            # inventory has to reconcile once first.
             failureThreshold: 30
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      volumes:
-        - name: config
-          configMap:
-            name: {{ include "r2a-cert-sync.name" . }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

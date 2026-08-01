@@ -8,55 +8,78 @@ import (
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/krisiasty/r2a-cert-sync/internal/reconcile"
 )
 
-// healthState tracks the reconciliation loop for the probe endpoints.
+// clusterReport is one cluster's line in /status. It carries no credential
+// material — only what was observed and when.
+type clusterReport struct {
+	Name       string `json:"name"`
+	Endpoint   string `json:"endpoint"`
+	Secret     string `json:"secret,omitempty"`
+	Synced     bool   `json:"synced"`
+	Error      string `json:"error,omitempty"`
+	LastAction string `json:"lastAction,omitempty"`
+
+	SyncedAt                 time.Time `json:"syncedAt,omitzero"`
+	DueAt                    time.Time `json:"dueAt,omitzero"`
+	TokenExpiresAt           time.Time `json:"tokenExpiresAt,omitzero"`
+	ServingCertExpiresAt     time.Time `json:"servingCertExpiresAt,omitzero"`
+	ServingCertDaysRemaining int32     `json:"servingCertDaysRemaining,omitempty"`
+}
+
+// healthState tracks the scheduler for the probe endpoints.
 type healthState struct {
 	mu            sync.RWMutex
-	clusterCount  int
+	inProgress    bool
 	nextAttemptAt time.Time
-	lastResult    reconcile.Result
+	clusters      []clusterReport
 	lastSuccessAt time.Time
 	ready         bool
 }
 
-func newHealthState(clusterCount int) *healthState {
-	return &healthState{clusterCount: clusterCount}
+func newHealthState() *healthState {
+	return &healthState{}
 }
 
 func (s *healthState) recordAttempt() {
 	s.mu.Lock()
-	s.nextAttemptAt = time.Time{} // clear while a pass is in progress
+	s.inProgress = true
 	s.mu.Unlock()
 }
 
-func (s *healthState) record(result reconcile.Result, next time.Duration) {
+func (s *healthState) record(clusters []clusterReport, nextDueIn time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.lastResult = result
-	s.nextAttemptAt = time.Now().Add(next)
+	s.clusters = clusters
+	s.inProgress = false
+	s.nextAttemptAt = time.Now().Add(min(nextDueIn, pollInterval))
 
-	// Readiness means every configured cluster is registered. A partial pass
-	// leaves the pod unready so the condition is visible, but the loop keeps
-	// running — the remaining clusters are retried on backoff.
-	if result.AllSynced() && len(result.Clusters) == s.clusterCount {
-		s.ready = true
+	// Readiness means every cluster in the inventory is registered. An unready
+	// pod makes a partial failure visible without stopping the loop: the
+	// remaining clusters keep their own backoff.
+	ready := true
+	for _, c := range clusters {
+		if !c.Synced {
+			ready = false
+			break
+		}
+	}
+	s.ready = ready
+	if ready {
 		s.lastSuccessAt = time.Now()
 	}
 }
 
-// isLive reports whether the loop is running on schedule. The grace window
-// absorbs a long Rancher rotation without tripping the liveness probe.
+// isLive reports whether the scheduler is still ticking. The grace window
+// absorbs one slow cluster without tripping the liveness probe.
 func (s *healthState) isLive() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.nextAttemptAt.IsZero() {
+	if s.inProgress || s.nextAttemptAt.IsZero() {
 		return true // startup, or a pass is in progress
 	}
-	return time.Now().Before(s.nextAttemptAt.Add(passTimeout + maxRetryInterval))
+	return time.Now().Before(s.nextAttemptAt.Add(clusterTimeout + pollInterval))
 }
 
 func (s *healthState) isReady() bool {
@@ -67,10 +90,10 @@ func (s *healthState) isReady() bool {
 
 // statusReport is the payload of /status.
 type statusReport struct {
-	Ready         bool                      `json:"ready"`
-	LastSuccessAt time.Time                 `json:"lastSuccessAt,omitzero"`
-	NextAttemptAt time.Time                 `json:"nextAttemptAt,omitzero"`
-	Clusters      []reconcile.ClusterStatus `json:"clusters"`
+	Ready         bool            `json:"ready"`
+	LastSuccessAt time.Time       `json:"lastSuccessAt,omitzero"`
+	NextAttemptAt time.Time       `json:"nextAttemptAt,omitzero"`
+	Clusters      []clusterReport `json:"clusters"`
 }
 
 func (s *healthState) report() statusReport {
@@ -80,7 +103,7 @@ func (s *healthState) report() statusReport {
 		Ready:         s.ready,
 		LastSuccessAt: s.lastSuccessAt,
 		NextAttemptAt: s.nextAttemptAt,
-		Clusters:      s.lastResult.Clusters,
+		Clusters:      s.clusters,
 	}
 }
 

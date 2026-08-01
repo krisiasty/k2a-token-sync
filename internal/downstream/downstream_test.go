@@ -33,7 +33,7 @@ func TestEnsureArgoCDIdentityIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("serviceaccount was not created: %v", err)
 	}
-	if sa.Labels["app.kubernetes.io/managed-by"] != "r2a-cert-sync" {
+	if sa.Labels["app.kubernetes.io/managed-by"] != "k2a-token-sync" {
 		t.Error("serviceaccount is not labelled as managed by this tool")
 	}
 
@@ -159,11 +159,11 @@ func TestEnsureAgentIdentityGrantsOnlyWhatTheDaemonNeeds(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
 
-	if err := EnsureAgentIdentity(ctx, client, "kube-system", "r2a-cert-sync"); err != nil {
+	if err := EnsureAgentIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
 		t.Fatalf("EnsureAgentIdentity returned unexpected error: %v", err)
 	}
 
-	role, err := client.RbacV1().ClusterRoles().Get(ctx, "r2a-cert-sync", metav1.GetOptions{})
+	role, err := client.RbacV1().ClusterRoles().Get(ctx, "k2a-token-sync", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("clusterrole was not created: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestEnsureAgentIdentityGrantsOnlyWhatTheDaemonNeeds(t *testing.T) {
 	}
 
 	// Idempotent: this runs on the bootstrap path and must tolerate re-runs.
-	if err := EnsureAgentIdentity(ctx, client, "kube-system", "r2a-cert-sync"); err != nil {
+	if err := EnsureAgentIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
 		t.Fatalf("second EnsureAgentIdentity returned unexpected error: %v", err)
 	}
 }

@@ -34,6 +34,17 @@ jobs:
       - name: go mod verify
         run: go mod verify
 
+      # The CRD schema is generated from api/v1alpha1, so a field added to the
+      # Go types without regenerating would be pruned by the API server rather
+      # than reported. Same idea as the go mod tidy check above.
+      - name: crd schema is current
+        run: |
+          ./hack/gen-crd.sh
+          git diff --exit-code -- charts/k2a-token-sync/crds
+
+      - name: shellcheck
+        run: shellcheck hack/*.sh
+
       - name: go build
         run: go build ./...
 
@@ -80,36 +91,26 @@ jobs:
         uses: azure/setup-helm@v5
 
       - name: helm lint
-        run: helm lint charts/r2a-cert-sync --set "image.tag=${TAG}"
+        run: helm lint charts/k2a-token-sync --set "image.tag=${TAG}"
 
       # image.tag is required; rendering without one must fail rather than
       # silently produce an image reference ending in a colon.
       - name: helm template rejects a missing image.tag
         run: |
-          if helm template r2a-cert-sync charts/r2a-cert-sync \
-               --namespace r2a-cert-sync > /dev/null 2>&1; then
+          if helm template k2a-token-sync charts/k2a-token-sync \
+               --namespace k2a-token-sync > /dev/null 2>&1; then
             echo "::error::rendering succeeded without image.tag"
             exit 1
           fi
 
-      # Render both providers so template errors and bad RBAC scoping surface
-      # here rather than at deploy time.
       - name: helm template
         run: |
-          helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync --set "image.tag=${TAG}" > /dev/null
-          helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace r2a-cert-sync --set "image.tag=${TAG}" \
-            --set rancher.url=https://rancher.example.com \
-            --set 'clusters[0].name=downstream-1' \
-            --set 'clusters[0].endpoint=10.0.0.10' \
-            --set 'clusters[0].autoRotate=true' \
-            --set 'clusters[1].name=standalone-1' \
-            --set 'clusters[1].provider=direct' \
-            --set 'clusters[1].endpoint=10.1.0.10' > /dev/null
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" > /dev/null
+          # Helm skips crds/ unless asked, so a malformed generated CRD would
+          # otherwise only surface at install time.
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" --include-crds > /dev/null
           # Deploying into ArgoCD's own namespace must not render a duplicate Role.
-          helm template r2a-cert-sync charts/r2a-cert-sync \
-            --namespace argocd --set "image.tag=${TAG}" \
-            --set 'clusters[0].name=standalone-1' \
-            --set 'clusters[0].provider=direct' \
-            --set 'clusters[0].endpoint=10.1.0.10' > /dev/null
+          helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace argocd --set "image.tag=${TAG}" > /dev/null

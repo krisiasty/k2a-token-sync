@@ -1,0 +1,96 @@
+{{- $name := include "k2a-token-sync.name" . }}
+{{- $argocdNamespace := include "k2a-token-sync.argocdNamespace" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+---
+# In its own namespace the daemon reads its inventory and holds the credential it
+# provisioned for each cluster. This namespace contains nothing but the daemon's
+# own objects.
+#
+# ClusterConnections are namespaced and only this namespace is listed, so a Role
+# suffices: the daemon holds no cluster-scoped permission anywhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: ["k2a-token-sync.io"]
+    resources: ["clusterconnections"]
+    verbs: ["get", "list"]
+  - apiGroups: ["k2a-token-sync.io"]
+    resources: ["clusterconnections/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- if ne $argocdNamespace .Release.Namespace }}
+---
+# ArgoCD's namespace, where the generated cluster Secrets live.
+#
+# The daemon holds create and patch here, and nothing else. In particular it
+# cannot read: not the Secrets it writes, not ArgoCD's own. It learns the result
+# of its own writes from what an apply returns, and records everything else in
+# each ClusterConnection's status.
+#
+# These verbs are namespace-wide because they have to be. Cluster names are not
+# known when this Role is created — that is the entire point of an inventory that
+# changes at runtime — and RBAC cannot scope resourceNames by prefix. Two things
+# limit what that permits: secretName must begin with "cluster-", so a connection
+# cannot be aimed at ArgoCD's own Secrets, and the absence of delete means nothing
+# here can be removed by the daemon.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $argocdNamespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $argocdNamespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

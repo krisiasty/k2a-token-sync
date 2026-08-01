@@ -1,6 +1,6 @@
-r2a-cert-sync - kubernetes daemon that keeps ArgoCD's registrations for downstream RKE2 clusters valid, letting ArgoCD connect directly to each cluster's API server instead of through the Rancher proxy.
+k2a-token-sync - kubernetes daemon that keeps ArgoCD's registrations for downstream RKE2 clusters valid, letting ArgoCD connect directly to each cluster's API server instead of through the Rancher proxy.
 
 Copyright 2026 Krzysztof Ciepłucha
 
 This product includes software developed by Krzysztof Ciepłucha.
-https://github.com/krisiasty/r2a-cert-sync
+https://github.com/krisiasty/k2a-token-sync

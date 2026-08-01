@@ -1,0 +1,35 @@
+image:
+  repository: ghcr.io/krisiasty/k2a-token-sync
+
+  # Required. The released version to deploy, e.g. "v0.0.1" — see
+  # https://github.com/krisiasty/k2a-token-sync/releases
+  #
+  # Not defaulted from the chart's metadata on purpose: the chart is versioned
+  # independently of the application, so the version you deploy is stated here
+  # rather than implied. Rendering fails if it is unset.
+  tag: ""
+
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+# Namespace of the ArgoCD instance this daemon serves. Every generated cluster
+# Secret is written here, and the chart renders a Role in this namespace.
+# One daemon serves one ArgoCD instance; deploy a second release for a second.
+argocdNamespace: argocd
+
+health:
+  port: 8080
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
