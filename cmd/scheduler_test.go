@@ -97,6 +97,62 @@ func TestPassesAreScheduledFromWhenTheyStarted(t *testing.T) {
 	}
 }
 
+// The scheduling arithmetic is exact, but the poll it lands on is not: dueAt is
+// computed from a clock read that happens a little after a tick, since the
+// inventory list comes first. Without slack, a cluster due a few milliseconds
+// past a tick waits for the following one, and every interval comes out one whole
+// tick longer than configured — five and a half minutes for a configured five,
+// which is what ran in production.
+func TestAClusterDueJustPastATickIsNotHeldForAWholeExtraPoll(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name  string
+		dueIn time.Duration
+		want  bool
+	}{
+		{"overdue", -time.Minute, true},
+		{"due exactly now", 0, true},
+		{"due a moment after this tick", 40 * time.Millisecond, true},
+		{"due within half a tick", dueSlack - time.Second, true},
+		{"due beyond half a tick waits", dueSlack + time.Second, false},
+		{"due a full interval away waits", maxPassInterval, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := &scheduler{
+				state: map[string]*clusterState{"c": {dueAt: now.Add(tc.dueIn)}},
+				now:   func() time.Time { return now },
+			}
+			got := len(s.dueClusters()) == 1
+			if got != tc.want {
+				t.Errorf("due=%v for a cluster due in %v, want %v", got, tc.dueIn, tc.want)
+			}
+		})
+	}
+}
+
+// An unresolvable spec is never reconciled, however overdue it looks.
+func TestAnInvalidClusterIsNeverDue(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	s := &scheduler{
+		state: map[string]*clusterState{
+			"broken": {dueAt: now.Add(-time.Hour), invalidReason: "endpoint is not a host:port"},
+		},
+		now: func() time.Time { return now },
+	}
+	if due := s.dueClusters(); len(due) != 0 {
+		t.Errorf("dueClusters returned %v, want none", due)
+	}
+}
+
 func TestHealthReadinessTracksEveryCluster(t *testing.T) {
 	t.Parallel()
 

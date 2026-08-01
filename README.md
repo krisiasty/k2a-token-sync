@@ -30,16 +30,31 @@ Two paths, and keeping them apart is the whole design:
 - **Request path** — ArgoCD connects straight to the cluster's own endpoint with the credential k2a-token-sync published.
 
 If k2a-token-sync is down, reconciliation pauses; ArgoCD keeps working. With the default 30-day token lifetime
-reissued at half life, k2a-token-sync can be down for a fortnight before anything degrades.
+reissued at half life, k2a-token-sync can be down for two weeks before anything degrades.
 
 Per cluster, every pass:
 
-1. Connects with the credential provisioned for that cluster at bootstrap, replacing that credential if it is a day old.
-2. Reads the cluster CA from the `kube-root-ca.crt` ConfigMap.
-3. Probes the direct endpoint's TLS certificate, verifying it against that CA and checking the SANs cover the
+1. Connects to the cluster's own endpoint — the same address ArgoCD uses — with the credential provisioned at
+   bootstrap, replacing that credential if it is a day old.
+2. Reads the cluster CA from the `kube-root-ca.crt` ConfigMap. This is the bundle ArgoCD will be given.
+3. Probes that endpoint's TLS certificate, verifying it against the bundle just read and checking the SANs cover the
    configured address.
 4. Applies everything in the ArgoCD cluster Secret except the credential. The apply's response is also how it learns
    whether ArgoCD still holds one, since it cannot read that Secret. Nothing changed means nothing written.
+
+Step 3 is not what establishes that the endpoint works — step 1 already did. That connection goes to the same address,
+so its own TLS handshake has to verify against the CA stored with the credential and match the endpoint's name. A
+certificate that is untrusted or does not cover the endpoint fails the pass at step 1, with the API server's TLS error,
+and the probe never runs at all.
+
+What the probe adds is the two things a client connection never reports: how long the certificate has left, and whether
+it verifies against the CA the cluster publishes **now**. That second one is the question that matters, because that
+bundle is what ArgoCD is about to be handed — and it can differ from the CA stored at bootstrap if the cluster's CA has
+been rotated since. Connecting successfully with yesterday's bundle says nothing about whether today's still works.
+
+During bootstrap the same probe genuinely is a pre-flight. There the administrative connection often arrives through a
+management proxy at an entirely different address, so nothing has touched the direct endpoint yet — which is why it is
+checked before any identity is created.
 
 ArgoCD's credential is reissued only once it is past half its lifetime, or when something it depends on has drifted —
 so the great majority of passes stop there, having written nothing at all. When one is due, the pass continues:
@@ -434,7 +449,7 @@ standalone-1   cluster2.example.com:6443   True    2026-08-24T09:12:44Z   2026-1
 standalone-2   10.2.0.10:6443              False   <none>                 <none>                 <none>      2m
 ```
 
-Both expiries are timestamps rather than "in 29 days" for a dull reason worth knowing if you ever add a column: kubectl
+Both expiries are timestamps rather than "in 29 days" for a reason worth knowing if you ever add a column: kubectl
 renders a date column as time *elapsed*, which for anything in the future is negative and prints as `<invalid>`.
 
 When a cluster is not `Ready`, three things answer it, in this order. The listing above says which cluster and for how
@@ -452,11 +467,11 @@ kubectl -n argocd get secret cluster-downstream-1 \
 
 `k2a-token-sync.io/token-expires-at`, `k2a-token-sync.io/serving-cert-expires-at` and `k2a-token-sync.io/cluster`.
 
-There is deliberately no last-sync annotation, and the omission is load-bearing. Every value written here describes
-something configured or observed, so a pass over an unchanged cluster writes nothing at all: the apply finds no
-difference, the Secret's `resourceVersion` holds still, and ArgoCD sees no event. A timestamp of the last pass would
-change every time, making every pass a write — which is what would force the interval back to something long. When a
-pass last ran is recorded in the ClusterConnection's `status.lastSyncTime` instead.
+There is deliberately no last-sync annotation, and leaving it out is what makes the rest of this work. Every value
+written here describes something configured or observed, so a pass over an unchanged cluster writes nothing at all: the
+apply finds no difference, the Secret's `resourceVersion` holds still, and ArgoCD sees no event. A timestamp of the
+last pass would change every time, making every pass a write — which is what would force the interval back to something
+long. When a pass last ran is recorded in the ClusterConnection's `status.lastSyncTime` instead.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 
@@ -529,7 +544,7 @@ The chart and the application are versioned independently, which is what Helm's 
 - **The application version is `image.tag`**, supplied in deployment values. There is deliberately no `appVersion` in
   `Chart.yaml`.
 
-That separation is load-bearing rather than cosmetic. If `image.tag` fell back to chart metadata, the deployed version
+That separation matters rather than being cosmetic. If `image.tag` fell back to chart metadata, the deployed version
 would live in a file inside the tagged tree — and since the tag is what triggers the build, the chart could never name
 the image that release produced. Keeping it in deployment values means it is set after the release, and the version you
 are running is stated explicitly instead of inferred. Rendering fails with an actionable message if it is missing, so
