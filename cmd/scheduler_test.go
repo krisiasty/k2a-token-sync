@@ -76,6 +76,27 @@ func TestNextInterval(t *testing.T) {
 	}
 }
 
+// A pass is scheduled from when it started, not from when it finished.
+//
+// Measuring from the end added the pass's duration to every interval, and because
+// that always carried the next due time a few milliseconds past the poll tick that
+// would have caught it, each interval quietly became one whole tick longer: five
+// and a half minutes for a configured five, observed live as 262 passes a day
+// instead of 288.
+func TestPassesAreScheduledFromWhenTheyStarted(t *testing.T) {
+	t.Parallel()
+
+	startedAt := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+
+	var status v1alpha1.ClusterConnectionStatus
+	status.TokenExpiresAt = &metav1.Time{Time: startedAt.Add(720 * time.Hour)}
+
+	got := dueAfterPass(startedAt, status)
+	if want := startedAt.Add(maxPassInterval); !got.Equal(want) {
+		t.Errorf("next due at %v, want %v — exactly one interval after the pass began", got, want)
+	}
+}
+
 func TestHealthReadinessTracksEveryCluster(t *testing.T) {
 	t.Parallel()
 

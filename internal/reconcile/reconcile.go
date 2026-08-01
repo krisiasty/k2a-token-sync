@@ -171,8 +171,18 @@ func (r *Reconciler) reconcile(
 	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
 	if reason == "" {
 		status.LastAction = "up-to-date"
-		logger.Info("registration current",
+
+		// This is far and away the most repeated line in the log — one per cluster
+		// per pass, for as long as nothing is wrong — so it says what happened
+		// ("nothing") and when that will stop being true, rather than leaving a
+		// reader to subtract two timestamps to find out.
+		//
+		// Reaching here means the token is not yet past half its lifetime, so this is
+		// always positive.
+		reissueDueIn := applied.TokenExpiresAt.Sub(now) - cluster.TokenTTL/2
+		logger.Info("credential still current, nothing written",
 			"token_expires_at", applied.TokenExpiresAt.UTC().Format(time.RFC3339),
+			"reissue_due_in", reissueDueIn.Round(time.Minute).String(),
 			"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 		)
 		return nil
