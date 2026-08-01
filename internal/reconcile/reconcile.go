@@ -256,19 +256,32 @@ func (r *Reconciler) reconcile(
 	// argocd.argoproj.io/secret-type label is invisible to ArgoCD, so writing the
 	// credential before the registration means ArgoCD never sees a cluster it
 	// cannot authenticate to — not even between two applies.
-	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
+	written, err := argocd.ApplyCredential(ctx, r.local, desired)
+	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
-	// The response reports the credential as it now stands, which is what the next
-	// pass has to recognise. Hashing what was sent instead would record an
-	// intention; this records the fact.
-	republished, err := argocd.ApplyRegistration(ctx, r.local, desired)
+	observed, err := argocd.ApplyRegistration(ctx, r.local, desired)
 	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
 
+	// What gets recorded is what was written, never what came back. The two applies
+	// are separate calls, so a writer landing between them would have its
+	// credential in that response — and recording that would adopt somebody else's
+	// token as this tool's own, leaving the comparison satisfied by it forever.
+	//
+	// The response is still worth reading. Differing already means exactly that
+	// happened, in the width of one round trip, which the next pass would report
+	// anyway; saying so now names it while the cause is still in view.
+	if observed != written {
+		logger.Warn("the credential just published was overwritten immediately, before this pass finished",
+			"secret", desired.Namespace+"/"+desired.Name,
+			"hint", "something else is writing this Secret; see the warning against provisioning it declaratively",
+		)
+	}
+
 	fingerprint := desired.Fingerprint()
-	fingerprint.CredentialHash = republished
+	fingerprint.CredentialHash = written
 	recordFingerprint(status, fingerprint)
 	// The reason alone would read as a state rather than an action: "cluster secret
 	// does not exist" is not what the pass did, and it is untrue by the time it is

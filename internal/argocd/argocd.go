@@ -165,8 +165,10 @@ func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguratio
 		WithData(data)
 }
 
-// credentialConfig is the credential half, and nothing else.
-func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration, error) {
+// credentialConfig is the credential half, and nothing else. It returns the
+// encoded payload alongside the apply configuration, because the digest of what
+// is being published has to come from the bytes actually sent.
+func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration, []byte, error) {
 	// ArgoCD reads bearerToken out of the Secret's "config" key. It goes only
 	// into that Secret, never a log.
 	payload, err := json.Marshal(clusterConfig{ //nolint:gosec // G117: serialising the credential here is intended
@@ -176,12 +178,12 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("encoding cluster config: %w", err)
+		return nil, nil, fmt.Errorf("encoding cluster config: %w", err)
 	}
 
 	return applycorev1.Secret(c.Name, c.Namespace).
 		WithType(corev1.SecretTypeOpaque).
-		WithData(map[string][]byte{configKey: payload}), nil
+		WithData(map[string][]byte{configKey: payload}), payload, nil
 }
 
 // ApplyRegistration writes everything except the credential and reports the
@@ -203,19 +205,26 @@ func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired
 	return hashCredential(applied), nil
 }
 
-// ApplyCredential writes the credential half.
-func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) error {
-	config, err := desired.credentialConfig()
+// ApplyCredential writes the credential half and returns a digest of exactly what
+// it published.
+//
+// The digest comes from the bytes sent rather than from any response, and that
+// distinction is the whole point. A response describes the object as it stands
+// when the server answers, which is not the same claim: another writer landing in
+// between would have its credential digested and recorded as this tool's own,
+// leaving the comparison permanently satisfied by somebody else's token.
+func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (string, error) {
+	config, payload, err := desired.credentialConfig()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, config, metav1.ApplyOptions{
 		FieldManager: FieldManagerCredential,
 		Force:        true,
 	}); err != nil {
-		return fmt.Errorf("applying credential for %s/%s: %w", desired.Namespace, desired.Name, err)
+		return "", fmt.Errorf("applying credential for %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
-	return nil
+	return hashConfig(payload), nil
 }
 
 // hashCredential digests the credential half of a Secret as it currently stands
@@ -240,6 +249,12 @@ func hashCredential(secret *corev1.Secret) string {
 	if parsed.BearerToken == "" {
 		return ""
 	}
+	return hashConfig(raw)
+}
+
+// hashConfig digests a credential payload. Shared so that what is recorded and
+// what is observed are always measured the same way.
+func hashConfig(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

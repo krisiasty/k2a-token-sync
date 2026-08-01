@@ -44,7 +44,7 @@ func TestApplyProducesArgoCDClusterSecret(t *testing.T) {
 	desired.TokenExpiresAt = expires
 	desired.ServingCertExpiresAt = now.Add(200 * 24 * time.Hour)
 
-	if err := ApplyCredential(ctx, client, desired); err != nil {
+	if _, err := ApplyCredential(ctx, client, desired); err != nil {
 		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
 	}
 	if _, err := ApplyRegistration(ctx, client, desired); err != nil {
@@ -118,7 +118,7 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	client := newClient()
 
 	desired := testSecret()
-	if err := ApplyCredential(ctx, client, desired); err != nil {
+	if _, err := ApplyCredential(ctx, client, desired); err != nil {
 		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
 	}
 
@@ -448,7 +448,7 @@ func TestHashCredential(t *testing.T) {
 		client := newClient()
 		desired := testSecret()
 		mutate(&desired)
-		if err := ApplyCredential(ctx, client, desired); err != nil {
+		if _, err := ApplyCredential(ctx, client, desired); err != nil {
 			t.Fatalf("ApplyCredential returned unexpected error: %v", err)
 		}
 		secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
@@ -494,5 +494,74 @@ func TestHashCredential(t *testing.T) {
 		if got := hashCredential(tc.secret); got != "" {
 			t.Errorf("%s hashed to %q, want the empty string that means no credential", tc.name, got)
 		}
+	}
+}
+
+// Publishing a credential takes two calls, and something can write between them.
+//
+// If the digest recorded as "mine" came from the second call's response, that
+// writer's credential would be adopted as this tool's own and the comparison
+// would be satisfied by it from then on — the detection defeated precisely when
+// it is needed. So ApplyCredential reports what it sent, and only the observation
+// comes from the response.
+func TestTheRecordedDigestIsWhatWasSentNotWhatCameBack(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	client := newClient()
+	desired := testSecret()
+
+	written, err := ApplyCredential(ctx, client, desired)
+	if err != nil {
+		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
+	}
+	if written == "" {
+		t.Fatal("ApplyCredential reported no digest for a credential it published")
+	}
+
+	// Another writer replaces the credential before the registration apply runs.
+	intruder := `{"bearerToken":"not-the-token-this-tool-minted","tlsClientConfig":{"insecure":false}}`
+	secret, err := client.CoreV1().Secrets("argocd").Get(ctx, desired.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("reading the secret back: %v", err)
+	}
+	secret.Data["config"] = []byte(intruder)
+	if _, err := client.CoreV1().Secrets("argocd").Update(ctx, secret, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("simulating another writer: %v", err)
+	}
+
+	observed, err := ApplyRegistration(ctx, client, desired)
+	if err != nil {
+		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
+	}
+
+	if observed == written {
+		t.Fatal("the two calls reported the same digest; this test is no longer simulating interference")
+	}
+	if observed != hashConfig([]byte(intruder)) {
+		t.Errorf("the observation is %q, want the intruder's credential — the response reports what is there", observed)
+	}
+
+	// The recorded value must still identify this tool's own credential, so the
+	// next pass sees the mismatch rather than blessing the replacement.
+	if reason := NeedsRefresh(fingerprintWith(written), observed, desired, 720*time.Hour, time.Now()); reason != ReasonCredentialReplaced {
+		t.Errorf("NeedsRefresh = %q, want %q", reason, ReasonCredentialReplaced)
+	}
+	if reason := NeedsRefresh(fingerprintWith(observed), observed, desired, 720*time.Hour, time.Now()); reason == ReasonCredentialReplaced {
+		t.Error("recording the response's digest hides the replacement entirely, which is the bug this guards")
+	}
+}
+
+// fingerprintWith builds a fingerprint matching testSecret, carrying the given
+// credential digest, so only that field decides the outcome.
+func fingerprintWith(credential string) Fingerprint {
+	desired := testSecret()
+	return Fingerprint{
+		Server:         desired.Server,
+		DisplayName:    desired.DisplayName,
+		Project:        desired.Project,
+		CAHash:         HashCA(desired.CAData),
+		TokenExpiresAt: time.Now().Add(700 * time.Hour),
+		CredentialHash: credential,
 	}
 }
