@@ -33,6 +33,18 @@ import (
 // clientTimeout bounds any single downstream API call.
 const clientTimeout = 30 * time.Second
 
+// selfRenewInterval is how often k2a-token-sync replaces its own credential.
+//
+// This used to happen on every pass, which was the same thing while a pass meant
+// a day. Now that a healthy pass costs nothing and runs every few minutes, the
+// interval has to be said out loud, or the tool would mint a token every few
+// minutes per cluster for no gain at all.
+//
+// A day keeps the remaining lifetime within a day of the full selfTokenTTL, so
+// the outage k2a-token-sync can survive stays as close to that TTL as renewing
+// continuously would achieve.
+const selfRenewInterval = 24 * time.Hour
+
 // Reconciler holds the collaborators needed to reconcile a cluster.
 type Reconciler struct {
 	cfg    *config.Config
@@ -117,7 +129,9 @@ func (r *Reconciler) reconcile(
 	// cost k2a-token-sync its own credential's headroom: reaching this point proves
 	// the current credential works, which is the only precondition for replacing
 	// it.
-	r.renewSelfCredential(ctx, cluster, access, status, logger)
+	if selfCredentialDue(cluster, access.expiresAt, now) {
+		r.renewSelfCredential(ctx, cluster, access, status, logger)
+	}
 
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
 		return err
@@ -149,7 +163,7 @@ func (r *Reconciler) reconcile(
 	// authenticate to.
 	var hasCredential bool
 	if !first {
-		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
+		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
 			return r.argocdSecretError(cluster, err)
 		}
 	}
@@ -198,7 +212,7 @@ func (r *Reconciler) reconcile(
 	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
-	if _, err := argocd.ApplyRegistration(ctx, r.local, desired, now); err != nil {
+	if _, err := argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
 
@@ -428,13 +442,28 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 	return &k8s.Credentials{Token: token.Value, CA: ca, ExpiresAt: token.ExpiresAt}, nil
 }
 
+// selfCredentialDue reports whether k2a-token-sync's own credential is old enough
+// to replace.
+//
+// Nothing records when a credential was issued, so its age is inferred from what
+// is left of the requested lifetime. If the API server capped that lifetime, this
+// reads the credential as older than it is and renews sooner — the safe direction,
+// and the case that already logs a warning.
+func selfCredentialDue(cluster config.Cluster, expiresAt time.Time, now time.Time) bool {
+	if expiresAt.IsZero() {
+		// Nothing known about it. Minting establishes an expiry to reason from.
+		return true
+	}
+	return cluster.SelfTokenTTL-expiresAt.Sub(now) >= selfRenewInterval
+}
+
 // renewSelfCredential mints a replacement for k2a-token-sync's own credential using
 // the credential it currently holds, and stores it once it is proven to work.
 //
-// Renewing on every successful pass rather than at half life is deliberate: the
-// write is one API call against a Secret nothing watches, and it keeps the
-// remaining lifetime near the full TTL at all times. Renewing at half life would
-// halve the outage k2a-token-sync can survive, for no saving worth having.
+// Renewing daily rather than at half life is deliberate: the write is one API call
+// against a Secret nothing watches, and it keeps the remaining lifetime within a
+// day of the full TTL. Renewing at half life would halve the outage
+// k2a-token-sync can survive, for no saving worth having.
 //
 // The verification is what makes self-renewal safe. Overwriting a working
 // credential with a broken one would lock k2a-token-sync out of the cluster with no

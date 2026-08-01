@@ -26,7 +26,7 @@ Secret format, so this replaces the credential half of `argocd cluster add` and 
 Two paths, and keeping them apart is the whole design:
 
 - **Control path** — k2a-token-sync connects to each downstream cluster with its own narrowly-scoped credential to mint
-  ArgoCD's token. It runs once a day.
+  ArgoCD's token. Each cluster is reconciled every five minutes, and almost every pass finds nothing to do.
 - **Request path** — ArgoCD connects straight to the cluster's own endpoint with the credential k2a-token-sync published.
 
 If k2a-token-sync is down, reconciliation pauses; ArgoCD keeps working. With the default 30-day token lifetime
@@ -34,7 +34,7 @@ reissued at half life, k2a-token-sync can be down for a fortnight before anythin
 
 ```mermaid
 graph TD
-    A[k2a-token-sync] -->|control path, daily| D[stored credential per cluster]
+    A[k2a-token-sync] -->|control path, every 5m| D[stored credential per cluster]
     D --> E[downstream API server]
     E --> F[ensure argocd-manager ServiceAccount]
     F --> G[TokenRequest: 30-day token]
@@ -58,6 +58,19 @@ Per cluster, each pass:
 
 A credential is only reissued once it is past half its lifetime, or when something has drifted — so routine passes
 write nothing and do not churn ArgoCD's cluster cache.
+
+### How drift is noticed
+
+k2a-token-sync holds **no read permission** on the Secrets it writes, which is deliberate: it cannot read ArgoCD's own
+Secrets either. It therefore never watches what it published — it learns the state from what its own apply returns, since
+an apply hands back the object it produced and needs only `patch`.
+
+The consequence is worth stating plainly: something that changes those Secrets from outside is noticed at the next pass,
+not when it happens. Delete a generated Secret and it comes back within five minutes; the same goes for one emptied or
+edited by hand. That window is the reconciliation interval, and it is short precisely because an unchanged pass writes
+nothing — so there is no cost to looking often.
+
+The credential's own expiry is never at risk from this, being reissued at half its lifetime, days ahead of any deadline.
 
 ### Certificate expiry
 
@@ -83,7 +96,7 @@ Two credentials exist per cluster, and they are not interchangeable.
 | Permissions | `cluster-admin` — ArgoCD applies arbitrary manifests | four rules, see below |
 | Form | bound token (TokenRequest) | bound token (TokenRequest) |
 | Lifetime | `tokenTTL`, default 720h (30d) | `selfTokenTTL`, default 2160h (90d) |
-| Renewed | by k2a-token-sync at half life, ~15d | by k2a-token-sync every pass, ~daily |
+| Renewed | by k2a-token-sync at half life, ~15d | by k2a-token-sync daily |
 | Stored in | `cluster-<name>` in ArgoCD's namespace | `<name>-credentials` in k2a-token-sync's namespace |
 | Used by | ArgoCD, connecting straight to the endpoint | k2a-token-sync, to mint the other one |
 | Created by | k2a-token-sync | bootstrap |
@@ -102,9 +115,9 @@ mints ArgoCD's tokens and renews its own, verifying each replacement against the
 overwriting a working credential with a broken one would lock it out, and that is the one failure self-renewal could
 introduce.
 
-**The downtime budget.** `selfTokenTTL` measured from the *last successful pass*, so about 90 days by default. Nothing
-else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the cluster again — the
-`kubectl get ccon` output will say `CredentialExpired` rather than reporting a bare 401.
+**The downtime budget.** `selfTokenTTL` measured from the *last renewal*, which happens daily, so about 90 days by
+default. Nothing else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the
+cluster again — the `kubectl get ccon` output will say `CredentialExpired` rather than reporting a bare 401.
 
 **Revocation.** `TokenRequest` tokens cannot be revoked individually. Deleting the ServiceAccount invalidates all of its
 tokens, which is the only lever, and for its own identity implies bootstrapping again.
@@ -382,8 +395,8 @@ administrative credential ever moves.
 ### Never manage the credential Secrets declaratively
 
 Do **not** create `<name>-credentials` with External Secrets, an ArgoCD Application, Sealed Secrets, or anything else that
-reconciles toward a stored value. Those Secrets belong to k2a-token-sync, which rewrites each one on every pass — roughly
-daily — to keep the remaining lifetime near the full `selfTokenTTL`.
+reconciles toward a stored value. Those Secrets belong to k2a-token-sync, which rewrites each one daily to keep
+the remaining lifetime within a day of the full `selfTokenTTL`.
 
 A second writer turns that into a silent fault. Every renewal is undone on the next reconcile, so the credential stops
 advancing; about ninety days later the stored copy expires and gets pushed over a working token, and k2a-token-sync locks
@@ -440,8 +453,13 @@ kubectl -n argocd get secret cluster-downstream-1 \
   -o jsonpath='{.metadata.annotations}' | jq
 ```
 
-`k2a-token-sync.io/token-expires-at`, `k2a-token-sync.io/serving-cert-expires-at`, `k2a-token-sync.io/last-sync` and
-`k2a-token-sync.io/cluster`.
+`k2a-token-sync.io/token-expires-at`, `k2a-token-sync.io/serving-cert-expires-at` and `k2a-token-sync.io/cluster`.
+
+There is deliberately no last-sync annotation, and the omission is load-bearing. Every value written here describes
+something configured or observed, so a pass over an unchanged cluster writes nothing at all: the apply finds no
+difference, the Secret's `resourceVersion` holds still, and ArgoCD sees no event. A timestamp of the last pass would
+change every time, making every pass a write — which is what would force the interval back to something long. When a
+pass last ran is recorded in the ClusterConnection's `status.lastSyncTime` instead.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 

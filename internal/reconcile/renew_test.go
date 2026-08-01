@@ -40,6 +40,75 @@ func testCluster() config.Cluster {
 	}
 }
 
+// Renewal is gated on age because a pass is now minutes rather than a day. Get
+// this wrong in one direction and the credential is reminted every few minutes;
+// wrong in the other and it silently ages out, locking k2a-token-sync out of the
+// cluster with no way back but a human re-running bootstrap.
+func TestSelfCredentialDue(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster() // selfTokenTTL is 2160h, so 90 days
+
+	cases := []struct {
+		name      string
+		expiresIn time.Duration
+		zero      bool
+		want      bool
+	}{
+		{
+			// Nothing recorded: mint one, so there is an expiry to reason from.
+			name: "no recorded expiry",
+			zero: true,
+			want: true,
+		},
+		{
+			// Just minted. The old behaviour renewed here too, on every pass.
+			name:      "freshly minted",
+			expiresIn: 2160 * time.Hour,
+			want:      false,
+		},
+		{
+			name:      "not quite a day old",
+			expiresIn: 2160*time.Hour - 23*time.Hour,
+			want:      false,
+		},
+		{
+			name:      "a day old",
+			expiresIn: 2160*time.Hour - selfRenewInterval,
+			want:      true,
+		},
+		{
+			// The lock-out case. Whatever else is true, an aged credential must be
+			// replaced while it still works.
+			name:      "near the end of its life",
+			expiresIn: time.Hour,
+			want:      true,
+		},
+		{
+			// A capped lifetime reads as older than it is, so it renews on every
+			// pass. That is the safe direction, and it already logs a warning.
+			name:      "lifetime capped far below the request",
+			expiresIn: 30 * time.Minute,
+			want:      true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var expiresAt time.Time
+			if !tc.zero {
+				expiresAt = now.Add(tc.expiresIn)
+			}
+			if got := selfCredentialDue(cluster, expiresAt, now); got != tc.want {
+				t.Errorf("selfCredentialDue(expires in %v) = %v, want %v", tc.expiresIn, got, tc.want)
+			}
+		})
+	}
+}
+
 // mintsTokens makes a fake downstream cluster answer TokenRequest, which it does
 // not do by default.
 func mintsTokens(client *fake.Clientset, token string, expiresAt time.Time) {
