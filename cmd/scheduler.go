@@ -27,9 +27,20 @@ const (
 	// before, the next poll replaces it.
 	pollInterval = 30 * time.Second
 
-	// maxPassInterval caps how long a healthy cluster goes unreconciled, so a
-	// long-lived token still gets its serving certificate checked daily.
-	maxPassInterval = 24 * time.Hour
+	// maxPassInterval caps how long a healthy cluster goes unreconciled.
+	//
+	// It is also the worst case for noticing anything k2a-token-sync cannot watch.
+	// Holding no read permission on the Secrets it writes, it learns what ArgoCD
+	// actually has only from what its own apply returns — so a Secret deleted or
+	// emptied out of band stays that way until the next pass, however healthy the
+	// token behind it is.
+	//
+	// Minutes rather than a day because a pass on an unchanged cluster is now free:
+	// the registration apply is a genuine no-op, since nothing written in it comes
+	// from the clock, and the credential is reissued on its own schedule. What used
+	// to make frequent passes expensive was a last-sync annotation that changed
+	// every time; see registrationConfig in internal/argocd.
+	maxPassInterval = 5 * time.Minute
 
 	// minPassInterval floors the derived interval, so an aggressively capped
 	// token lifetime cannot turn the loop into a busy wait.
@@ -218,11 +229,12 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 
 // nextInterval decides when a healthy cluster is next due.
 //
-// The configured lifetime is an upper bound, not the whole story: an API server
-// may cap token lifetime via --service-account-max-token-expiration, so a
-// credential can be far shorter lived than requested. Waking at half the
-// remaining lifetime keeps a margin of one whole refresh; the daily cap means a
-// long-lived token still gets its certificate checked.
+// The cap governs any ordinary cluster, since half of even a short token's life is
+// longer than a few minutes. What the remaining lifetime still decides is the
+// pathological case: an API server may cap token lifetime via
+// --service-account-max-token-expiration, and against a token measured in minutes
+// half the remaining life is the interval that keeps a margin of one whole
+// refresh. The floor stops that from becoming a busy wait.
 func nextInterval(status v1alpha1.ClusterConnectionStatus, now time.Time) time.Duration {
 	if status.TokenExpiresAt == nil || status.TokenExpiresAt.IsZero() {
 		return maxPassInterval

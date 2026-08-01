@@ -46,7 +46,7 @@ func TestApplyProducesArgoCDClusterSecret(t *testing.T) {
 	if err := ApplyCredential(ctx, client, desired); err != nil {
 		t.Fatalf("ApplyCredential returned unexpected error: %v", err)
 	}
-	if _, err := ApplyRegistration(ctx, client, desired, now); err != nil {
+	if _, err := ApplyRegistration(ctx, client, desired); err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
 
@@ -115,7 +115,6 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 
 	ctx := t.Context()
 	client := newClient()
-	now := time.Now()
 
 	desired := testSecret()
 	if err := ApplyCredential(ctx, client, desired); err != nil {
@@ -126,7 +125,7 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	registrationOnly := testSecret()
 	registrationOnly.BearerToken = ""
 
-	hasCredential, err := ApplyRegistration(ctx, client, registrationOnly, now)
+	hasCredential, err := ApplyRegistration(ctx, client, registrationOnly)
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
@@ -151,12 +150,11 @@ func TestApplyRegistrationReportsAMissingCredential(t *testing.T) {
 
 	ctx := t.Context()
 	client := newClient()
-	now := time.Now()
 
 	desired := testSecret()
 	desired.BearerToken = ""
 
-	hasCredential, err := ApplyRegistration(ctx, client, desired, now)
+	hasCredential, err := ApplyRegistration(ctx, client, desired)
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
@@ -175,7 +173,7 @@ func TestApplyMergesExtraLabelsAndAnnotations(t *testing.T) {
 	desired.ExtraLabels = map[string]string{"env": "prod"}
 	desired.ExtraAnnotations = map[string]string{"owner": "platform"}
 
-	if _, err := ApplyRegistration(ctx, client, desired, time.Now()); err != nil {
+	if _, err := ApplyRegistration(ctx, client, desired); err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
 
@@ -191,6 +189,49 @@ func TestApplyMergesExtraLabelsAndAnnotations(t *testing.T) {
 	}
 	if secret.Labels[SecretTypeLabel] != "cluster" {
 		t.Error("extra labels overwrote the ArgoCD secret-type label")
+	}
+}
+
+// Re-applying the registration on an unchanged cluster has to be a genuine
+// no-op, or the reconciliation interval cannot be short: a write ArgoCD sees
+// every few minutes would churn its cluster cache continuously. That holds only
+// while nothing written here is derived from the clock, which a single innocuous
+// annotation — a last-sync stamp, say — would quietly undo.
+//
+// So the annotation keys are pinned. Adding one that changes on its own is then a
+// test failure rather than a slow rediscovery of why passes used to be daily.
+func TestRegistrationWritesNothingDerivedFromTheClock(t *testing.T) {
+	t.Parallel()
+
+	desired := testSecret()
+	desired.TokenExpiresAt = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	desired.ServingCertExpiresAt = time.Date(2027, 7, 31, 12, 0, 0, 0, time.UTC)
+
+	config := desired.registrationConfig()
+
+	want := map[string]bool{
+		ClusterNameAnnotation:       true,
+		TokenExpiryAnnotation:       true,
+		ServingCertExpiryAnnotation: true,
+	}
+	for key := range config.Annotations {
+		if !want[key] {
+			t.Errorf("unexpected annotation %q: if its value can change on its own, "+
+				"every pass becomes a write and an event for ArgoCD", key)
+		}
+		delete(want, key)
+	}
+	for key := range want {
+		t.Errorf("annotation %q is no longer written", key)
+	}
+
+	// Both remaining timestamps describe something observed, so they hold still
+	// between passes while the thing they describe does.
+	if got := config.Annotations[TokenExpiryAnnotation]; got != "2026-08-30T12:00:00Z" {
+		t.Errorf("token expiry annotation = %q", got)
+	}
+	if got := config.Annotations[ServingCertExpiryAnnotation]; got != "2027-07-31T12:00:00Z" {
+		t.Errorf("serving cert expiry annotation = %q", got)
 	}
 }
 
@@ -224,7 +265,7 @@ func TestNeedsRefresh(t *testing.T) {
 			name:          "nothing published yet",
 			mutate:        func(f *Fingerprint) { *f = Fingerprint{} },
 			hasCredential: true,
-			want:          ReasonMissing,
+			want:          ReasonUnrecorded,
 		},
 		{
 			// The self-healing path: someone deleted or emptied the Secret.
