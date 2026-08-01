@@ -21,12 +21,12 @@ func TestEnsureArgoCDIdentityIsIdempotent(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
 
-	changed, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
 	if err != nil {
 		t.Fatalf("first call returned unexpected error: %v", err)
 	}
-	if !changed {
-		t.Error("first call reported no change, want the identity to be created")
+	if !repairs.ServiceAccount || !repairs.Binding {
+		t.Errorf("first call reported %+v, want both created", repairs)
 	}
 
 	sa, err := client.CoreV1().ServiceAccounts("kube-system").Get(ctx, "argocd-manager", metav1.GetOptions{})
@@ -45,13 +45,65 @@ func TestEnsureArgoCDIdentityIsIdempotent(t *testing.T) {
 		t.Errorf("bound to %q, want %q", binding.RoleRef.Name, clusterAdminRole)
 	}
 
-	// A second pass must be a no-op; this runs on every reconciliation.
-	changed, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	// A second pass must be a no-op, and this now runs on every single pass rather
+	// than only when a credential is due — so a spurious "repaired" here would
+	// reissue ArgoCD's credential every five minutes, forever.
+	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
 	if err != nil {
 		t.Fatalf("second call returned unexpected error: %v", err)
 	}
-	if changed {
-		t.Error("second call reported a change, want a no-op")
+	if repairs.Any() {
+		t.Errorf("second call reported %+v, want a no-op", repairs)
+	}
+}
+
+// The two halves are reported separately because they mean different things to
+// the caller: a recreated ServiceAccount invalidates ArgoCD's token and forces a
+// reissue, a recreated binding does not.
+func TestEnsureArgoCDIdentityDistinguishesWhatItRepaired(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+
+	if _, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager"); err != nil {
+		t.Fatalf("setup returned unexpected error: %v", err)
+	}
+
+	// Someone deletes the binding but leaves the account: the token ArgoCD holds
+	// still authenticates, it has simply lost its permissions.
+	if err := client.RbacV1().ClusterRoleBindings().
+		Delete(ctx, "argocd-manager-role-binding", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting the binding: %v", err)
+	}
+
+	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	if err != nil {
+		t.Fatalf("EnsureArgoCDIdentity returned unexpected error: %v", err)
+	}
+	if repairs.ServiceAccount {
+		t.Error("reported the serviceaccount as recreated when only the binding was missing")
+	}
+	if !repairs.Binding {
+		t.Error("did not report the binding as recreated")
+	}
+
+	// And the other way round: the account goes, the binding stays. Every token
+	// ever issued for the old account is now dead.
+	if err := client.CoreV1().ServiceAccounts("kube-system").
+		Delete(ctx, "argocd-manager", metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting the serviceaccount: %v", err)
+	}
+
+	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	if err != nil {
+		t.Fatalf("EnsureArgoCDIdentity returned unexpected error: %v", err)
+	}
+	if !repairs.ServiceAccount {
+		t.Error("did not report the serviceaccount as recreated")
+	}
+	if repairs.Binding {
+		t.Error("reported the binding as recreated when it was still there")
 	}
 }
 

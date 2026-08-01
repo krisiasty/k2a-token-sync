@@ -39,7 +39,9 @@ Per cluster, every pass:
 2. Reads the cluster CA from the `kube-root-ca.crt` ConfigMap. This is the bundle ArgoCD will be given.
 3. Probes that endpoint's TLS certificate, verifying it against the bundle just read and checking the SANs cover the
    configured address.
-4. Applies everything in the ArgoCD cluster Secret except the credential. The apply's response is also how it learns
+4. Checks that the `argocd-manager` ServiceAccount and its `cluster-admin` binding are still there, restoring either if
+   it is not. Two reads when nothing is wrong.
+5. Applies everything in the ArgoCD cluster Secret except the credential. The apply's response is also how it learns
    whether ArgoCD still holds one, since it cannot read that Secret. Nothing changed means nothing written.
 
 Step 3 is not what establishes that the endpoint works — step 1 already did. That connection goes to the same address,
@@ -56,13 +58,20 @@ During bootstrap the same probe genuinely is a pre-flight. There the administrat
 management proxy at an entirely different address, so nothing has touched the direct endpoint yet — which is why it is
 checked before any identity is created.
 
+Step 4 runs every pass rather than only when a credential is due, because ArgoCD's identity is the one thing this tool
+depends on that a person can delete, and the damage is otherwise invisible. A bound token carries the ServiceAccount's
+UID, so deleting that account stops every token issued for it from authenticating — including the one ArgoCD is holding
+— while the published Secret still contains a bearer token and still matches what was recorded. Checked only at reissue,
+that would have gone unnoticed for the two weeks until the next one, with the log reporting the credential as current
+throughout. A recreated ServiceAccount therefore forces an immediate reissue; a recreated binding does not, since the
+existing token still authenticates and has simply regained its permissions.
+
 ArgoCD's credential is reissued only once it is past half its lifetime, or when something it depends on has drifted —
 so the great majority of passes stop there, having written nothing at all. When one is due, the pass continues:
 
-1. Ensures the `argocd-manager` ServiceAccount and its `cluster-admin` binding exist, creating them if absent. This is
-   the same identity `argocd cluster add` installs.
-2. Mints a bound token via the TokenRequest API, honouring whatever lifetime the API server grants.
-3. Writes the credential, then re-applies the registration. That order means ArgoCD never sees a cluster it cannot
+1. Mints a bound token via the TokenRequest API for that identity — the same one `argocd cluster add` installs —
+   honouring whatever lifetime the API server grants.
+2. Writes the credential, then re-applies the registration. That order means ArgoCD never sees a cluster it cannot
    authenticate to, not even briefly between two applies. It re-reads cluster Secrets on every reconcile, so credentials
    swap with no restart of any ArgoCD component.
 
@@ -571,4 +580,8 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
   actually granted rather than what was asked for, so a capped cluster works; it just has a shorter downtime budget.
 - k2a-token-sync cannot detect a generated Secret left behind by a cluster removed while it was down, because it holds no
   `list` permission in ArgoCD's namespace. Cleanup is a documented step.
+- ArgoCD's credential is never exercised. Its validity is inferred from the TokenRequest API having issued it, and from
+  the identity behind it still existing, which is checked every pass. What cannot be checked from here is the request
+  path itself: whether ArgoCD, from where it runs, can reach the endpoint and authenticate. Nothing on the control path
+  observes that.
 - No metrics endpoint. `/status` and the objects' own status carry the same information for now.

@@ -137,6 +137,27 @@ func (r *Reconciler) reconcile(
 		r.renewSelfCredential(ctx, cluster, access, status, logger, now)
 	}
 
+	// Every pass, not only when a credential is due. ArgoCD's identity is the one
+	// thing this tool depends on that a person can delete, and until this ran on
+	// every pass the damage was invisible: the published Secret still carried a
+	// bearer token, the fingerprint still matched, and the log went on reporting
+	// the credential as current for the fortnight until the next reissue — while
+	// ArgoCD had been failing since the moment the ServiceAccount went away.
+	//
+	// Two reads when nothing is wrong, which is the whole cost.
+	repairs, err := downstream.EnsureArgoCDIdentity(ctx, access.client,
+		cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
+	if err != nil {
+		return err
+	}
+	if repairs.Any() {
+		logger.Warn("ArgoCD's downstream identity was missing and has been restored",
+			"serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+			"recreated_serviceaccount", repairs.ServiceAccount,
+			"recreated_binding", repairs.Binding,
+		)
+	}
+
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
 		return err
 	}
@@ -174,6 +195,14 @@ func (r *Reconciler) reconcile(
 	}
 
 	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
+	if repairs.ServiceAccount {
+		// Outranks anything the published state comparison concluded: that compares
+		// what was written against what is wanted, and both can look perfect while
+		// the token itself is dead. A new ServiceAccount has a new UID, so every
+		// token bound to the old one — including ArgoCD's — stopped authenticating
+		// when it was deleted.
+		reason = argocd.ReasonIdentityRecreated
+	}
 	if reason == "" {
 		status.LastAction = "up-to-date"
 
@@ -191,16 +220,6 @@ func (r *Reconciler) reconcile(
 			"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 		)
 		return nil
-	}
-
-	created, err := downstream.EnsureArgoCDIdentity(ctx, access.client,
-		cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
-	if err != nil {
-		return err
-	}
-	if created {
-		logger.Info("provisioned ArgoCD identity in downstream cluster",
-			"serviceaccount", cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name)
 	}
 
 	token, err := downstream.MintToken(ctx, access.client,
