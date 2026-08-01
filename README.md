@@ -292,11 +292,11 @@ kubectl delete ccon standalone-1
 kubectl -n argocd delete secret cluster-standalone-1     # not done for you
 ```
 
-Deleting the object stops maintenance. It deliberately does **not** delete the generated Secret: k2a-token-sync holds no
-delete permission in ArgoCD's namespace, so removing a registration ArgoCD is actively using stays an explicit act. Left
-alone, the credential in it expires within `tokenTTL`.
+Deleting the ClusterConnection (ccon) object stops maintenance. It deliberately does **not** delete the generated Secret:
+k2a-token-sync holds no delete permission in ArgoCD's namespace, so removing a registration ArgoCD is actively using
+stays an explicit act. Left alone, the credential in it expires within `tokenTTL`.
 
-Two more objects outlive the connection, and can be removed once ArgoCD no longer needs the cluster: the
+Two more objects outlive the ClusterConnection, and can be removed once ArgoCD no longer needs the cluster: the
 `argocd-manager` and `k2a-token-sync` ServiceAccounts downstream, along with their bindings.
 
 With no `list` permission in ArgoCD's namespace, k2a-token-sync cannot detect a Secret left behind by a connection
@@ -338,18 +338,24 @@ Output is grouped by cluster, because "where did that happen" is the first quest
 them. Registering the cluster ArgoCD itself runs on is a normal case, and the second heading then says "the same cluster
 as above" rather than leaving you to compare two addresses.
 
-In order: resolve both clusters before changing anything; read the cluster CA; **probe the endpoint** and refuse if its
-certificate does not cover it; install the two identities; store the credential; use that credential once against the
-endpoint to prove the whole path works; apply the ClusterConnection.
+**The bootstrap does, in order:**
+
+- resolve both clusters before changing anything;
+- read the cluster CA;
+- **probe the endpoint** and refuse if its certificate does not cover it;
+- install the two identities;
+- store the credential;
+- use that credential once against the endpoint to prove the whole path works;
+- apply the ClusterConnection.
 
 The pre-flight is there because a certificate that does not cover the endpoint is the most common reason direct access
 fails, and it is far cheaper to learn before two identities exist than after. The verification is a warning rather than
 an error — the endpoint may be reachable from the cluster k2a-token-sync runs on but not from your desk.
 
 Downstream access is a **file**, not a context: files are what you can copy off a control-plane node.
-`--from-kubeconfig` takes one, `--from-context` selects within it or within your ambient kubeconfig. Separate files are
-supported on purpose, because merging kubeconfigs is unsafe when both define the same context name for different
-clusters.
+`--from-kubeconfig` takes a path to a file with downstream cluster kubeconfig, `--from-context` selects context within it
+or within your ambient kubeconfig. Separate files are supported on purpose, because merging kubeconfigs is unsafe when
+both define the same context name for different clusters.
 
 The credential never passes through your terminal — it goes from the downstream cluster into k2a-token-sync's namespace
 directly. Progress goes to stderr, so `--print` can send the manifest to stdout without anything else in the way.
@@ -407,18 +413,18 @@ the remaining lifetime within a day of the full `selfTokenTTL`.
 
 A second writer turns that into a silent fault. Every renewal is undone on the next reconcile, so the credential stops
 advancing; about ninety days later the stored copy expires and gets pushed over a working token, and k2a-token-sync locks
-itself out of the cluster. The symptom appears a quarter after the cause.
+itself out of the cluster. The symptom appears three months after the cause.
 
 There is also nothing to gain. The credential is disposable: it is regenerated in seconds by re-running bootstrap, and
 k2a-token-sync replaces it daily regardless, so a vaulted copy is stale almost immediately. What deserves protecting is
-the administrative kubeconfig bootstrap consumes — which you already manage somewhere.
+the administrative kubeconfig bootstrap consumes — which you should already manage somewhere.
 
 ## Deployment paths
 
-Two shapes work, and they differ only in who applies the chart.
+Two methods work, and they differ only in who applies the chart.
 
 **Helm or Ansible, then bootstrap.** Install the chart, then run bootstrap once per cluster. Nothing per-cluster lives in
-git; the inventory lives in the API, which is what moving it out of a ConfigMap was for.
+git; the inventory lives in the API.
 
 **ArgoCD owns the chart, then bootstrap.** An Application deploys the chart from git — CRD, RBAC, Deployment, no secrets,
 fully declarative. Bootstrap still runs out-of-band, because the credential cannot be in git.
