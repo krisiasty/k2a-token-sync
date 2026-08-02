@@ -11,6 +11,9 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -75,9 +78,9 @@ func NewClient(dyn dynamic.Interface, namespace string) *Client {
 
 // List returns every ClusterConnection in the namespace, resolved into clusters.
 //
-// Entries whose spec cannot be resolved are returned with InvalidReason set. A
-// second entry claiming a name or secretName already taken is likewise reported
-// rather than dropped, since admission cannot see cross-object conflicts.
+// Entries whose spec cannot be resolved are returned with InvalidReason set,
+// rather than dropped, since admission cannot see cross-object conflicts and a
+// cluster vanishing from the inventory over a typo is the worst outcome.
 func (c *Client) List(ctx context.Context) ([]Entry, error) {
 	list, err := c.resource.List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -85,33 +88,76 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 	}
 
 	entries := make([]Entry, 0, len(list.Items))
-	secretOwners := make(map[string]string, len(list.Items))
-
 	for i := range list.Items {
 		entry, err := decode(&list.Items[i])
 		if err != nil {
 			// A malformed object is reported against its own name and skipped.
 			// There is nothing to write status to if it does not even decode.
-			entries = append(entries, Entry{
+			entry = Entry{
 				Cluster:       config.Cluster{Name: list.Items[i].GetName()},
 				InvalidReason: err.Error(),
-			})
-			continue
+			}
 		}
-
-		// Two connections writing one Secret would silently overwrite each
-		// other, so the second one to be seen is held back instead.
-		if owner, taken := secretOwners[entry.Cluster.SecretName]; taken {
-			entry.InvalidReason = fmt.Sprintf("secretName %q is already maintained by %q",
-				entry.Cluster.SecretName, owner)
-		} else if entry.InvalidReason == "" {
-			secretOwners[entry.Cluster.SecretName] = entry.Cluster.Name
-		}
-
 		entries = append(entries, entry)
 	}
 
+	blockContestedSecrets(entries)
 	return entries, nil
+}
+
+// blockContestedSecrets holds back every claimant when two or more connections
+// resolve to the same Secret.
+//
+// The obvious alternative — let the first one seen keep it — reads as though it
+// protects the incumbent, and does the opposite. List order is not an ownership
+// boundary: it is alphabetical, so adding a connection whose name happens to sort
+// earlier makes the newcomer the owner. It would then publish its own endpoint and
+// credential over a Secret another cluster is still registered under, while the
+// dispossessed one is quietly excluded from reconciliation, its status frozen at
+// whatever it last said. ArgoCD would go on trusting a registration that now points
+// somewhere else entirely.
+//
+// There is no answer to "which of these should win" that this tool can safely
+// invent, so it declines to choose. Nothing is written until a person removes the
+// ambiguity, which costs a stalled cluster and saves a misdirected one.
+func blockContestedSecrets(entries []Entry) {
+	claimants := make(map[string][]string, len(entries))
+	for _, entry := range entries {
+		if entry.InvalidReason != "" || entry.Cluster.SecretName == "" {
+			continue
+		}
+		claimants[entry.Cluster.SecretName] = append(claimants[entry.Cluster.SecretName], entry.Cluster.Name)
+	}
+
+	for i := range entries {
+		contenders := claimants[entries[i].Cluster.SecretName]
+		if entries[i].InvalidReason != "" || len(contenders) < 2 {
+			continue
+		}
+
+		others := make([]string, 0, len(contenders)-1)
+		for _, name := range contenders {
+			if name != entries[i].Cluster.Name {
+				others = append(others, name)
+			}
+		}
+		// Sorted so the message reads the same however the API returned the list;
+		// it is written into status, where a value that reshuffles on its own would
+		// look like something changed.
+		sort.Strings(others)
+
+		entries[i].InvalidReason = fmt.Sprintf(
+			"secretName %q is also claimed by %s; none of them will be reconciled until one claim remains",
+			entries[i].Cluster.SecretName, strings.Join(quoted(others), ", "))
+	}
+}
+
+func quoted(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, strconv.Quote(name))
+	}
+	return out
 }
 
 // UpdateStatus writes the status subresource for one connection.

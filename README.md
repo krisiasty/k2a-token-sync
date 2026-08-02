@@ -272,8 +272,15 @@ spec:
 it so it cannot drift from the API.
 
 Two things a schema cannot check are checked by k2a-token-sync and reported on the object: a name long enough to make the
-Secret names derived from it invalid, and two connections claiming one `secretName` — which would have them silently
+Secret names derived from it invalid, and two connections claiming one `secretName`, which would have them silently
 overwrite each other.
+
+A contested `secretName` stops **every** claimant, not just the newcomer. Picking one would mean picking by list order,
+which is alphabetical and has nothing to do with ownership: a connection added later but named earlier would take over a
+Secret another cluster is registered under, republish it against its own endpoint, and leave the dispossessed one
+excluded from reconciliation with its status frozen. ArgoCD would go on trusting a registration now pointing somewhere
+else. There is no answer to which claimant should win that this tool can safely invent, so it declines to choose and
+writes nothing until one claim remains. That stalls a cluster; the alternative misdirects one.
 
 ### Adding a cluster
 
