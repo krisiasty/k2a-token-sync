@@ -49,8 +49,11 @@ func newFakeInventory(names ...string) *fakeInventory {
 }
 
 // readyStatus is a status of the kind a previous process would have left in the
-// API: the cluster reconciled, and said so.
-func readyStatus(generation int64) v1alpha1.ClusterConnectionStatus {
+// API: the cluster reconciled, and said so. It describes generation 1, so it goes
+// stale the moment a test edits the spec.
+func readyStatus() v1alpha1.ClusterConnectionStatus {
+	const generation = int64(1)
+
 	return v1alpha1.ClusterConnectionStatus{
 		ObservedGeneration: generation,
 		LastAction:         "up-to-date",
@@ -309,7 +312,7 @@ func TestReadinessWaitsForAPassInThisProcess(t *testing.T) {
 	t.Parallel()
 
 	inv := newFakeInventory("restarted")
-	inv.prior["restarted"] = readyStatus(1) // what the previous process left behind
+	inv.prior["restarted"] = readyStatus() // what the previous process left behind
 	rec := newFakeReconciler()
 	s := testScheduler(t, inv, rec)
 	free := fillPool(t, s)
@@ -321,7 +324,7 @@ func TestReadinessWaitsForAPassInThisProcess(t *testing.T) {
 	if s.health.isReady() {
 		t.Error("ready before this process reconciled anything, on the strength of a status it only read")
 	}
-	if report := s.report(); report[0].Synced {
+	if published := s.health.report().Clusters; published[0].Synced {
 		t.Error("a cluster reads as synced although its first pass has not run")
 	}
 
@@ -339,7 +342,7 @@ func TestReadinessDropsUntilAnEditedSpecHasReconciled(t *testing.T) {
 	t.Parallel()
 
 	inv := newFakeInventory("edited")
-	inv.prior["edited"] = readyStatus(1)
+	inv.prior["edited"] = readyStatus()
 	rec := newFakeReconciler()
 	s := testScheduler(t, inv, rec)
 
@@ -351,7 +354,7 @@ func TestReadinessDropsUntilAnEditedSpecHasReconciled(t *testing.T) {
 
 	inv.mu.Lock()
 	inv.generation = 2
-	inv.prior["edited"] = readyStatus(1) // status still describes generation 1
+	inv.prior["edited"] = readyStatus() // still describes generation 1
 	inv.mu.Unlock()
 
 	rec.holdAll("edited")
@@ -364,6 +367,108 @@ func TestReadinessDropsUntilAnEditedSpecHasReconciled(t *testing.T) {
 	s.wg.Wait()
 	if !s.health.isReady() {
 		t.Error("not ready after the edited spec reconciled")
+	}
+}
+
+// The snapshot must be built and published without letting go of the lock in
+// between, which is the only thing that orders two completions publishing at once.
+//
+// This asserts the mechanism rather than the symptom, because the symptom is a
+// narrow interleaving that a test cannot reliably provoke — the check below it
+// caught the old structure roughly once in ten runs. healthState's clock is the
+// way in: record reads it, so a probe installed there runs at exactly the moment
+// the snapshot is being published, and can ask whether the scheduler's lock is
+// still held. TryLock is not how production code should ever ask that; here the
+// question is the point of the test.
+func TestASnapshotIsBuiltAndPublishedWithoutReleasingTheLock(t *testing.T) {
+	t.Parallel()
+
+	s := testScheduler(t, newFakeInventory("c"), newFakeReconciler())
+
+	probed := make(chan bool, 4)
+	s.health.now = func() time.Time {
+		if s.mu.TryLock() {
+			s.mu.Unlock()
+			probed <- false
+		} else {
+			probed <- true
+		}
+		return time.Now()
+	}
+
+	s.publish()
+
+	select {
+	case held := <-probed:
+		if !held {
+			t.Error("the snapshot was published with the lock released; a completion in that gap " +
+				"can publish a newer snapshot that this one then overwrites")
+		}
+	default:
+		t.Fatal("nothing was published")
+	}
+}
+
+// What several passes finishing at once must leave behind is the newest view of
+// the fleet, not whichever view happened to be published last.
+//
+// Building a snapshot and publishing it used to be separate synchronised steps,
+// so two completions could build in one order and publish in the other. The
+// older snapshot then stayed on display until something else published, which
+// for readiness means reporting a fleet as ready moments after a cluster in it
+// failed.
+//
+// This cannot force the interleaving, and against the old structure it caught it
+// in about one run in ten even repeated twenty times over. It stands as the
+// end-state check — once every pass has finished, what is published has to agree
+// with what happened — with the test above it pinning the mechanism outright.
+func TestConcurrentCompletionsLeaveTheNewestSnapshotPublished(t *testing.T) {
+	t.Parallel()
+
+	names := []string{"a-fails", "b-ok", "c-ok", "d-ok", "e-ok", "f-ok"}
+	inv := newFakeInventory(names...)
+	for _, name := range names {
+		inv.prior[name] = readyStatus()
+	}
+	s := testScheduler(t, inv, &failingReconciler{fail: map[string]bool{"a-fails": true}})
+
+	// Repeated, because a single round catches an ordering slip only when the pass
+	// holding the stale snapshot happens to be the last one to publish, and the
+	// window it needs is a lock handoff wide.
+	for round := range 20 {
+		s.mu.Lock()
+		for _, state := range s.state {
+			state.dueAt = time.Now().Add(-time.Minute)
+		}
+		s.mu.Unlock()
+
+		s.tick(t.Context())
+		s.wg.Wait()
+
+		published := s.health.report()
+		byName := make(map[string]clusterReport, len(published.Clusters))
+		for _, report := range published.Clusters {
+			byName[report.Name] = report
+		}
+		for _, name := range names {
+			report, ok := byName[name]
+			if !ok {
+				t.Fatalf("round %d: %s is missing from the published snapshot", round, name)
+			}
+			if name == "a-fails" {
+				if report.Synced || report.Error == "" {
+					t.Fatalf("round %d: the failed cluster reads as synced=%v error=%q",
+						round, report.Synced, report.Error)
+				}
+				continue
+			}
+			if !report.Synced {
+				t.Fatalf("round %d: %s reconciled, but the published snapshot predates its pass", round, name)
+			}
+		}
+		if published.Ready {
+			t.Fatalf("round %d: ready although one cluster's pass failed", round)
+		}
 	}
 }
 

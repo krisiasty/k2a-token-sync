@@ -221,7 +221,7 @@ func (s *scheduler) tick(ctx context.Context) {
 	s.dispatch(ctx)
 
 	s.health.recordPoll()
-	s.health.record(s.report(), s.nextDueIn())
+	s.publish()
 }
 
 // refresh reconciles the in-memory schedule with the objects in the API.
@@ -369,7 +369,7 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	// publishes its own result — on the way out of either branch, since a pass that
 	// failed is the one worth seeing. Without this /status and readiness would lag
 	// a whole poll behind the work they describe.
-	defer func() { s.health.record(s.report(), s.nextDueIn()) }()
+	defer s.publish()
 
 	s.mu.Lock()
 	// Claimed at dispatch, checked again here, because the two can be a slot's
@@ -470,14 +470,30 @@ func nextInterval(status v1alpha1.ClusterConnectionStatus, now time.Time) time.D
 	return max(min(maxPassInterval, half), minPassInterval)
 }
 
-// nextDueIn is how long until the earliest scheduled reconciliation.
+// publish hands /status and /readyz a fresh snapshot of the schedule.
+//
+// Building the snapshot and publishing it happen under one hold of the lock, and
+// that is the whole point of the method existing. Two passes finishing at once
+// could otherwise build their snapshots in one order and publish them in the
+// other, leaving the older of the two on display until something else published —
+// which for readiness means reporting a fleet as ready after a cluster in it has
+// just failed.
+//
+// The lock is held across the call into healthState, which has a lock of its own.
+// That ordering is safe because nothing in healthState calls back into the
+// scheduler; it only stores what it is handed.
+func (s *scheduler) publish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.health.record(s.reportLocked(), s.nextDueInLocked())
+}
+
+// nextDueInLocked is how long until the earliest scheduled reconciliation. The
+// caller holds the lock.
 //
 // A cluster whose pass is running is skipped: its dueAt belongs to the pass that
 // has already started and would otherwise read as permanently overdue.
-func (s *scheduler) nextDueIn() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *scheduler) nextDueInLocked() time.Duration {
 	now := s.now()
 	next := maxPassInterval
 	for _, state := range s.state {
@@ -491,11 +507,8 @@ func (s *scheduler) nextDueIn() time.Duration {
 	return max(next, 0)
 }
 
-// report renders the current state for /status.
-func (s *scheduler) report() []clusterReport {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+// reportLocked renders the current state for /status. The caller holds the lock.
+func (s *scheduler) reportLocked() []clusterReport {
 	out := make([]clusterReport, 0, len(s.state))
 	for _, state := range s.state {
 		report := clusterReport{
