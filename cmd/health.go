@@ -168,7 +168,7 @@ func (s *healthState) report() statusReport {
 	}
 }
 
-func runHealthServer(ctx context.Context, logger *slog.Logger, port string, state *healthState, cancel context.CancelFunc) {
+func newHealthHandler(logger *slog.Logger, state *healthState, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) {
@@ -197,6 +197,20 @@ func runHealthServer(ctx context.Context, logger *slog.Logger, port string, stat
 			logger.Warn("writing status response failed", "error", err)
 		}
 	})
+
+	mux.Handle("/metrics", metricsHandler)
+	return mux
+}
+
+func runHealthServer(
+	ctx context.Context,
+	logger *slog.Logger,
+	port string,
+	state *healthState,
+	metricsHandler http.Handler,
+	cancel context.CancelFunc,
+) {
+	mux := newHealthHandler(logger, state, metricsHandler)
 
 	srv := &http.Server{Addr: ":" + port, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 

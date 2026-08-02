@@ -59,7 +59,7 @@ type Config struct {
 	// per-cluster setting.
 	ArgoCDNamespace string
 
-	// HealthPort serves /livez, /readyz and /status.
+	// HealthPort serves /livez, /readyz, /status and /metrics.
 	HealthPort string
 }
 
