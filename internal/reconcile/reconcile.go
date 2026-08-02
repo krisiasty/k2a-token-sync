@@ -100,9 +100,49 @@ func (r *Reconciler) Cluster(
 	}
 
 	status.LastSyncTime = &metav1.Time{Time: now}
+
+	// The pass did its work, so ArgoCD is served — but saying Ready while this
+	// tool is a few hours from losing the cluster for good would put the only
+	// warning that matters behind a condition nobody is alerting on. Ready holds
+	// until a failing renewal is actually running out; below that it is the honest
+	// answer to "is this connection all right".
+	if reason, message, failing := selfCredentialThreatensAccess(cluster, status, now); failing {
+		setCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, message, generation)
+		return status, nil
+	}
+
 	setCondition(&status, v1alpha1.ConditionReady, metav1.ConditionTrue, v1alpha1.ReasonReady,
 		"ArgoCD holds a current credential for this cluster", generation)
 	return status, nil
+}
+
+// selfCredentialThreatensAccess reports whether renewal is failing *and* the
+// credential in use is running out — two facts that are unremarkable apart and
+// serious together.
+func selfCredentialThreatensAccess(
+	cluster config.Cluster,
+	status v1alpha1.ClusterConnectionStatus,
+	now time.Time,
+) (reason, message string, failing bool) {
+	if !meta.IsStatusConditionFalse(status.Conditions, v1alpha1.ConditionSelfCredentialValid) {
+		return "", "", false
+	}
+
+	var issuedAt, expiresAt time.Time
+	if status.SelfCredentialIssuedAt != nil {
+		issuedAt = status.SelfCredentialIssuedAt.Time
+	}
+	if status.SelfCredentialExpiresAt != nil {
+		expiresAt = status.SelfCredentialExpiresAt.Time
+	}
+	if !selfCredentialCritical(cluster, issuedAt, expiresAt, now) {
+		return "", "", false
+	}
+
+	return v1alpha1.ReasonSelfCredentialExpiring, fmt.Sprintf(
+		"ArgoCD still holds a usable credential, but k2a-token-sync cannot renew its own and that expires %s, "+
+			"in %s; see the SelfCredentialValid condition",
+		expiresAt.UTC().Format(time.RFC3339), expiresAt.Sub(now).Round(time.Minute)), true
 }
 
 func (r *Reconciler) reconcile(
@@ -129,13 +169,7 @@ func (r *Reconciler) reconcile(
 	// cost k2a-token-sync its own credential's headroom: reaching this point proves
 	// the current credential works, which is the only precondition for replacing
 	// it.
-	var selfIssuedAt time.Time
-	if status.SelfCredentialIssuedAt != nil {
-		selfIssuedAt = status.SelfCredentialIssuedAt.Time
-	}
-	if selfCredentialDue(cluster, selfIssuedAt, access.expiresAt, now) {
-		r.renewSelfCredential(ctx, cluster, access, status, logger, now)
-	}
+	r.maintainSelfCredential(ctx, cluster, access, status, logger, now)
 
 	// Every pass, not only when a credential is due. ArgoCD's identity is the one
 	// thing this tool depends on that a person can delete, and until this ran on
@@ -576,6 +610,86 @@ func (r *Reconciler) verifyForArgoCD(
 	return nil
 }
 
+// maintainSelfCredential keeps k2a-token-sync's own credential fresh and, more
+// importantly, says so on the object either way.
+//
+// Renewal used to fail in silence: a warning in the log, the pass carrying on,
+// Ready=True. That is defensible for one failure and indefensible for a hundred,
+// because each one spends a little more of a lifetime that cannot be recovered
+// once gone. Nothing outside the log recorded that the clock was running, so the
+// first visible symptom would have been a cluster that could no longer be reached
+// and could only be bootstrapped again by hand.
+//
+// The pass deliberately does not fail. The credential in hand still works, so
+// ArgoCD's own registration should still be maintained with it — abandoning that
+// work would turn a problem with this tool's credential into an outage of the
+// thing it exists to serve. Carrying on also keeps the ordinary five-minute
+// cadence, which retries renewal sooner than the failure backoff would.
+func (r *Reconciler) maintainSelfCredential(
+	ctx context.Context,
+	cluster config.Cluster,
+	access *clusterAccess,
+	status *v1alpha1.ClusterConnectionStatus,
+	logger *slog.Logger,
+	now time.Time,
+) {
+	var issuedAt time.Time
+	if status.SelfCredentialIssuedAt != nil {
+		issuedAt = status.SelfCredentialIssuedAt.Time
+	}
+
+	if !selfCredentialDue(cluster, issuedAt, access.expiresAt, now) {
+		setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionTrue, v1alpha1.ReasonReady,
+			"current, and not yet due for renewal", status.ObservedGeneration)
+		return
+	}
+
+	reason, err := r.renewSelfCredential(ctx, cluster, access, status, logger, now)
+	if err == nil {
+		setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionTrue, v1alpha1.ReasonReady,
+			"renewed", status.ObservedGeneration)
+		return
+	}
+
+	remaining := access.expiresAt.Sub(now)
+	message := fmt.Sprintf("%v; the credential in use expires %s, in %s, after which this cluster has to be "+
+		"bootstrapped again", err, access.expiresAt.UTC().Format(time.RFC3339), remaining.Round(time.Minute))
+	setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionFalse, reason,
+		message, status.ObservedGeneration)
+
+	// Severity follows what is left, not what went wrong. The same failure is
+	// unremarkable with eighty days in hand and an emergency with two hours.
+	if selfCredentialCritical(cluster, issuedAt, access.expiresAt, now) {
+		logger.Error("cannot renew k2a-token-sync's own credential, and it is running out",
+			"expires_at", access.expiresAt.UTC().Format(time.RFC3339),
+			"remaining", remaining.Round(time.Minute).String(),
+			"error", err)
+		return
+	}
+	logger.Warn("could not renew k2a-token-sync's own credential; the current one still works",
+		"expires_at", access.expiresAt.UTC().Format(time.RFC3339),
+		"remaining", remaining.Round(time.Minute).String(),
+		"error", err)
+}
+
+// selfCredentialCritical reports whether a continuing renewal failure now
+// threatens access rather than merely freshness.
+//
+// A quarter of the granted lifetime is the headroom, floored at one renewal
+// interval so that a credential the API server capped short is treated as urgent
+// straight away — a token granted two hours has no comfortable margin at all, and
+// waiting for a proportional one would mean waiting until it was nearly gone.
+func selfCredentialCritical(cluster config.Cluster, issuedAt, expiresAt, now time.Time) bool {
+	if expiresAt.IsZero() {
+		return false
+	}
+	granted := cluster.SelfTokenTTL
+	if !issuedAt.IsZero() {
+		granted = expiresAt.Sub(issuedAt)
+	}
+	return expiresAt.Sub(now) < max(granted/4, selfRenewInterval)
+}
+
 // selfCredentialDue reports whether k2a-token-sync's own credential is old enough
 // to replace.
 //
@@ -622,14 +736,12 @@ func (r *Reconciler) renewSelfCredential(
 	status *v1alpha1.ClusterConnectionStatus,
 	logger *slog.Logger,
 	now time.Time,
-) {
+) (string, error) {
 	namespace := cluster.ServiceAccount.Namespace
 
 	token, err := downstream.MintToken(ctx, access.client, namespace, cluster.SelfServiceAccountName, cluster.SelfTokenTTL)
 	if err != nil {
-		logger.Warn("could not renew k2a-token-sync's own credential; the current one still works",
-			"expires_at", formatTime(status.SelfCredentialExpiresAt), "error", err)
-		return
+		return v1alpha1.ReasonRenewalMintFailed, fmt.Errorf("minting a replacement credential: %w", err)
 	}
 
 	granted := token.ExpiresAt.Sub(now)
@@ -642,12 +754,10 @@ func (r *Reconciler) renewSelfCredential(
 
 	probe, err := r.clientForToken(cluster.ServerURL(), token.Value, access.ca)
 	if err != nil {
-		logger.Warn("could not build a client for the renewed credential; keeping the current one", "error", err)
-		return
+		return v1alpha1.ReasonRenewalUnverified, fmt.Errorf("building a client for the replacement credential: %w", err)
 	}
 	if _, err := downstream.ClusterCA(ctx, probe, namespace); err != nil {
-		logger.Warn("the renewed credential does not work; keeping the current one", "error", err)
-		return
+		return v1alpha1.ReasonRenewalUnverified, fmt.Errorf("the replacement credential does not work: %w", err)
 	}
 
 	if err := k8s.WriteCredentials(ctx, r.local, r.cfg.Namespace, cluster.CredentialsSecretName(),
@@ -656,8 +766,7 @@ func (r *Reconciler) renewSelfCredential(
 			"app.kubernetes.io/managed-by": "k2a-token-sync",
 			"k2a-token-sync.io/cluster":    cluster.Name,
 		}); err != nil {
-		logger.Warn("could not store the renewed credential; keeping the current one", "error", err)
-		return
+		return v1alpha1.ReasonRenewalNotStored, fmt.Errorf("storing the replacement credential: %w", err)
 	}
 
 	// Both, and only once the credential is stored. Recording an issue time for a
@@ -665,13 +774,7 @@ func (r *Reconciler) renewSelfCredential(
 	status.SelfCredentialExpiresAt = &metav1.Time{Time: token.ExpiresAt}
 	status.SelfCredentialIssuedAt = &metav1.Time{Time: now}
 	logger.Debug("renewed k2a-token-sync's own credential", "expires_at", token.ExpiresAt.UTC().Format(time.RFC3339))
-}
-
-func formatTime(t *metav1.Time) string {
-	if t == nil {
-		return "unknown"
-	}
-	return t.UTC().Format(time.RFC3339)
+	return "", nil
 }
 
 // ClientFromCredentials builds a client for a downstream cluster from a stored

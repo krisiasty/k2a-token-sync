@@ -15,6 +15,17 @@ const (
 	// covering the endpoint name, and not near expiry.
 	ConditionServingCertificateValid = "ServingCertificateValid"
 
+	// ConditionSelfCredentialValid reports whether k2a-token-sync is still able to
+	// renew its own credential for this cluster.
+	//
+	// Separate from Ready because the two can genuinely disagree, and for a long
+	// time. Renewal failing does not stop ArgoCD working: the credential in hand
+	// keeps minting ArgoCD's tokens until it expires. What it does mean is that a
+	// clock is running, and at the end of it only a person re-running bootstrap can
+	// restore access. That deserves to be visible from the first failure rather
+	// than at the end.
+	ConditionSelfCredentialValid = "SelfCredentialValid" //nolint:gosec // a condition type, not a credential
+
 	// ConditionConflict reports that another ClusterConnection claims the same
 	// secretName. Admission cannot see this, since it spans objects.
 	ConditionConflict = "Conflict"
@@ -32,6 +43,19 @@ const (
 	ReasonCredentialReplaced  = "CredentialReplaced" //nolint:gosec // a condition reason, not a credential
 	ReasonSecretNameConflict  = "SecretNameConflict"
 	ReasonInvalidSpec         = "InvalidSpec"
+
+	// The three ways renewing k2a-token-sync's own credential can fail. They are
+	// distinct because they point at different places: the downstream cluster's
+	// RBAC or API server, the credential the API server just issued, and this
+	// tool's own namespace.
+	ReasonRenewalMintFailed = "RenewalMintFailed"
+	ReasonRenewalUnverified = "RenewalUnverified"
+	ReasonRenewalNotStored  = "RenewalNotStored"
+
+	// ReasonSelfCredentialExpiring means renewal has been failing long enough that
+	// the credential in use is running out. Access to the cluster is at stake, not
+	// just freshness.
+	ReasonSelfCredentialExpiring = "SelfCredentialExpiring" //nolint:gosec // a condition reason, not a credential
 )
 
 // ClusterConnection declares how to reach one downstream cluster, how to
@@ -46,6 +70,7 @@ const (
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.spec.endpoint`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Self Valid",type=string,JSONPath=`.status.conditions[?(@.type=="SelfCredentialValid")].status`
 // A date column is rendered by kubectl as time *elapsed*, which is negative for
 // anything in the future and prints as "<invalid>". Both of these are expiries,
 // so they are strings and show the timestamp itself. Age below is a real date

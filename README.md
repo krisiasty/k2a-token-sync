@@ -133,6 +133,14 @@ mints ArgoCD's tokens and renews its own, verifying each replacement against the
 overwriting a working credential with a broken one would lock it out, and that is the one failure self-renewal could
 introduce.
 
+**When renewal fails.** The credential in hand keeps working, so ArgoCD is unaffected and the pass carries on
+publishing as normal — abandoning that work would turn a problem with this tool's credential into an outage of the thing
+it exists to serve. What changes is that the `SelfCredentialValid` condition goes `False` from the very first failure,
+naming which step failed and when the credential in use runs out. Renewal is retried on every pass, five minutes apart.
+Once the remaining lifetime falls below a quarter of what was granted — or below one renewal interval, whichever is
+longer, so a credential the API server capped short counts as urgent immediately — `Ready` goes `False` too, because at
+that point the question is no longer freshness but whether this cluster is about to need bootstrapping by hand.
+
 **The downtime budget.** `selfTokenTTL` measured from the *last renewal*, which happens daily, so about 90 days by
 default. Nothing else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the
 cluster again — the `kubectl get ccon` output will say `CredentialExpired` rather than reporting a bare 401.
@@ -472,14 +480,18 @@ Per-cluster state is on the objects themselves, which is the readable view:
 
 ```console
 $ kubectl -n k2a-token-sync get ccon
-NAME           ENDPOINT                    READY   TOKEN EXPIRES          SELF EXPIRES           CERT DAYS   AGE
-downstream-1   10.0.0.10:6443              True    2026-08-31T16:25:26Z   2026-10-30T16:25:26Z   364         12d
-standalone-1   cluster2.example.com:6443   True    2026-08-24T09:12:44Z   2026-10-30T17:01:09Z   211         12d
-standalone-2   10.2.0.10:6443              False   <none>                 <none>                 <none>      2m
+NAME           ENDPOINT         READY   SELF VALID   TOKEN EXPIRES          SELF EXPIRES           CERT DAYS   AGE
+downstream-1   10.0.0.10:6443   True    True         2026-08-31T16:25:26Z   2026-10-30T16:25:26Z   364         12d
+standalone-1   10.0.1.10:6443   True    False        2026-08-24T09:12:44Z   2026-10-30T17:01:09Z   211         12d
+standalone-2   10.2.0.10:6443   False   <none>       <none>                 <none>                 <none>      2m
 ```
 
 Both expiries are timestamps rather than "in 29 days" for a reason worth knowing if you ever add a column: kubectl
 renders a date column as time *elapsed*, which for anything in the future is negative and prints as `<invalid>`.
+
+`SELF VALID` is the one to watch when everything else looks fine: `standalone-1` above is serving ArgoCD perfectly well
+while k2a-token-sync has lost the ability to renew its own credential, which is a problem with a deadline rather than a
+symptom.
 
 When a cluster is not `Ready`, three things answer it, in this order. The listing above says which cluster and for how
 long. `kubectl describe ccon <name>` gives the reason — `AwaitingCredential` for one that has not been bootstrapped,

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -139,14 +141,14 @@ func TestSelfCredentialDueWithoutARecordedIssueTime(t *testing.T) {
 
 // mintsTokens makes a fake downstream cluster answer TokenRequest, which it does
 // not do by default.
-func mintsTokens(client *fake.Clientset, token string, expiresAt time.Time) {
+func mintsTokens(client *fake.Clientset, expiresAt time.Time) {
 	client.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		if action.GetSubresource() != "token" {
 			return false, nil, nil
 		}
 		return true, &authenticationv1.TokenRequest{
 			Status: authenticationv1.TokenRequestStatus{
-				Token:               token,
+				Token:               newToken,
 				ExpirationTimestamp: metav1.NewTime(expiresAt),
 			},
 		}, nil
@@ -200,7 +202,7 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 
 	local := fake.NewClientset(storedCredential(expires))
 	downstreamClient := fake.NewClientset(rootCA())
-	mintsTokens(downstreamClient, newToken, time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC))
+	mintsTokens(downstreamClient, time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC))
 
 	// The verification client cannot read the CA, standing in for a token the API
 	// server will not accept.
@@ -213,7 +215,9 @@ func TestRenewalThatFailsVerificationKeepsTheWorkingCredential(t *testing.T) {
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
 
-	r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now())
+	if _, err := r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now()); err != nil {
+		t.Logf("renewal reported: %v", err)
+	}
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -245,7 +249,7 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 
 	local := fake.NewClientset(storedCredential(oldExpiry))
 	downstreamClient := fake.NewClientset(rootCA())
-	mintsTokens(downstreamClient, newToken, newExpiry)
+	mintsTokens(downstreamClient, newExpiry)
 
 	r := newReconciler(local, func() (kubernetes.Interface, error) {
 		return fake.NewClientset(rootCA()), nil
@@ -256,7 +260,9 @@ func TestRenewalStoresAVerifiedCredential(t *testing.T) {
 	}
 	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: oldExpiry}
 
-	r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now())
+	if _, err := r.renewSelfCredential(ctx, cluster, access, &status, r.logger, r.now()); err != nil {
+		t.Logf("renewal reported: %v", err)
+	}
 
 	creds, err := k8s.ReadCredentials(ctx, local, testNamespace, cluster.CredentialsSecretName())
 	if err != nil {
@@ -327,5 +333,213 @@ func TestAccessAcceptsACredentialWithNoRecordedExpiry(t *testing.T) {
 	}
 	if !access.expiresAt.IsZero() {
 		t.Errorf("expiresAt = %v, want zero", access.expiresAt)
+	}
+}
+
+// failsTo makes one verb against one resource return an error, standing in for
+// the RBAC and API-server failures that renewal actually meets.
+func failsTo(client *fake.Clientset, verb, resource string, message string) {
+	client.PrependReactor(verb, resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New(message)
+	})
+}
+
+// Every way renewal can fail has to reach the object, not just the log. A failure
+// that only warns spends the credential's remaining lifetime in silence, and the
+// first visible symptom is a cluster that can no longer be reached at all.
+func TestRenewalFailuresAreRecordedOnTheObject(t *testing.T) {
+	t.Parallel()
+
+	// Two hours left of a lifetime that was granted as four: past the quarter that
+	// counts as comfortable, so every one of these is the urgent flavour.
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	issued := now.Add(-2 * time.Hour)
+	expires := now.Add(2 * time.Hour)
+
+	cases := []struct {
+		name       string
+		breaks     func(local *fake.Clientset, downstreamClient *fake.Clientset)
+		verifyWith func() (kubernetes.Interface, error)
+		wantReason string
+	}{
+		{
+			// No permission to mint, or the API server refusing: the usual shape of
+			// a downstream RBAC problem.
+			name: "cannot mint a replacement",
+			breaks: func(_ *fake.Clientset, downstreamClient *fake.Clientset) {
+				failsTo(downstreamClient, "create", "serviceaccounts", "serviceaccounts/token is forbidden")
+			},
+			verifyWith: func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil },
+			wantReason: v1alpha1.ReasonRenewalMintFailed,
+		},
+		{
+			// Minted, but it does not work — the case that must never overwrite a
+			// credential that does.
+			name:       "the replacement does not work",
+			breaks:     func(_ *fake.Clientset, _ *fake.Clientset) {},
+			verifyWith: func() (kubernetes.Interface, error) { return fake.NewClientset(), nil },
+			wantReason: v1alpha1.ReasonRenewalUnverified,
+		},
+		{
+			// Minted and verified, but this tool cannot write its own namespace.
+			name: "cannot store the replacement",
+			breaks: func(local *fake.Clientset, _ *fake.Clientset) {
+				failsTo(local, "update", "secrets", "secrets is forbidden")
+				failsTo(local, "create", "secrets", "secrets is forbidden")
+			},
+			verifyWith: func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil },
+			wantReason: v1alpha1.ReasonRenewalNotStored,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cluster := testCluster()
+			cluster.SelfTokenTTL = 4 * time.Hour
+
+			local := fake.NewClientset(storedCredential(expires))
+			downstreamClient := fake.NewClientset(rootCA())
+			mintsTokens(downstreamClient, now.Add(4*time.Hour))
+			tc.breaks(local, downstreamClient)
+
+			r := newReconciler(local, tc.verifyWith)
+			r.now = func() time.Time { return now }
+
+			status := v1alpha1.ClusterConnectionStatus{
+				SelfCredentialExpiresAt: &metav1.Time{Time: expires},
+				SelfCredentialIssuedAt:  &metav1.Time{Time: issued},
+			}
+			access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
+
+			r.maintainSelfCredential(t.Context(), cluster, access, &status, r.logger, now)
+
+			condition := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSelfCredentialValid)
+			if condition == nil {
+				t.Fatal("renewal failed without saying so on the object")
+			}
+			if condition.Status != metav1.ConditionFalse {
+				t.Errorf("SelfCredentialValid = %s, want False", condition.Status)
+			}
+			// The reason has to name the step, since the three point at different
+			// places: downstream RBAC, the credential just issued, and this tool's
+			// own namespace.
+			if condition.Reason != tc.wantReason {
+				t.Errorf("reason = %q, want %q", condition.Reason, tc.wantReason)
+			}
+			if !strings.Contains(condition.Message, "bootstrapped again") {
+				t.Errorf("the message does not say what the end of this is: %q", condition.Message)
+			}
+
+			// The working credential must survive every one of these.
+			creds, err := k8s.ReadCredentials(t.Context(), local, testNamespace, cluster.CredentialsSecretName())
+			if err != nil {
+				t.Fatalf("reading the stored credential back: %v", err)
+			}
+			if creds.Token != oldToken {
+				t.Errorf("stored token = %q, want the working credential %q left alone", creds.Token, oldToken)
+			}
+			if status.SelfCredentialIssuedAt.Time != issued {
+				t.Error("a failed renewal moved the issue time, which would age out a credential that still works")
+			}
+
+			// Two hours left of four: Ready must stop claiming everything is fine.
+			_, _, threatened := selfCredentialThreatensAccess(cluster, status, now)
+			if !threatened {
+				t.Error("Ready would still report healthy with the credential two hours from expiry")
+			}
+		})
+	}
+}
+
+// The same failure is unremarkable with most of the lifetime left. Ready stays
+// true, because ArgoCD genuinely is still being served, while the dedicated
+// condition carries the bad news.
+func TestAFailingRenewalWithHeadroomDoesNotUnsettleReady(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster() // selfTokenTTL is 2160h
+	issued := now.Add(-25 * time.Hour)
+	expires := issued.Add(2160 * time.Hour) // 89 days still to run
+
+	local := fake.NewClientset(storedCredential(expires))
+	downstreamClient := fake.NewClientset(rootCA())
+	failsTo(downstreamClient, "create", "serviceaccounts", "serviceaccounts/token is forbidden")
+
+	r := newReconciler(local, func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil })
+	r.now = func() time.Time { return now }
+
+	status := v1alpha1.ClusterConnectionStatus{
+		SelfCredentialExpiresAt: &metav1.Time{Time: expires},
+		SelfCredentialIssuedAt:  &metav1.Time{Time: issued},
+	}
+	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
+
+	r.maintainSelfCredential(t.Context(), cluster, access, &status, r.logger, now)
+
+	if !meta.IsStatusConditionFalse(status.Conditions, v1alpha1.ConditionSelfCredentialValid) {
+		t.Error("a failing renewal was not reported at all")
+	}
+	if _, _, threatened := selfCredentialThreatensAccess(cluster, status, now); threatened {
+		t.Error("Ready was pulled down with 89 days of credential left, which is not yet a threat to access")
+	}
+}
+
+// A credential the API server capped short has no comfortable margin to wait for,
+// so proportional headroom is not enough on its own.
+func TestACappedLifetimeIsUrgentImmediately(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster() // asks for 2160h
+
+	// Granted two hours, and only just issued: three quarters of it still to run.
+	issued := now.Add(-15 * time.Minute)
+	expires := now.Add(105 * time.Minute)
+
+	if !selfCredentialCritical(cluster, issued, expires, now) {
+		t.Error("a two-hour credential was treated as having comfortable headroom")
+	}
+
+	// The same proportion of a ninety-day credential is not urgent at all.
+	longIssued := now.Add(-22 * 24 * time.Hour)
+	longExpires := now.Add(68 * 24 * time.Hour)
+	if selfCredentialCritical(cluster, longIssued, longExpires, now) {
+		t.Error("68 days of remaining credential was treated as urgent")
+	}
+}
+
+// Renewal that succeeds must clear the condition, or one bad afternoon would
+// leave the object complaining forever.
+func TestASuccessfulRenewalClearsTheCondition(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster()
+	issued := now.Add(-25 * time.Hour)
+	expires := now.Add(2000 * time.Hour)
+
+	local := fake.NewClientset(storedCredential(expires))
+	downstreamClient := fake.NewClientset(rootCA())
+	mintsTokens(downstreamClient, now.Add(2160*time.Hour))
+
+	r := newReconciler(local, func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil })
+	r.now = func() time.Time { return now }
+
+	status := v1alpha1.ClusterConnectionStatus{
+		SelfCredentialExpiresAt: &metav1.Time{Time: expires},
+		SelfCredentialIssuedAt:  &metav1.Time{Time: issued},
+	}
+	// Left over from an earlier failure.
+	setCondition(&status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionFalse,
+		v1alpha1.ReasonRenewalMintFailed, "an earlier failure", 1)
+
+	access := &clusterAccess{client: downstreamClient, ca: testCA, expiresAt: expires}
+	r.maintainSelfCredential(t.Context(), cluster, access, &status, r.logger, now)
+
+	if !meta.IsStatusConditionTrue(status.Conditions, v1alpha1.ConditionSelfCredentialValid) {
+		t.Error("a successful renewal left the object still reporting a failure")
 	}
 }
