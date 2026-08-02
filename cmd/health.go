@@ -23,6 +23,7 @@ type clusterReport struct {
 	SyncedAt                 time.Time `json:"syncedAt,omitzero"`
 	DueAt                    time.Time `json:"dueAt,omitzero"`
 	TokenExpiresAt           time.Time `json:"tokenExpiresAt,omitzero"`
+	SelfCredentialExpiresAt  time.Time `json:"selfCredentialExpiresAt,omitzero"`
 	ServingCertExpiresAt     time.Time `json:"servingCertExpiresAt,omitzero"`
 	ServingCertDaysRemaining int32     `json:"servingCertDaysRemaining,omitempty"`
 }

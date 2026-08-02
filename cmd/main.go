@@ -98,7 +98,7 @@ func runSync(logger *slog.Logger) error {
 
 	state := newHealthState()
 	telemetry := newRuntimeTelemetry(logger)
-	metricsHandler := newMetricsHandler(telemetry)
+	metricsHandler := newMetricsHandler(state)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()

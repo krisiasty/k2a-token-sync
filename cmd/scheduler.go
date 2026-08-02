@@ -806,6 +806,9 @@ func (s *scheduler) reportLocked() []clusterReport {
 		if state.status.TokenExpiresAt != nil {
 			report.TokenExpiresAt = state.status.TokenExpiresAt.Time
 		}
+		if state.status.SelfCredentialExpiresAt != nil {
+			report.SelfCredentialExpiresAt = state.status.SelfCredentialExpiresAt.Time
+		}
 		if state.status.ServingCertExpiresAt != nil {
 			report.ServingCertExpiresAt = state.status.ServingCertExpiresAt.Time
 		}

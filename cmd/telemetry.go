@@ -111,12 +111,6 @@ func (t *runtimeTelemetry) sample() {
 	t.maximum = t.maximum.maxima(values)
 }
 
-func (t *runtimeTelemetry) snapshot() (runtimeValues, runtimeValues) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.current, t.maximum
-}
-
 // takeReport returns a consistent interval and starts the next interval at the
 // current values. A scrape racing this reset sees either complete interval.
 func (t *runtimeTelemetry) takeReport() (runtimeValues, runtimeValues) {

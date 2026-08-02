@@ -2,109 +2,107 @@ package main
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-type runtimeMetricDefinition struct {
-	current *prometheus.Desc
-	maximum *prometheus.Desc
-	value   func(runtimeValues) float64
+// clusterCollector exports the per-cluster facts worth alerting on.
+//
+// It reads the same snapshot /status serves, so the two cannot disagree, and it
+// reads it at scrape time rather than caching: whatever the last pass established
+// is what a scrape sees.
+//
+// Deliberately absent is anything about this process's own memory or goroutines.
+// The Go and process collectors registered alongside already export all of it,
+// and export it better — read at scrape time rather than from a sample up to a
+// second old. What only this tool knows is the state of the credentials it
+// maintains, and that is what these are.
+type clusterCollector struct {
+	state *healthState
+
+	ready         *prometheus.Desc
+	tokenExpiry   *prometheus.Desc
+	selfExpiry    *prometheus.Desc
+	servingExpiry *prometheus.Desc
+	lastSync      *prometheus.Desc
 }
 
-// runtimeTelemetryCollector exports the same sampled values as the periodic
-// log. The interval maxima reset after each log; Prometheus retains their time
-// series and can aggregate them over longer windows.
-type runtimeTelemetryCollector struct {
-	telemetry *runtimeTelemetry
-	metrics   []runtimeMetricDefinition
-}
-
-func newRuntimeTelemetryCollector(telemetry *runtimeTelemetry) *runtimeTelemetryCollector {
-	definition := func(name, maximumName, help string, value func(runtimeValues) float64) runtimeMetricDefinition {
-		return runtimeMetricDefinition{
-			current: prometheus.NewDesc(name, "Current "+help+".", nil, nil),
-			maximum: prometheus.NewDesc(maximumName, "Maximum sampled "+help+" since the previous telemetry log.", nil, nil),
-			value:   value,
-		}
-	}
-
-	return &runtimeTelemetryCollector{
-		telemetry: telemetry,
-		metrics: []runtimeMetricDefinition{
-			definition(
-				"k2a_token_sync_runtime_uptime_seconds",
-				"k2a_token_sync_runtime_uptime_interval_max_seconds",
-				"process uptime in seconds",
-				func(v runtimeValues) float64 { return v.uptime.Seconds() },
-			),
-			definition(
-				"k2a_token_sync_runtime_goroutines",
-				"k2a_token_sync_runtime_goroutines_interval_max",
-				"number of live goroutines",
-				func(v runtimeValues) float64 { return float64(v.goroutines) },
-			),
-			definition(
-				"k2a_token_sync_runtime_os_threads",
-				"k2a_token_sync_runtime_os_threads_interval_max",
-				"number of live OS threads owned by the Go runtime",
-				func(v runtimeValues) float64 { return float64(v.osThreads) },
-			),
-			definition(
-				"k2a_token_sync_runtime_heap_alloc_bytes",
-				"k2a_token_sync_runtime_heap_alloc_interval_max_bytes",
-				"bytes occupied by allocated heap objects",
-				func(v runtimeValues) float64 { return float64(v.heapAllocBytes) },
-			),
-			definition(
-				"k2a_token_sync_runtime_heap_inuse_bytes",
-				"k2a_token_sync_runtime_heap_inuse_interval_max_bytes",
-				"bytes in heap spans that contain objects",
-				func(v runtimeValues) float64 { return float64(v.heapInuseBytes) },
-			),
-			definition(
-				"k2a_token_sync_runtime_stack_inuse_bytes",
-				"k2a_token_sync_runtime_stack_inuse_interval_max_bytes",
-				"bytes reserved for goroutine stacks",
-				func(v runtimeValues) float64 { return float64(v.stackInuseBytes) },
-			),
-			definition(
-				"k2a_token_sync_runtime_reserved_bytes",
-				"k2a_token_sync_runtime_reserved_interval_max_bytes",
-				"bytes of read-write memory mapped by the Go runtime",
-				func(v runtimeValues) float64 { return float64(v.runtimeReservedBytes) },
-			),
-			definition(
-				"k2a_token_sync_runtime_heap_objects",
-				"k2a_token_sync_runtime_heap_objects_interval_max",
-				"number of live or not-yet-swept heap objects",
-				func(v runtimeValues) float64 { return float64(v.heapObjects) },
-			),
-		},
+func newClusterCollector(state *healthState) *clusterCollector {
+	label := []string{"cluster"}
+	return &clusterCollector{
+		state: state,
+		ready: prometheus.NewDesc(
+			"k2a_token_sync_cluster_ready",
+			"Whether ArgoCD holds a current registration for this cluster, 1 or 0.",
+			label, nil),
+		tokenExpiry: prometheus.NewDesc(
+			"k2a_token_sync_cluster_token_expiration_timestamp_seconds",
+			"When the credential published to ArgoCD for this cluster expires.",
+			label, nil),
+		selfExpiry: prometheus.NewDesc(
+			"k2a_token_sync_cluster_self_credential_expiration_timestamp_seconds",
+			"When k2a-token-sync's own credential for this cluster expires. Past this it cannot mint, and only bootstrap restores access.",
+			label, nil),
+		servingExpiry: prometheus.NewDesc(
+			"k2a_token_sync_cluster_serving_cert_expiration_timestamp_seconds",
+			"When the serving certificate observed at this cluster's endpoint expires.",
+			label, nil),
+		lastSync: prometheus.NewDesc(
+			"k2a_token_sync_cluster_last_sync_timestamp_seconds",
+			"When a pass last completed for this cluster.",
+			label, nil),
 	}
 }
 
-func (c *runtimeTelemetryCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, metric := range c.metrics {
-		ch <- metric.current
-		ch <- metric.maximum
+func (c *clusterCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, d := range []*prometheus.Desc{c.ready, c.tokenExpiry, c.selfExpiry, c.servingExpiry, c.lastSync} {
+		ch <- d
 	}
 }
 
-func (c *runtimeTelemetryCollector) Collect(ch chan<- prometheus.Metric) {
-	current, maximum := c.telemetry.snapshot()
-	for _, metric := range c.metrics {
-		ch <- prometheus.MustNewConstMetric(metric.current, prometheus.GaugeValue, metric.value(current))
-		ch <- prometheus.MustNewConstMetric(metric.maximum, prometheus.GaugeValue, metric.value(maximum))
+func (c *clusterCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, report := range c.state.report().Clusters {
+		gauge(ch, c.ready, boolAsFloat(report.Synced), report.Name)
+		timestamp(ch, c.tokenExpiry, report.TokenExpiresAt, report.Name)
+		timestamp(ch, c.selfExpiry, report.SelfCredentialExpiresAt, report.Name)
+		timestamp(ch, c.servingExpiry, report.ServingCertExpiresAt, report.Name)
+		timestamp(ch, c.lastSync, report.SyncedAt, report.Name)
 	}
 }
 
-func newMetricsHandler(telemetry *runtimeTelemetry) http.Handler {
+func gauge(ch chan<- prometheus.Metric, desc *prometheus.Desc, value float64, labels ...string) {
+	ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, value, labels...)
+}
+
+// timestamp exports a deadline as seconds since the epoch, and exports nothing at
+// all when there is no deadline to report.
+//
+// Absolute rather than "seconds remaining", because remaining is only true at the
+// instant it is scraped, while `expiration_timestamp_seconds - time()` is correct
+// whenever the query runs. Omitting the unknown matters more: a zero would read as
+// 1970 and fire every expiry alert at once for a cluster that has simply never
+// published yet.
+func timestamp(ch chan<- prometheus.Metric, desc *prometheus.Desc, at time.Time, labels ...string) {
+	if at.IsZero() {
+		return
+	}
+	gauge(ch, desc, float64(at.Unix()), labels...)
+}
+
+func boolAsFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func newMetricsHandler(state *healthState) http.Handler {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
-		newRuntimeTelemetryCollector(telemetry),
+		newClusterCollector(state),
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 	)

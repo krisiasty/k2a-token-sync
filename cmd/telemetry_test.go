@@ -4,15 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
@@ -54,7 +49,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 	now = startedAt.Add(6 * time.Second)
 	telemetry.sample()
 
-	current, maximum := telemetry.snapshot()
+	current, maximum := telemetry.current, telemetry.maximum
 	if current != (runtimeValues{
 		uptime:               6 * time.Second,
 		goroutines:           8,
@@ -84,7 +79,7 @@ func TestRuntimeTelemetryTracksAndResetsIntervalMaxima(t *testing.T) {
 	if reportedCurrent != current || reportedMaximum != maximum {
 		t.Fatalf("report = (%+v, %+v), want (%+v, %+v)", reportedCurrent, reportedMaximum, current, maximum)
 	}
-	_, resetMaximum := telemetry.snapshot()
+	resetMaximum := telemetry.maximum
 	if resetMaximum != current {
 		t.Fatalf("maximum after report = %+v, want current %+v", resetMaximum, current)
 	}
@@ -132,57 +127,6 @@ func TestRuntimeTelemetryLogContainsCurrentAndMaximumGroups(t *testing.T) {
 	}
 }
 
-func TestMetricsEndpointExportsCurrentAndIntervalMaximum(t *testing.T) {
-	telemetry := &runtimeTelemetry{
-		current: runtimeValues{
-			uptime: 7*time.Second + 500*time.Millisecond, goroutines: 5, osThreads: 3,
-			heapAllocBytes: 100, heapInuseBytes: 150, stackInuseBytes: 20,
-			runtimeReservedBytes: 300, heapObjects: 11,
-		},
-		maximum: runtimeValues{
-			uptime: 8 * time.Second, goroutines: 9, osThreads: 4,
-			heapAllocBytes: 120, heapInuseBytes: 180, stackInuseBytes: 25,
-			runtimeReservedBytes: 350, heapObjects: 13,
-		},
-		initialized: true,
-	}
-	handler := newHealthHandler(
-		slog.New(slog.DiscardHandler),
-		newHealthState(),
-		newMetricsHandler(telemetry),
-	)
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
-	handler.ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-	if contentType := recorder.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
-		t.Fatalf("Content-Type = %q", contentType)
-	}
-
-	body := recorder.Body.String()
-	for _, metric := range []string{
-		"k2a_token_sync_runtime_uptime_seconds 7.5",
-		"k2a_token_sync_runtime_uptime_interval_max_seconds 8",
-		"k2a_token_sync_runtime_goroutines 5",
-		"k2a_token_sync_runtime_goroutines_interval_max 9",
-		"k2a_token_sync_runtime_os_threads 3",
-		"k2a_token_sync_runtime_heap_alloc_bytes 100",
-		"k2a_token_sync_runtime_heap_inuse_bytes 150",
-		"k2a_token_sync_runtime_stack_inuse_bytes 20",
-		"k2a_token_sync_runtime_reserved_bytes 300",
-		"k2a_token_sync_runtime_heap_objects 11",
-		"go_goroutines ",
-		"process_start_time_seconds ",
-	} {
-		if !strings.Contains(body, metric) {
-			t.Errorf("metrics response does not contain %q", metric)
-		}
-	}
-}
-
 func TestReadRuntimeValues(t *testing.T) {
 	values := readRuntimeValues()
 	if values.goroutines == 0 {
@@ -202,7 +146,7 @@ func TestReadRuntimeValues(t *testing.T) {
 	}
 }
 
-func TestTelemetrySamplingReportingAndCollectionAreConcurrentSafe(t *testing.T) {
+func TestTelemetrySamplingAndReportingAreConcurrentSafe(t *testing.T) {
 	var value atomic.Uint64
 	telemetry := &runtimeTelemetry{
 		logger:    slog.New(slog.DiscardHandler),
@@ -218,10 +162,6 @@ func TestTelemetrySamplingReportingAndCollectionAreConcurrentSafe(t *testing.T) 
 	}
 	telemetry.sample()
 
-	collector := newRuntimeTelemetryCollector(telemetry)
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(collector)
-
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		for range 100 {
@@ -233,14 +173,28 @@ func TestTelemetrySamplingReportingAndCollectionAreConcurrentSafe(t *testing.T) 
 			telemetry.takeReport()
 		}
 	})
-	wg.Go(func() {
-		for range 100 {
-			if _, err := registry.Gather(); err != nil {
-				t.Errorf("gather metrics: %v", err)
-			}
-		}
-	})
 	wg.Wait()
+
+	// The invariant the locking exists to hold: a maximum is only ever raised by a
+	// sample, and reset to the sample it was reset at, so it can never end up
+	// behind the current value. A torn read or a lost update shows up here.
+	current, maximum := telemetry.current, telemetry.maximum
+	for _, field := range []struct {
+		name             string
+		current, maximum uint64
+	}{
+		{"goroutines", current.goroutines, maximum.goroutines},
+		{"os_threads", current.osThreads, maximum.osThreads},
+		{"heap_alloc_bytes", current.heapAllocBytes, maximum.heapAllocBytes},
+		{"heap_inuse_bytes", current.heapInuseBytes, maximum.heapInuseBytes},
+		{"stack_inuse_bytes", current.stackInuseBytes, maximum.stackInuseBytes},
+		{"runtime_reserved_bytes", current.runtimeReservedBytes, maximum.runtimeReservedBytes},
+		{"heap_objects", current.heapObjects, maximum.heapObjects},
+	} {
+		if field.maximum < field.current {
+			t.Errorf("%s: maximum %d is behind current %d", field.name, field.maximum, field.current)
+		}
+	}
 }
 
 func TestTelemetryIntervals(t *testing.T) {
