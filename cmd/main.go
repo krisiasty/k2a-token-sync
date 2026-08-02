@@ -97,11 +97,16 @@ func runSync(logger *slog.Logger) error {
 	}
 
 	state := newHealthState()
+	telemetry := newRuntimeTelemetry(logger)
+	metricsHandler := newMetricsHandler(state)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	wg.Go(func() {
-		runHealthServer(ctx, logger, cfg.HealthPort, state, stop)
+		telemetry.run(ctx)
+	})
+	wg.Go(func() {
+		runHealthServer(ctx, logger, cfg.HealthPort, state, metricsHandler, stop)
 	})
 
 	logger.Info("starting k2a-token-sync",
@@ -109,6 +114,8 @@ func runSync(logger *slog.Logger) error {
 		"namespace", cfg.Namespace,
 		"argocd_namespace", cfg.ArgoCDNamespace,
 		"poll_interval", pollInterval.String(),
+		"telemetry_sample_interval", telemetrySampleInterval.String(),
+		"telemetry_report_interval", telemetryReportInterval.String(),
 	)
 
 	newScheduler(

@@ -195,7 +195,7 @@ helm install k2a-token-sync ./charts/k2a-token-sync \
 | `image.repository` | `ghcr.io/krisiasty/k2a-token-sync` | Image repository |
 | `image.tag` | **required** | Released version to deploy, e.g. `v0.10.0`. Rendering fails if unset |
 | `argocdNamespace` | `argocd` | Namespace of the ArgoCD instance served; all cluster Secrets go here |
-| `health.port` | `8080` | Port for `/livez`, `/readyz` and `/status` |
+| `health.port` | `8080` | Port for `/livez`, `/readyz`, `/status` and `/metrics` |
 
 There is nothing here about clusters, and that is the point: the inventory lives in the API, so adding one needs no
 release upgrade.
@@ -261,7 +261,7 @@ k2a-token-sync takes three settings from the environment. Everything else about 
 | --- | --- | --- | --- |
 | `POD_NAMESPACE` | yes | | Namespace k2a-token-sync runs in; its inventory and credentials live here |
 | `ARGOCD_NAMESPACE` | no | `argocd` | Namespace of the ArgoCD instance served |
-| `HEALTH_PORT` | no | `8080` | Port for `/livez`, `/readyz` and `/status` |
+| `HEALTH_PORT` | no | `8080` | Port for `/livez`, `/readyz`, `/status` and `/metrics` |
 
 One instance serves one ArgoCD, so `ARGOCD_NAMESPACE` is a process setting rather than a per-cluster one. Point a
 second release at a second ArgoCD if you need that.
@@ -487,6 +487,7 @@ prunes only what it tracks.
 | `/livez` | Liveness — fails if the reconciliation loop has stalled |
 | `/readyz` | Readiness — passes once every cluster in the inventory has reconciled in *this* process |
 | `/status` | JSON detail per cluster, including observed certificate expiry. Carries no credential material |
+| `/metrics` | Prometheus metrics: per-cluster deadlines, plus the standard Go and process collectors |
 
 ### What liveness actually checks
 
@@ -550,6 +551,35 @@ written here describes something configured or observed, so a pass over an uncha
 apply finds no difference, the Secret's `resourceVersion` holds still, and ArgoCD sees no event. A timestamp of the
 last pass would change every time, making every pass a write — which is what would force the interval back to something
 long. When a pass last ran is recorded in the ClusterConnection's `status.lastSyncTime` instead.
+
+Runtime telemetry is sampled every second. Every ten minutes one structured log reports the current and maximum values
+seen during that interval for uptime, goroutines, OS threads, allocated and in-use heap, in-use stack, memory reserved by
+the Go runtime and live heap objects. The interval maximum resets after it is logged. That log is for reading after the
+fact, when there is no query engine to ask.
+
+`/metrics` deliberately does not restate any of it. The standard Go and process collectors registered there export every
+one of those numbers already, and export them read at scrape time rather than from a sample up to a second old. What the
+endpoint adds is what nothing else knows — one series per cluster, labelled `cluster`:
+
+| Metric | Meaning |
+| --- | --- |
+| `k2a_token_sync_cluster_ready` | 1 when ArgoCD holds a current registration, 0 otherwise |
+| `k2a_token_sync_cluster_token_expiration_timestamp_seconds` | when the credential published to ArgoCD expires |
+| `k2a_token_sync_cluster_self_credential_expiration_timestamp_seconds` | when this tool's own credential expires |
+| `k2a_token_sync_cluster_serving_cert_expiration_timestamp_seconds` | when the observed serving certificate expires |
+| `k2a_token_sync_cluster_last_sync_timestamp_seconds` | when a pass last *succeeded* |
+
+Deadlines are absolute timestamps rather than seconds remaining, because remaining is only true at the instant it is
+scraped. Alert on the difference — `k2a_token_sync_cluster_token_expiration_timestamp_seconds - time() < 86400` is
+correct whenever it runs. A deadline that is not yet known is **absent rather than zero**: zero reads as 1970, which
+would fire every expiry alert at once for a cluster that has simply never published.
+
+The chart renders a ClusterIP Service, so the endpoint has an address that survives a rollout:
+`http://<release>.<namespace>.svc.cluster.local:8080/metrics`. That is the whole of the scrape setup, and it is
+deliberate — there are no `prometheus.io/scrape` annotations and no ServiceMonitor. Both exist to feed Prometheus's own
+service discovery, so both are inert for a collector that takes a static endpoint list, and shipping both would invite
+two scrapers finding the same pod twice. Under prometheus-operator, a ServiceMonitor selecting this Service is the
+addition to make.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 
@@ -669,4 +699,3 @@ the requirement cannot be discovered as a mystery `ImagePullBackOff`.
 - Whether ArgoCD itself can reach an endpoint is not observable from here. The verification above runs from
   k2a-token-sync's pod, which is usually the same network path but not necessarily: NetworkPolicies, egress rules or a
   service mesh can differ between workloads in the same cluster.
-- No metrics endpoint. `/status` and the objects' own status carry the same information for now.

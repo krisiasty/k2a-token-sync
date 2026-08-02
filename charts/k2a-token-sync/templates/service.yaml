@@ -1,0 +1,31 @@
+{{/*
+A stable address for the health port, which is what makes /metrics scrapable.
+
+Nothing in Kubernetes needs this Service: the Deployment is a singleton and
+serves no traffic. A collector does. Scrapers that take a static endpoint list —
+Vector's prometheus_scrape among them — have no way to follow a pod IP that
+changes on every rollout, so the alternative to a Service is a configuration
+that breaks the next time this is deployed.
+
+Deliberately no prometheus.io/scrape annotations and no ServiceMonitor. Both
+exist to feed Prometheus's own service discovery, and neither is read by anything
+that does not run it; adding both would also mean two scrapers finding the same
+pod twice. If this ever runs somewhere with prometheus-operator, a ServiceMonitor
+selecting this Service is the addition to make then.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "k2a-token-sync.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "k2a-token-sync.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: health
+      port: {{ .Values.health.port }}
+      targetPort: health
+      protocol: TCP
