@@ -141,6 +141,12 @@ func (f *fakeInventory) UpdateStatus(_ context.Context, name string, status v1al
 	return nil
 }
 
+func (f *fakeInventory) writeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writes
+}
+
 func (f *fakeInventory) listDeadline() (time.Time, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
