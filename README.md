@@ -185,7 +185,7 @@ manage cluster objects — those are separate manifests, see
 ```bash
 helm install k2a-token-sync ./charts/k2a-token-sync \
   --namespace k2a-token-sync --create-namespace \
-  --set image.tag=v0.10.0
+  --set image.tag=v0.11.0
 ```
 
 #### Key chart values
@@ -193,7 +193,7 @@ helm install k2a-token-sync ./charts/k2a-token-sync \
 | Value | Default | Description |
 | --- | --- | --- |
 | `image.repository` | `ghcr.io/krisiasty/k2a-token-sync` | Image repository |
-| `image.tag` | **required** | Released version to deploy, e.g. `v0.10.0`. Rendering fails if unset |
+| `image.tag` | **required** | Released version to deploy, e.g. `v0.11.0`. Rendering fails if unset |
 | `argocdNamespace` | `argocd` | Namespace of the ArgoCD instance served; all cluster Secrets go here |
 | `health.port` | `8080` | Port for `/livez`, `/readyz`, `/status` and `/metrics` |
 
@@ -228,7 +228,7 @@ spec:
     helm:
       values: |
         image:
-          tag: "v0.10.0"      # required; the release to deploy
+          tag: "v0.11.0"      # required; the release to deploy
   destination:
     server: https://kubernetes.default.svc
     namespace: k2a-token-sync
@@ -250,7 +250,7 @@ the generated CRD by hand, and would drift. Render the chart instead, and apply 
 
 ```bash
 helm template k2a-token-sync ./charts/k2a-token-sync \
-  --namespace k2a-token-sync --set image.tag=v0.10.0 --include-crds > k2a-token-sync.yaml
+  --namespace k2a-token-sync --set image.tag=v0.11.0 --include-crds > k2a-token-sync.yaml
 ```
 
 ## Configuration
@@ -628,7 +628,7 @@ golangci-lint run
 
 # image.tag is required, so the chart needs one to render — any value will do
 # when you are only checking the templates
-helm lint charts/k2a-token-sync --set image.tag=v0.10.0
+helm lint charts/k2a-token-sync --set image.tag=v0.11.0
 ```
 
 The versions in the examples above are illustrative — deploy whatever is current, which is listed on the
@@ -658,6 +658,11 @@ git push origin vX.Y.Z
 That is the whole release. GoReleaser builds and publishes the images, archives and GitHub release. Then set
 `image.tag` to the new version where you deploy — your values file, or the ArgoCD Application — and the upgrade
 rolls out.
+
+Before tagging, check whether anything under `charts/` changed since the last release and bump the chart's own
+`version` if so. It moves with the chart's contents rather than with the application, so a release that adds a template
+and leaves the version alone ships two different charts under one number — which is the one thing the version is there
+to prevent. `git diff <last-tag>..main -- charts/` answers it in a line.
 
 Nothing in ordinary CI exercises that path, so after changing anything in it, run the **Release** workflow by hand — on
 the branch that changed it, before merging rather than after:
