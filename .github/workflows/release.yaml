@@ -4,35 +4,97 @@ on:
   push:
     tags:
       - "v*"
+  # The dry run below, on demand. Nothing about a release is exercised by
+  # ordinary CI, so without this the first time the release path runs is the time
+  # it matters, and a failure part way through leaves images in ghcr.io for a
+  # version that has no release — GoReleaser pushes images before it creates one.
+  workflow_dispatch:
 
+# Read-only by default, so a job has to ask for anything more. Only the job that
+# actually publishes asks.
 permissions:
-  contents: write  # create GitHub release
-  packages: write  # push to ghcr.io
+  contents: read
 
+# Every external action is pinned to a full commit SHA rather than a tag. This is
+# the workflow where it matters most: it runs with a token that can create
+# releases and push images, so a tag moved upstream would be a way to publish
+# artifacts nobody in this repository reviewed. The trailing comment is the
+# release that SHA is, and is what Dependabot rewrites when it bumps the pin.
+#
+# The tools those actions would otherwise download are pinned by checksum in
+# .github/actions/release-tools, which both jobs below use.
 jobs:
   release:
+    name: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # create GitHub release
+      packages: write  # push to ghcr.io
+
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # GoReleaser needs full history for changelog
+          # Without this, checkout leaves the token in .git/config where every
+          # later step can read it. Nothing here needs it: GoReleaser reads the
+          # changelog from local history, publishes over the API with the token
+          # passed to its step, and pushes images with the registry login.
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: docker/login-action@v4.5.2
+      - uses: ./.github/actions/release-tools
+
+      - uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: goreleaser/goreleaser-action@v7
-        with:
-          version: "~> v2"
-          args: release --clean
+      - name: release
+        run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Everything the release job does short of publishing: the same checkout, the
+  # same pinned tools, the same binaries and the same multi-arch image builds
+  # through the pinned Buildx and BuildKit. Snapshot mode needs no tag, and the
+  # docker build runs in GoReleaser's build phase while only the push lives in
+  # publish — so skipping publish still exercises the part worth exercising.
+  #
+  # It reads git history the way the real changelog does, which is what makes it
+  # a genuine test of running with no persisted git credential.
+  #
+  # No write permissions and no registry login: this proves the release path
+  # works without holding the ability to use it.
+  dry-run:
+    name: dry run
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: ./.github/actions/release-tools
+
+      # --snapshot already implies --skip=publish. Both are given because this job
+      # is one flag away from publishing for real, and that is not a thing to leave
+      # implied.
+      - name: build a release without publishing it
+        run: goreleaser release --snapshot --clean --skip=publish

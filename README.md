@@ -605,6 +605,12 @@ Releases are published to `ghcr.io/krisiasty/k2a-token-sync` via GitHub Actions 
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
 
+Everything that release path pulls in is pinned to something that cannot move: actions to full commit SHAs, images to
+digests, and downloaded release tools to exact versions and committed SHA-256 checksums. A tag or release asset can be
+replaced by its owner, and this is a binary that holds `cluster-admin` on every cluster it manages — so what goes into it
+should only ever change in a commit somebody reviewed. Dependabot proposes action and Dockerfile image bumps weekly;
+release-tool versions and checksums, and the BuildKit image pin in the workflow, are bumped by hand.
+
 ### Cutting a release
 
 ```bash
@@ -615,6 +621,19 @@ git push origin vX.Y.Z
 That is the whole release. GoReleaser builds and publishes the images, archives and GitHub release. Then set
 `image.tag` to the new version where you deploy — your values file, or the ArgoCD Application — and the upgrade
 rolls out.
+
+Nothing in ordinary CI exercises that path, so after changing anything in it, run the **Release** workflow by hand — on
+the branch that changed it, before merging rather than after:
+
+```bash
+gh workflow run Release --ref my-branch
+```
+
+That takes about four minutes and publishes nothing: the same checkout and the same pinned tools, the same binaries and
+the same multi-arch images, built by a job with no write permissions and no registry login. It is worth doing because a
+release that fails half way through is the expensive kind — GoReleaser pushes images before it creates the GitHub
+release, so an interrupted one leaves `ghcr.io` tags, including `latest`, pointing at a version that has no release
+behind it.
 
 ### Versioning
 
