@@ -478,8 +478,32 @@ prunes only what it tracks.
 | Endpoint | Purpose |
 | --- | --- |
 | `/livez` | Liveness — fails if the reconciliation loop has stalled |
-| `/readyz` | Readiness — passes once every cluster in the inventory has reconciled |
+| `/readyz` | Readiness — passes once every cluster in the inventory has reconciled in *this* process |
 | `/status` | JSON detail per cluster, including observed certificate expiry. Carries no credential material |
+
+### What liveness actually checks
+
+Clusters reconcile on their own schedules, up to four at a time, and the poll that starts a pass never waits for it to
+finish. That is about more than throughput. A cluster whose API server accepts a connection and then stops answering
+used to hold the whole loop for its five-minute timeout: nothing else became due, an edit went unnoticed, and `/livez`
+reported health the entire time, because it excused any pass in progress. The one state a restart would have fixed was
+the one the probe could not see.
+
+`/livez` fails on either of two things now — no poll has completed for five minutes, or some pass has outlived its own
+five-minute timeout by a minute, which means it is not slow but wedged, since every pass runs under that deadline. The
+first window is several polls wide on purpose: an API server that is briefly unreachable is not something restarting
+this pod fixes, so it must not cause one.
+
+Nothing is dropped when more than four clusters are due at once; the rest queue. Raising that bound is the answer if a
+fleet ever grows large enough for the queue to matter. A queued pass rechecks its cluster when its turn comes rather
+than trusting what was true when it was queued — in between, another ClusterConnection may have claimed the same Secret,
+or the object may have been deleted, and both of those are decided by refusing to write.
+
+`/readyz` deliberately means "reconciled by *this* process", which is why the emphasis is in the table above. Every
+object carries a `Ready` condition from whichever process last wrote it, so a restarted pod finds `Ready=True`
+everywhere before it has done anything at all — and reporting readiness off the back of that would tell a rollout the
+new pod is serving while every pass was still queued. The same applies after an edit: the condition on the object
+describes the spec as it was before the edit, so readiness drops until the new one has actually been through a pass.
 
 Per-cluster state is on the objects themselves, which is the readable view:
 
