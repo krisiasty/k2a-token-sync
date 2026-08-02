@@ -34,4 +34,4 @@ go.work.sum
 .claude/
 dist/
 k2a-values.yaml
-k2a-token-sync
+/k2a-token-sync

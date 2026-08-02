@@ -123,6 +123,26 @@ jobs:
             exit 1
           fi
 
+      # A template file present locally but never committed renders fine on the
+      # machine that wrote it and vanishes here — which is exactly how the Service
+      # went missing from its own pull request. Naming the objects the chart is
+      # supposed to ship turns that into a failed build instead of a promise in the
+      # README that nothing keeps.
+      - name: the chart ships every object it claims to
+        run: |
+          set -euo pipefail
+          rendered=$(helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" --include-crds)
+          # A here-string rather than a pipe into grep -q: grep exits on the first
+          # match, the writer takes SIGPIPE, and under pipefail the pipeline reports
+          # 141 for a check that actually succeeded.
+          for kind in CustomResourceDefinition Deployment Role RoleBinding Service ServiceAccount; do
+            if ! grep -qx "kind: ${kind}" <<<"${rendered}"; then
+              echo "::error::the chart rendered no ${kind}"
+              exit 1
+            fi
+          done
+
       - name: helm template
         run: |
           helm template k2a-token-sync charts/k2a-token-sync \

@@ -567,7 +567,7 @@ endpoint adds is what nothing else knows — one series per cluster, labelled `c
 | `k2a_token_sync_cluster_token_expiration_timestamp_seconds` | when the credential published to ArgoCD expires |
 | `k2a_token_sync_cluster_self_credential_expiration_timestamp_seconds` | when this tool's own credential expires |
 | `k2a_token_sync_cluster_serving_cert_expiration_timestamp_seconds` | when the observed serving certificate expires |
-| `k2a_token_sync_cluster_last_sync_timestamp_seconds` | when a pass last completed |
+| `k2a_token_sync_cluster_last_sync_timestamp_seconds` | when a pass last *succeeded* |
 
 Deadlines are absolute timestamps rather than seconds remaining, because remaining is only true at the instant it is
 scraped. Alert on the difference — `k2a_token_sync_cluster_token_expiration_timestamp_seconds - time() < 86400` is

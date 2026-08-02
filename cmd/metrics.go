@@ -52,7 +52,7 @@ func newClusterCollector(state *healthState) *clusterCollector {
 			label, nil),
 		lastSync: prometheus.NewDesc(
 			"k2a_token_sync_cluster_last_sync_timestamp_seconds",
-			"When a pass last completed for this cluster.",
+			"When a pass last succeeded for this cluster. A failing cluster stops advancing this while its other series stay current.",
 			label, nil),
 	}
 }
