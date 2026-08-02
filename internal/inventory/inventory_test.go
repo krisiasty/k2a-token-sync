@@ -286,3 +286,81 @@ func TestUpdateStatusWritesToTheSubresource(t *testing.T) {
 		t.Error("the entry reads as edited although status caught up with the spec")
 	}
 }
+
+// A malformed object — one the Go types cannot parse — keeps the two things that
+// matter: the generation being rejected, and the status recording what was last
+// published. Discarding the status would make fixing a typo cost a needless
+// reissue of a credential that is working.
+func TestAMalformedObjectKeepsItsGenerationAndPublishedState(t *testing.T) {
+	t.Parallel()
+
+	malformed := connection("malformed", "malformed.example.com:6443", "cluster-malformed")
+	malformed.SetGeneration(7)
+	// tokenTTL is a string in the schema; a number cannot be converted into one.
+	spec, ok := malformed.Object["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("the fixture no longer has a spec map")
+	}
+	spec["tokenTTL"] = int64(720)
+	malformed.Object["status"] = map[string]any{
+		"observedGeneration":    int64(6),
+		"appliedCredentialHash": "sha256:abc",
+	}
+
+	entries, err := newTestClient(malformed).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("List returned %d entries, want the malformed object reported rather than dropped", len(entries))
+	}
+
+	entry := entries[0]
+	if entry.InvalidReason == "" {
+		t.Error("a malformed object was accepted")
+	}
+	if entry.InvalidCause != v1alpha1.ReasonInvalidSpec {
+		t.Errorf("InvalidCause is %q, want %q", entry.InvalidCause, v1alpha1.ReasonInvalidSpec)
+	}
+	if entry.Generation != 7 {
+		t.Errorf("Generation is %d, want 7 — the generation being rejected", entry.Generation)
+	}
+	if entry.Status.AppliedCredentialHash != "sha256:abc" {
+		t.Errorf("the published fingerprint was discarded: %+v", entry.Status)
+	}
+	if entry.ObservedGeneration != 6 {
+		t.Errorf("ObservedGeneration is %d, want 6 from the status beside the broken spec", entry.ObservedGeneration)
+	}
+}
+
+// The cause travels with the reason, since it is what decides which conditions
+// get written.
+func TestTheInventorySaysWhichKindOfProblemItFound(t *testing.T) {
+	t.Parallel()
+
+	entries, err := newTestClient(
+		connection("alpha", "alpha.example.com:6443", "cluster-shared"),
+		connection("omega", "omega.example.com:6443", "cluster-shared"),
+		connection("broken", "", "cluster-broken"),
+		connection("fine", "fine.example.com:6443", "cluster-fine"),
+	).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+
+	want := map[string]string{
+		"alpha":  v1alpha1.ReasonSecretNameConflict,
+		"omega":  v1alpha1.ReasonSecretNameConflict,
+		"broken": v1alpha1.ReasonInvalidSpec,
+		"fine":   "",
+	}
+	for _, entry := range entries {
+		if got := entry.InvalidCause; got != want[entry.Cluster.Name] {
+			t.Errorf("%s: InvalidCause is %q, want %q", entry.Cluster.Name, got, want[entry.Cluster.Name])
+		}
+		if (entry.InvalidCause == "") != (entry.InvalidReason == "") {
+			t.Errorf("%s: cause %q and reason %q disagree about whether it is usable",
+				entry.Cluster.Name, entry.InvalidCause, entry.InvalidReason)
+		}
+	}
+}

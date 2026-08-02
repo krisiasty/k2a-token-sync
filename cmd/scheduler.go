@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -142,8 +143,11 @@ type clusterState struct {
 
 	// invalidReason is set when the object's spec cannot be resolved, or when
 	// another ClusterConnection claims the same Secret. Such a cluster is never
-	// reconciled, but it is still reported.
+	// reconciled, but it is still reported — on the object as well as in /status,
+	// since the object is where an operator looks. invalidCause decides which
+	// conditions say so.
 	invalidReason string
+	invalidCause  string
 }
 
 // scheduler polls the inventory and reconciles each cluster on its own cadence.
@@ -219,9 +223,128 @@ func (s *scheduler) tick(ctx context.Context) {
 	}
 
 	s.dispatch(ctx)
+	s.reportRejected(ctx)
 
 	s.health.recordPoll()
 	s.publish()
+}
+
+// reportRejected writes the verdict onto every object this tool is declining to
+// reconcile.
+//
+// Those objects are the ones an operator goes looking at, and until now they were
+// the only ones that said nothing: excluded before reconciliation, so nothing ever
+// wrote their status. 'kubectl get ccon' showed an empty Ready column, or worse a
+// Ready=True left over from before the spec was broken, and the reason lived only
+// in this process's /status endpoint.
+//
+// The whole phase shares one deadline rather than one per write. A poll that
+// stretches is a poll that stops counting as progress, and a fleet of objects the
+// API server is refusing to accept must not be able to push it there.
+func (s *scheduler) reportRejected(ctx context.Context) {
+	rejected := s.rejectedNeedingStatus()
+	if len(rejected) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, inventoryTimeout)
+	defer cancel()
+
+	for _, r := range rejected {
+		if err := s.inv.UpdateStatus(ctx, r.name, r.status); err != nil {
+			// Logged and stepped over: one object the API server will not accept must
+			// not stop the others from being told why they are stuck.
+			s.logger.Warn("writing the reason a cluster is not being reconciled failed",
+				"cluster", r.name, "error", err)
+			continue
+		}
+		s.logger.Info("cluster is not being reconciled", "cluster", r.name, "reason", r.reason)
+	}
+}
+
+type rejection struct {
+	name   string
+	reason string
+	status v1alpha1.ClusterConnectionStatus
+}
+
+// rejectedNeedingStatus lists the rejected clusters whose objects do not already
+// say so.
+//
+// The comparison is against the status read in this poll, which is what makes a
+// steady state cost nothing: the write happens once, the next poll reads it back,
+// and from then on the desired status and the actual one are the same value. There
+// is no bookkeeping of what was written, so a status edited or rolled back out of
+// band is simply written again.
+func (s *scheduler) rejectedNeedingStatus() []rejection {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []rejection
+	for name, state := range s.state {
+		if state.invalidReason == "" {
+			continue
+		}
+		desired := rejectedStatus(state)
+		// Compared exactly. Both sides come from the same read, so everything this
+		// does not touch is identical by construction, and the cost of being wrong is
+		// one redundant write rather than a missing one.
+		if reflect.DeepEqual(desired, state.status) {
+			continue
+		}
+		out = append(out, rejection{name: name, reason: state.invalidReason, status: desired})
+	}
+	slices.SortFunc(out, func(a, b rejection) int { return strings.Compare(a.name, b.name) })
+	return out
+}
+
+// rejectedStatus is what an object should say while this tool is declining to
+// reconcile it. The caller holds the lock.
+func rejectedStatus(state *clusterState) v1alpha1.ClusterConnectionStatus {
+	status := state.status
+	status.Conditions = slices.Clone(status.Conditions)
+
+	// The generation that was rejected, so that fixing the object is visibly
+	// different from this verdict still being current.
+	status.ObservedGeneration = state.generation
+
+	reason := state.invalidCause
+	if reason == "" {
+		// Not reachable from the inventory, which always says which kind it is. Here
+		// because a condition with no reason is one the API server rejects outright,
+		// which would lose the message as well as the reason.
+		reason = v1alpha1.ReasonInvalidSpec
+	}
+
+	status.LastAction = "not reconciled: " + state.invalidReason
+	setRejectedCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, state)
+
+	// Conflict is the one condition that names something outside this object, so it
+	// is set only for the conflict itself and removed as soon as the cause is
+	// something else. Leaving it behind would have an object blaming a neighbour for
+	// a problem in its own spec.
+	if reason == v1alpha1.ReasonSecretNameConflict {
+		setRejectedCondition(&status, v1alpha1.ConditionConflict, metav1.ConditionTrue, reason, state)
+	} else {
+		meta.RemoveStatusCondition(&status.Conditions, v1alpha1.ConditionConflict)
+	}
+	return status
+}
+
+func setRejectedCondition(
+	status *v1alpha1.ClusterConnectionStatus,
+	conditionType string,
+	value metav1.ConditionStatus,
+	reason string,
+	state *clusterState,
+) {
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             value,
+		Reason:             reason,
+		Message:            state.invalidReason,
+		ObservedGeneration: state.generation,
+	})
 }
 
 // refresh reconciles the in-memory schedule with the objects in the API.
@@ -267,6 +390,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		state.generation = entry.Generation
 		state.status = entry.Status
 		state.invalidReason = entry.InvalidReason
+		state.invalidCause = entry.InvalidCause
 		state.departed = false
 	}
 
@@ -389,6 +513,11 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	// The reconciler edits the conditions it is given, and /status reads them from
 	// here while it does, so the pass gets a slice of its own.
 	prior.Conditions = slices.Clone(prior.Conditions)
+	// This pass running is itself the proof that the conflict is over — a contested
+	// cluster never gets one. The reconciler knows nothing about Conflict and would
+	// carry it forward untouched, leaving an object that reconciles perfectly well
+	// still accusing a neighbour that may not even exist any more.
+	meta.RemoveStatusCondition(&prior.Conditions, v1alpha1.ConditionConflict)
 	s.mu.Unlock()
 
 	// When the pass started, not when it finished. Scheduling from the end would add

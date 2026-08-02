@@ -50,11 +50,17 @@ type Entry struct {
 	// published: it holds no read permission on the generated Secrets.
 	Status v1alpha1.ClusterConnectionStatus
 
-	// InvalidReason is set when the object parsed but its spec cannot be
-	// resolved. Such an entry is reported on the object rather than dropped
-	// silently, since a cluster vanishing from the inventory because of a typo is
-	// the worst of both outcomes.
+	// InvalidReason is set when the entry cannot be reconciled: its spec does not
+	// resolve, or another connection claims the same Secret. Such an entry is
+	// reported on the object rather than dropped silently, since a cluster
+	// vanishing from the inventory because of a typo is the worst of both outcomes.
 	InvalidReason string
+
+	// InvalidCause says which of those it is, as one of the condition reasons in
+	// the API package. The message above is for a person; this is what decides
+	// which conditions get written to the object, and the two kinds want different
+	// ones: a spec only this object can fix, against a conflict that names another.
+	InvalidCause string
 }
 
 // Edited reports whether the spec has changed since k2a-token-sync last recorded a
@@ -89,16 +95,7 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 
 	entries := make([]Entry, 0, len(list.Items))
 	for i := range list.Items {
-		entry, err := decode(&list.Items[i])
-		if err != nil {
-			// A malformed object is reported against its own name and skipped.
-			// There is nothing to write status to if it does not even decode.
-			entry = Entry{
-				Cluster:       config.Cluster{Name: list.Items[i].GetName()},
-				InvalidReason: err.Error(),
-			}
-		}
-		entries = append(entries, entry)
+		entries = append(entries, decode(&list.Items[i]))
 	}
 
 	blockContestedSecrets(entries)
@@ -149,6 +146,7 @@ func blockContestedSecrets(entries []Entry) {
 		entries[i].InvalidReason = fmt.Sprintf(
 			"secretName %q is also claimed by %s; none of them will be reconciled until one claim remains",
 			entries[i].Cluster.SecretName, strings.Join(quoted(others), ", "))
+		entries[i].InvalidCause = v1alpha1.ReasonSecretNameConflict
 	}
 }
 
@@ -185,27 +183,56 @@ func (c *Client) UpdateStatus(ctx context.Context, name string, status v1alpha1.
 
 // decode converts one object into an Entry, resolving its spec into the runtime
 // cluster type.
-func decode(obj *unstructured.Unstructured) (Entry, error) {
+//
+// It never fails. Every way an object can be unusable is reported on the entry
+// instead, because the caller writes that verdict back to the object, and an
+// entry it never received is an object that says nothing about why it is being
+// ignored.
+func decode(obj *unstructured.Unstructured) Entry {
+	// Taken from the object rather than from the decoded spec, so that they survive
+	// an object the Go types cannot parse at all.
+	entry := Entry{
+		Cluster:    config.Cluster{Name: obj.GetName()},
+		Generation: obj.GetGeneration(),
+		Status:     decodeStatus(obj),
+	}
+	entry.ObservedGeneration = entry.Status.ObservedGeneration
+
 	var cc v1alpha1.ClusterConnection
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &cc); err != nil {
-		return Entry{}, fmt.Errorf("decoding clusterconnection: %w", err)
-	}
-
-	entry := Entry{
-		Generation:         obj.GetGeneration(),
-		ObservedGeneration: cc.Status.ObservedGeneration,
-		Status:             cc.Status,
+		entry.InvalidReason = fmt.Sprintf("decoding clusterconnection: %v", err)
+		entry.InvalidCause = v1alpha1.ReasonInvalidSpec
+		return entry
 	}
 
 	cluster, err := config.FromSpec(cc.Name, cc.Spec)
 	if err != nil {
-		// Keep the name so the caller can still report against the object.
-		entry.Cluster = config.Cluster{Name: cc.Name}
 		entry.InvalidReason = err.Error()
-		return entry, nil //nolint:nilerr // reported on the entry rather than returned, so one bad object cannot hide the rest
+		entry.InvalidCause = v1alpha1.ReasonInvalidSpec
+		return entry
 	}
 	entry.Cluster = cluster
-	return entry, nil
+	return entry
+}
+
+// decodeStatus decodes the status subtree on its own.
+//
+// A spec these types cannot parse says nothing about the status beside it, and
+// the status is worth keeping: it records the fingerprint of what was last
+// published, so discarding it would make fixing the spec cost a needless
+// reissue. If the status itself will not decode there is nothing to preserve,
+// and an empty one is the honest answer.
+func decodeStatus(obj *unstructured.Unstructured) v1alpha1.ClusterConnectionStatus {
+	raw, found, err := unstructured.NestedMap(obj.Object, "status")
+	if err != nil || !found {
+		return v1alpha1.ClusterConnectionStatus{}
+	}
+
+	var status v1alpha1.ClusterConnectionStatus
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(raw, &status); err != nil {
+		return v1alpha1.ClusterConnectionStatus{}
+	}
+	return status
 }
 
 // IsCRDMissing reports whether the ClusterConnection CRD itself is absent,
