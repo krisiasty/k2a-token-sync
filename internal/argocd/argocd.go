@@ -165,8 +165,10 @@ func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguratio
 		WithData(data)
 }
 
-// credentialConfig is the credential half, and nothing else.
-func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration, error) {
+// credentialConfig is the credential half, and nothing else. It returns the
+// encoded payload alongside the apply configuration, because the digest of what
+// is being published has to come from the bytes actually sent.
+func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration, []byte, error) {
 	// ArgoCD reads bearerToken out of the Secret's "config" key. It goes only
 	// into that Secret, never a log.
 	payload, err := json.Marshal(clusterConfig{ //nolint:gosec // G117: serialising the credential here is intended
@@ -176,58 +178,85 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("encoding cluster config: %w", err)
+		return nil, nil, fmt.Errorf("encoding cluster config: %w", err)
 	}
 
 	return applycorev1.Secret(c.Name, c.Namespace).
 		WithType(corev1.SecretTypeOpaque).
-		WithData(map[string][]byte{configKey: payload}), nil
+		WithData(map[string][]byte{configKey: payload}), payload, nil
 }
 
-// ApplyRegistration writes everything except the credential and reports whether
-// the credential is present on the server afterwards.
+// ApplyRegistration writes everything except the credential and reports the
+// credential that is on the server afterwards, digested.
 //
 // An apply returns the object it produced, and needs only the patch verb, so
 // this doubles as k2a-token-sync's only view of what it has published: no get, list
 // or watch permission in ArgoCD's namespace is required anywhere. That is what
 // makes a deleted or emptied Secret self-healing — the next pass recreates the
 // registration and sees that the credential is gone.
-func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (bool, error) {
+func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (string, error) {
 	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(), metav1.ApplyOptions{
 		FieldManager: FieldManagerRegistration,
 		Force:        true,
 	})
 	if err != nil {
-		return false, fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
+		return "", fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
-	return hasBearerToken(applied), nil
+	return hashCredential(applied), nil
 }
 
-// ApplyCredential writes the credential half.
-func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) error {
-	config, err := desired.credentialConfig()
+// ApplyCredential writes the credential half and returns a digest of exactly what
+// it published.
+//
+// The digest comes from the bytes sent rather than from any response, and that
+// distinction is the whole point. A response describes the object as it stands
+// when the server answers, which is not the same claim: another writer landing in
+// between would have its credential digested and recorded as this tool's own,
+// leaving the comparison permanently satisfied by somebody else's token.
+func ApplyCredential(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (string, error) {
+	config, payload, err := desired.credentialConfig()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, config, metav1.ApplyOptions{
 		FieldManager: FieldManagerCredential,
 		Force:        true,
 	}); err != nil {
-		return fmt.Errorf("applying credential for %s/%s: %w", desired.Namespace, desired.Name, err)
+		return "", fmt.Errorf("applying credential for %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
-	return nil
+	return hashConfig(payload), nil
 }
 
-func hasBearerToken(secret *corev1.Secret) bool {
+// hashCredential digests the credential half of a Secret as it currently stands
+// on the server, or returns "" when there is effectively none.
+//
+// An empty string means the same thing it always did — no usable credential — so
+// a config present but carrying no bearer token still counts as absent.
+//
+// The digest covers the whole config payload rather than the token alone, because
+// ArgoCD's TLS settings live in there too: a hand-edited caData would otherwise
+// survive unnoticed until the next reissue, breaking ArgoCD's connection while
+// the token itself looked perfectly fine.
+func hashCredential(secret *corev1.Secret) string {
 	raw, ok := secret.Data[configKey]
 	if !ok {
-		return false
+		return ""
 	}
 	var parsed clusterConfig
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return false
+		return ""
 	}
-	return parsed.BearerToken != ""
+	if parsed.BearerToken == "" {
+		return ""
+	}
+	return hashConfig(raw)
+}
+
+// hashConfig digests a credential payload. Shared so that what is recorded and
+// what is observed are always measured the same way.
+func hashConfig(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // Fingerprint is what a previous pass wrote, as recorded in the owning
@@ -243,6 +272,16 @@ type Fingerprint struct {
 	CAHash         string
 	TokenExpiresAt time.Time
 	TokenIssuedAt  time.Time
+
+	// CredentialHash digests the credential this tool last published, taken from
+	// the payload it sent.
+	//
+	// Every other field here describes what was wanted, and this one is no
+	// different: it is the credential this tool intended ArgoCD to hold. What the
+	// server actually holds arrives separately, from an apply response, and the two
+	// disagreeing is the whole signal — so this side of the comparison must never
+	// be sourced from a response, or it would agree with whatever it found.
+	CredentialHash string
 }
 
 // Fingerprint describes what applying this ClusterSecret would publish, for
@@ -282,6 +321,13 @@ const (
 	ReasonUnrecorded RefreshReason = "no registration recorded in status"
 	ReasonNoToken    RefreshReason = "cluster secret has no bearer token"
 
+	// ReasonCredentialReplaced means the published credential is not the one this
+	// tool last wrote. Something else — External Secrets, a sealed-secrets
+	// controller, a person with kubectl — has written over it, and whatever is
+	// there now was not minted here, is not tracked here, and cannot be renewed
+	// here.
+	ReasonCredentialReplaced RefreshReason = "cluster secret holds a credential this tool did not write"
+
 	// ReasonIdentityRecreated is the one reason that does not come from comparing
 	// what was published against what is wanted. Both can match exactly while the
 	// token is dead: a bound token carries the ServiceAccount's UID, so deleting
@@ -298,19 +344,25 @@ const (
 
 // NeedsRefresh decides whether to mint a new credential.
 //
-// applied is what the last pass recorded in status; hasCredential is what the
-// server reported when the registration was applied this pass. Minting on every
-// cycle would work, but each write churns ArgoCD's cluster cache, so a
-// credential is reissued only when it is past half its lifetime, when something
-// it depends on has drifted, or when it has gone missing entirely.
-func NeedsRefresh(applied Fingerprint, hasCredential bool, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
+// applied is what the last pass recorded in status; published is the credential
+// the server reported when the registration was applied this pass, digested.
+// Minting on every cycle would work, but each write churns ArgoCD's cluster
+// cache, so a credential is reissued only when it is past half its lifetime, when
+// something it depends on has drifted, or when it has gone missing or been
+// replaced.
+func NeedsRefresh(applied Fingerprint, published string, desired ClusterSecret, ttl time.Duration, now time.Time) RefreshReason {
 	switch {
 	case applied == (Fingerprint{}):
 		// Nothing recorded: either this cluster has never been published, or
 		// status was lost. Reissuing is the safe reading of both.
 		return ReasonUnrecorded
-	case !hasCredential:
+	case published == "":
 		return ReasonNoToken
+	case applied.CredentialHash != "" && published != applied.CredentialHash:
+		// Only meaningful once a hash has been recorded. A status written before
+		// this existed has none, so the comparison waits for the next reissue to
+		// record one rather than reissuing every cluster at once on upgrade.
+		return ReasonCredentialReplaced
 	case applied.Server != desired.Server:
 		return ReasonServerDrift
 	case applied.DisplayName != desired.DisplayName:

@@ -422,6 +422,11 @@ Do **not** create `<name>-credentials` with External Secrets, an ArgoCD Applicat
 reconciles toward a stored value. Those Secrets belong to k2a-token-sync, which rewrites each one daily to keep
 the remaining lifetime within a day of the full `selfTokenTTL`.
 
+On the ArgoCD side the same mistake is caught rather than silent: k2a-token-sync records a digest of the credential it
+published and compares it against what the apply response reports on every pass, so a `cluster-<name>` Secret written
+over by anything else is noticed within one pass and replaced with a credential this tool can actually renew. The Secret
+below has no such protection, because it is the one k2a-token-sync reads rather than writes blind.
+
 A second writer turns that into a silent fault. Every renewal is undone on the next reconcile, so the credential stops
 advancing; about ninety days later the stored copy expires and gets pushed over a working token, and k2a-token-sync locks
 itself out of the cluster. The symptom appears three months after the cause.

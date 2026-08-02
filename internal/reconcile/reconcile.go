@@ -187,14 +187,14 @@ func (r *Reconciler) reconcile(
 	// cluster's first pass, where a credential has to be minted anyway and
 	// applying the label first would briefly show ArgoCD a cluster it cannot
 	// authenticate to.
-	var hasCredential bool
+	var published string
 	if !first {
-		if hasCredential, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
+		if published, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
 			return r.argocdSecretError(cluster, err)
 		}
 	}
 
-	reason := argocd.NeedsRefresh(applied, hasCredential, desired, cluster.TokenTTL, now)
+	reason := argocd.NeedsRefresh(applied, published, desired, cluster.TokenTTL, now)
 	if repairs.ServiceAccount {
 		// Outranks anything the published state comparison concluded: that compares
 		// what was written against what is wanted, and both can look perfect while
@@ -256,14 +256,37 @@ func (r *Reconciler) reconcile(
 	// argocd.argoproj.io/secret-type label is invisible to ArgoCD, so writing the
 	// credential before the registration means ArgoCD never sees a cluster it
 	// cannot authenticate to — not even between two applies.
-	if err := argocd.ApplyCredential(ctx, r.local, desired); err != nil {
+	written, err := argocd.ApplyCredential(ctx, r.local, desired)
+	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
-	if _, err := argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
+	observed, err := argocd.ApplyRegistration(ctx, r.local, desired)
+	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
 
-	recordFingerprint(status, desired.Fingerprint())
+	// What gets recorded is what was written, never what came back. The two applies
+	// are separate calls, so a writer landing between them would have its
+	// credential in that response — and recording that would adopt somebody else's
+	// token as this tool's own, leaving the comparison satisfied by it forever.
+	//
+	// Recorded before the check below, because the check can fail the pass and this
+	// is the reference the next one compares against. Status is written either way.
+	fingerprint := desired.Fingerprint()
+	fingerprint.CredentialHash = written
+	recordFingerprint(status, fingerprint)
+
+	// Differing means the credential was overwritten within one round trip, so
+	// ArgoCD is holding something this tool did not mint and cannot renew. Saying
+	// Ready=True here would be a lie about the one thing this object exists to
+	// report, so the pass fails: the condition names the cause, and backoff paces
+	// the retries rather than minting a fresh token against a contested Secret
+	// every five minutes.
+	if observed != written {
+		return fmt.Errorf("%w: the credential published to %s/%s was overwritten before this pass finished; "+
+			"something else is writing that Secret, which must not be provisioned declaratively",
+			errCredentialReplaced, desired.Namespace, desired.Name)
+	}
 	// The reason alone would read as a state rather than an action: "cluster secret
 	// does not exist" is not what the pass did, and it is untrue by the time it is
 	// recorded. Naming the action keeps the field consistent with "up-to-date" and
@@ -280,10 +303,11 @@ func (r *Reconciler) reconcile(
 // fingerprintFrom reads back what a previous pass recorded.
 func fingerprintFrom(status v1alpha1.ClusterConnectionStatus) argocd.Fingerprint {
 	f := argocd.Fingerprint{
-		Server:      status.AppliedServer,
-		DisplayName: status.AppliedDisplayName,
-		Project:     status.AppliedProject,
-		CAHash:      status.AppliedCAHash,
+		Server:         status.AppliedServer,
+		DisplayName:    status.AppliedDisplayName,
+		Project:        status.AppliedProject,
+		CAHash:         status.AppliedCAHash,
+		CredentialHash: status.AppliedCredentialHash,
 	}
 	if status.TokenExpiresAt != nil {
 		f.TokenExpiresAt = status.TokenExpiresAt.Time
@@ -299,6 +323,7 @@ func recordFingerprint(status *v1alpha1.ClusterConnectionStatus, f argocd.Finger
 	status.AppliedDisplayName = f.DisplayName
 	status.AppliedProject = f.Project
 	status.AppliedCAHash = f.CAHash
+	status.AppliedCredentialHash = f.CredentialHash
 	status.TokenExpiresAt = &metav1.Time{Time: f.TokenExpiresAt}
 	status.TokenIssuedAt = &metav1.Time{Time: f.TokenIssuedAt}
 }
@@ -331,6 +356,8 @@ func reasonFor(err error) string {
 		return v1alpha1.ReasonCertificateInvalid
 	case errors.Is(err, errCredentialRejected):
 		return v1alpha1.ReasonCredentialRejected
+	case errors.Is(err, errCredentialReplaced):
+		return v1alpha1.ReasonCredentialReplaced
 	default:
 		return v1alpha1.ReasonEndpointUnreachable
 	}
@@ -354,6 +381,13 @@ var (
 	// obvious alternative, EndpointUnreachable, would be actively misleading: the
 	// endpoint answered, and said no.
 	errCredentialRejected = errors.New("minted credential rejected")
+
+	// errCredentialReplaced means something overwrote the credential between this
+	// tool publishing it and the next call in the same pass. Nothing here is broken
+	// — the token was good when it was written — but ArgoCD now holds one this tool
+	// did not mint and cannot renew, so the cluster is not in the state this object
+	// claims.
+	errCredentialReplaced = errors.New("published credential was overwritten")
 )
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.

@@ -29,6 +29,7 @@ const (
 	ReasonEndpointUnreachable = "EndpointUnreachable"
 	ReasonCertificateInvalid  = "CertificateInvalid"
 	ReasonCredentialRejected  = "CredentialRejected" //nolint:gosec // a condition reason, not a credential
+	ReasonCredentialReplaced  = "CredentialReplaced" //nolint:gosec // a condition reason, not a credential
 	ReasonSecretNameConflict  = "SecretNameConflict"
 	ReasonInvalidSpec         = "InvalidSpec"
 )
@@ -256,4 +257,18 @@ type ClusterConnectionStatus struct {
 
 	// +optional
 	AppliedCAHash string `json:"appliedCAHash,omitempty"`
+
+	// AppliedCredentialHash digests the credential last published to ArgoCD.
+	//
+	// It is taken from the payload that was sent, never from any response. A
+	// response describes the Secret as it stands when the server answers, which is
+	// a different claim: anything that wrote in between would be digested and
+	// remembered as this tool's own. Recording what was published keeps the
+	// comparison anchored to something only this tool could have written.
+	//
+	// A later pass compares it against what an apply response reports, which is the
+	// only thing that can be learned about a Secret this tool may not read.
+	//
+	// +optional
+	AppliedCredentialHash string `json:"appliedCredentialHash,omitempty"`
 }
