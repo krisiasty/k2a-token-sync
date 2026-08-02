@@ -129,7 +129,7 @@ func TestAClusterDueJustPastATickIsNotHeldForAWholeExtraPoll(t *testing.T) {
 				state: map[string]*clusterState{"c": {dueAt: now.Add(tc.dueIn)}},
 				now:   func() time.Time { return now },
 			}
-			got := len(s.dueClusters()) == 1
+			got := len(s.claimDue()) == 1
 			if got != tc.want {
 				t.Errorf("due=%v for a cluster due in %v, want %v", got, tc.dueIn, tc.want)
 			}
@@ -148,8 +148,8 @@ func TestAnInvalidClusterIsNeverDue(t *testing.T) {
 		},
 		now: func() time.Time { return now },
 	}
-	if due := s.dueClusters(); len(due) != 0 {
-		t.Errorf("dueClusters returned %v, want none", due)
+	if due := s.claimDue(); len(due) != 0 {
+		t.Errorf("claimDue returned %d clusters, want none", len(due))
 	}
 }
 
@@ -180,21 +180,70 @@ func TestHealthReadinessTracksEveryCluster(t *testing.T) {
 	}
 }
 
-func TestHealthLivenessSurvivesAPassInProgress(t *testing.T) {
+// stoppedClock builds a health state whose sense of time the test controls.
+func stoppedClock(t *testing.T, at time.Time) (*healthState, func(time.Duration)) {
+	t.Helper()
+
+	now := at
+	state := newHealthState()
+	state.now = func() time.Time { return now }
+	state.polledAt = now
+	return state, func(d time.Duration) { now = now.Add(d) }
+}
+
+func TestHealthLivenessTracksCompletedPolls(t *testing.T) {
 	t.Parallel()
 
-	state := newHealthState()
+	state, advance := stoppedClock(t, time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC))
 	if !state.isLive() {
-		t.Error("not live at startup")
+		t.Error("not live at startup, before the first poll has had a chance to run")
 	}
 
-	state.recordAttempt()
+	advance(maxProgressAge - time.Second)
 	if !state.isLive() {
-		t.Error("not live while a pass is in progress")
+		t.Error("a loop within its window is reported as stalled")
 	}
 
-	state.record([]clusterReport{{Name: "a", Synced: true}}, time.Minute)
+	// The window is deliberately several polls wide: a control plane that is
+	// briefly unreachable must not be answered by restarting a healthy pod.
+	advance(2 * time.Second)
+	if state.isLive() {
+		t.Errorf("live %v after the last completed poll, want the probe to fail past %v",
+			maxProgressAge+time.Second, maxProgressAge)
+	}
+
+	state.recordPoll()
 	if !state.isLive() {
-		t.Error("not live immediately after a pass")
+		t.Error("a completed poll did not clear the stall")
+	}
+}
+
+// The failure this replaced: while a pass was in progress liveness returned true
+// unconditionally, so an inventory call that hung — the one thing a restart would
+// actually fix — kept the probe green for as long as the process lived.
+func TestHealthLivenessDoesNotExcuseAPassThatNeverEnds(t *testing.T) {
+	t.Parallel()
+
+	start := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
+	state, advance := stoppedClock(t, start)
+
+	state.passStarted("slow", start)
+	advance(clusterTimeout)
+	state.recordPoll() // the loop is still polling; only this cluster is stuck
+	if !state.isLive() {
+		t.Error("a pass that is merely slow tripped the liveness probe")
+	}
+
+	// Past its own timeout the pass is not slow, it is wedged: every pass runs
+	// under a context that should have ended it.
+	advance(passGrace + time.Second)
+	state.recordPoll()
+	if state.isLive() {
+		t.Error("a pass that outlived its timeout was still reported as a healthy loop")
+	}
+
+	state.passFinished("slow")
+	if !state.isLive() {
+		t.Error("still stalled after the pass ended")
 	}
 }

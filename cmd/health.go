@@ -27,23 +27,71 @@ type clusterReport struct {
 	ServingCertDaysRemaining int32     `json:"servingCertDaysRemaining,omitempty"`
 }
 
+const (
+	// maxProgressAge is how long the loop may go without completing a poll before
+	// liveness fails.
+	//
+	// Ten polls is generous on purpose. The probe exists to catch a process that
+	// has stopped making progress, and restarting is a remedy for exactly one
+	// cause: a loop that has wedged. An API server that is briefly unreachable —
+	// during a control plane upgrade, say — is not that, and answering it by
+	// killing a pod that is behaving correctly would trade a recoverable outage for
+	// a restart loop. The window is wide enough to sit through one.
+	maxProgressAge = 10 * pollInterval
+
+	// passGrace is how far a pass may overrun clusterTimeout before it counts as
+	// wedged rather than slow.
+	//
+	// Every pass runs under that timeout, so overrunning it means the context was
+	// not honoured — a goroutine blocked somewhere that does not take one. Such a
+	// pass never ends and never gives its slot back, and enough of them stop the
+	// fleet reconciling while the polls carry on completing, which is a stall the
+	// poll clock alone cannot see.
+	passGrace = 1 * time.Minute
+)
+
 // healthState tracks the scheduler for the probe endpoints.
 type healthState struct {
 	mu            sync.RWMutex
-	inProgress    bool
 	nextAttemptAt time.Time
 	clusters      []clusterReport
 	lastSuccessAt time.Time
 	ready         bool
+
+	// polledAt is when a poll last completed, and passes holds the start time of
+	// every pass currently in flight. Between them they are what liveness is
+	// judged on.
+	polledAt time.Time
+	passes   map[string]time.Time
+
+	now func() time.Time
 }
 
 func newHealthState() *healthState {
-	return &healthState{}
+	return &healthState{
+		polledAt: time.Now(), // the process has just started; that counts as progress
+		passes:   make(map[string]time.Time),
+		now:      time.Now,
+	}
 }
 
-func (s *healthState) recordAttempt() {
+// recordPoll marks a completed poll. Only a poll that got as far as reading the
+// inventory counts: one that could not is the case liveness is meant to notice.
+func (s *healthState) recordPoll() {
 	s.mu.Lock()
-	s.inProgress = true
+	s.polledAt = s.now()
+	s.mu.Unlock()
+}
+
+func (s *healthState) passStarted(cluster string, startedAt time.Time) {
+	s.mu.Lock()
+	s.passes[cluster] = startedAt
+	s.mu.Unlock()
+}
+
+func (s *healthState) passFinished(cluster string) {
+	s.mu.Lock()
+	delete(s.passes, cluster)
 	s.mu.Unlock()
 }
 
@@ -52,8 +100,7 @@ func (s *healthState) record(clusters []clusterReport, nextDueIn time.Duration) 
 	defer s.mu.Unlock()
 
 	s.clusters = clusters
-	s.inProgress = false
-	s.nextAttemptAt = time.Now().Add(min(nextDueIn, pollInterval))
+	s.nextAttemptAt = s.now().Add(min(nextDueIn, pollInterval))
 
 	// Readiness means every cluster in the inventory is registered. An unready
 	// pod makes a partial failure visible without stopping the loop: the
@@ -67,19 +114,33 @@ func (s *healthState) record(clusters []clusterReport, nextDueIn time.Duration) 
 	}
 	s.ready = ready
 	if ready {
-		s.lastSuccessAt = time.Now()
+		s.lastSuccessAt = s.now()
 	}
 }
 
-// isLive reports whether the scheduler is still ticking. The grace window
-// absorbs one slow cluster without tripping the liveness probe.
+// isLive reports whether the loop is still making progress.
+//
+// Two things can stop it, and neither used to be visible here. A poll that never
+// returns — an inventory call left hanging by a connection that is accepted and
+// then ignored — used to be read as a pass in progress, which excused liveness
+// indefinitely: the probe reported health for exactly as long as the loop did
+// nothing at all. And a pass that ignores its deadline holds its slot for good,
+// so enough of them stop the fleet reconciling while the polls carry on
+// completing on time.
 func (s *healthState) isLive() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.inProgress || s.nextAttemptAt.IsZero() {
-		return true // startup, or a pass is in progress
+
+	now := s.now()
+	if now.Sub(s.polledAt) > maxProgressAge {
+		return false
 	}
-	return time.Now().Before(s.nextAttemptAt.Add(clusterTimeout + pollInterval))
+	for _, startedAt := range s.passes {
+		if now.Sub(startedAt) > clusterTimeout+passGrace {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *healthState) isReady() bool {

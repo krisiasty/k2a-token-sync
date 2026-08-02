@@ -481,6 +481,22 @@ prunes only what it tracks.
 | `/readyz` | Readiness — passes once every cluster in the inventory has reconciled |
 | `/status` | JSON detail per cluster, including observed certificate expiry. Carries no credential material |
 
+### What liveness actually checks
+
+Clusters reconcile on their own schedules, up to four at a time, and the poll that starts a pass never waits for it to
+finish. That is about more than throughput. A cluster whose API server accepts a connection and then stops answering
+used to hold the whole loop for its five-minute timeout: nothing else became due, an edit went unnoticed, and `/livez`
+reported health the entire time, because it excused any pass in progress. The one state a restart would have fixed was
+the one the probe could not see.
+
+`/livez` fails on either of two things now — no poll has completed for five minutes, or some pass has outlived its own
+five-minute timeout by a minute, which means it is not slow but wedged, since every pass runs under that deadline. The
+first window is several polls wide on purpose: an API server that is briefly unreachable is not something restarting
+this pod fixes, so it must not cause one.
+
+Nothing is dropped when more than four clusters are due at once; the rest queue. Raising that bound is the answer if a
+fleet ever grows large enough for the queue to matter.
+
 Per-cluster state is on the objects themselves, which is the readable view:
 
 ```console
