@@ -53,6 +53,18 @@ jobs:
           curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "${url}" --output "${binary}"
           printf '%s  %s\n' "${BUILDX_SHA256}" "${binary}" | sha256sum --check --strict
           install -D -m 0755 "${binary}" "${HOME}/.docker/cli-plugins/docker-buildx"
+          # Shadowing the runner's copy relies on the CLI preferring
+          # ~/.docker/cli-plugins over the system plugin directory, which is
+          # precedence this workflow does not control. Every other pin here fails
+          # closed; this one would not. Losing it silently leaves the release built
+          # by whichever Buildx the runner image happens to ship, verified by nobody,
+          # and the job still green — so it is asserted rather than assumed.
+          installed="$(docker buildx version)"
+          echo "buildx in use: ${installed}"
+          printf '%s\n' "${installed}" | grep -qF "${BUILDX_VERSION}" || {
+            echo "::error::expected buildx ${BUILDX_VERSION}, but the CLI resolved: ${installed}"
+            exit 1
+          }
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
