@@ -200,13 +200,45 @@ helm install k2a-token-sync ./charts/k2a-token-sync \
 There is nothing here about clusters, and that is the point: the inventory lives in the API, so adding one needs no
 release upgrade.
 
-#### Upgrading the CRD
-
-Helm installs `crds/` but never upgrades it. When a release changes the schema, apply it explicitly:
+#### Upgrading
 
 ```bash
+# 1. the CRD, if this release changed it — Helm installs crds/ and never touches it again
 kubectl apply -f charts/k2a-token-sync/crds/
+
+# 2. the release
+helm upgrade k2a-token-sync ./charts/k2a-token-sync \
+  --namespace k2a-token-sync \
+  --set image.tag=v0.11.0 --wait --timeout 5m
 ```
+
+**The CRD comes first, and only when it changed.** Helm applies `crds/` at install and ignores it ever after, so a
+schema change is yours to apply. Order matters whenever a release adds status fields: the API server prunes anything the
+schema does not know, so a new binary writing to an old CRD loses exactly the state it just computed, and loses it
+silently. `kubectl diff -f charts/k2a-token-sync/crds/` answers whether there is anything to do — it exits 0 when there
+is not, which is the common case.
+
+**Name the version.** `image.tag` has no default, so an upgrade that omits it fails to render rather than quietly
+keeping the running one. That is deliberate, and it is why `--reuse-values` is the wrong habit here: the version you are
+deploying should be stated, not inherited from whatever was set last time.
+
+**What it does to reconciliation.** One replica and a `Recreate` strategy — two instances would race to mint and publish
+the same credentials — so there is a gap of a few seconds where nothing reconciles. Nothing depends on that gap: ArgoCD
+holds credentials with days or weeks left and never talks to this tool.
+
+**`--wait` is worth more here than usual.** Readiness is not "the container started": it passes once every cluster in the
+inventory has completed a pass *in the new process*. So a green `helm upgrade --wait` means the new version has actually
+reconciled the whole fleet, which is the thing you wanted to know. The corollary is that one unhealthy cluster will hold
+the rollout open until the timeout — usually what you want, occasionally not.
+
+`--atomic` will roll back automatically if that happens. Worth it when nobody is watching; against it, a rollback also
+destroys the evidence of why the new version could not reconcile.
+
+Afterwards, `kubectl -n k2a-token-sync get ccon` should show every cluster `Ready` with a recent `lastSyncTime`, and the
+pod should be running the tag you named.
+
+**Rolling back** is `helm rollback k2a-token-sync`. The CRD is not rolled back and does not need to be: fields an older
+binary never writes are inert, so a newer schema is safe under an older release.
 
 #### ArgoCD
 
