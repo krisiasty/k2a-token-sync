@@ -9,6 +9,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
+	"github.com/krisiasty/k2a-token-sync/internal/argocd"
 	"github.com/krisiasty/k2a-token-sync/internal/config"
 )
 
@@ -53,4 +55,29 @@ func TestArgoCDSecretError(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Reporting Ready=True while knowing ArgoCD holds a credential this tool did not
+// publish would be a lie about the one thing the object exists to report. The
+// failure has to reach status, and the recorded digest has to survive it — that
+// digest is what the next pass compares against, so losing it would hide the
+// replacement permanently.
+func TestReplacedCredentialIsAFailureWithTheDigestStillRecorded(t *testing.T) {
+	t.Parallel()
+
+	var status v1alpha1.ClusterConnectionStatus
+	recordFingerprint(&status, argocd.Fingerprint{
+		Server:         "https://10.1.0.10:6443",
+		CredentialHash: "the-digest-this-tool-published",
+	})
+
+	err := fmt.Errorf("%w: overwritten", errCredentialReplaced)
+
+	if got := reasonFor(err); got != v1alpha1.ReasonCredentialReplaced {
+		t.Errorf("reasonFor = %q, want %q — EndpointUnreachable would blame the wrong thing",
+			got, v1alpha1.ReasonCredentialReplaced)
+	}
+	if status.AppliedCredentialHash != "the-digest-this-tool-published" {
+		t.Errorf("recorded digest = %q, want what was published", status.AppliedCredentialHash)
+	}
 }

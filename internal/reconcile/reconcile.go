@@ -270,19 +270,23 @@ func (r *Reconciler) reconcile(
 	// credential in that response — and recording that would adopt somebody else's
 	// token as this tool's own, leaving the comparison satisfied by it forever.
 	//
-	// The response is still worth reading. Differing already means exactly that
-	// happened, in the width of one round trip, which the next pass would report
-	// anyway; saying so now names it while the cause is still in view.
-	if observed != written {
-		logger.Warn("the credential just published was overwritten immediately, before this pass finished",
-			"secret", desired.Namespace+"/"+desired.Name,
-			"hint", "something else is writing this Secret; see the warning against provisioning it declaratively",
-		)
-	}
-
+	// Recorded before the check below, because the check can fail the pass and this
+	// is the reference the next one compares against. Status is written either way.
 	fingerprint := desired.Fingerprint()
 	fingerprint.CredentialHash = written
 	recordFingerprint(status, fingerprint)
+
+	// Differing means the credential was overwritten within one round trip, so
+	// ArgoCD is holding something this tool did not mint and cannot renew. Saying
+	// Ready=True here would be a lie about the one thing this object exists to
+	// report, so the pass fails: the condition names the cause, and backoff paces
+	// the retries rather than minting a fresh token against a contested Secret
+	// every five minutes.
+	if observed != written {
+		return fmt.Errorf("%w: the credential published to %s/%s was overwritten before this pass finished; "+
+			"something else is writing that Secret, which must not be provisioned declaratively",
+			errCredentialReplaced, desired.Namespace, desired.Name)
+	}
 	// The reason alone would read as a state rather than an action: "cluster secret
 	// does not exist" is not what the pass did, and it is untrue by the time it is
 	// recorded. Naming the action keeps the field consistent with "up-to-date" and
@@ -352,6 +356,8 @@ func reasonFor(err error) string {
 		return v1alpha1.ReasonCertificateInvalid
 	case errors.Is(err, errCredentialRejected):
 		return v1alpha1.ReasonCredentialRejected
+	case errors.Is(err, errCredentialReplaced):
+		return v1alpha1.ReasonCredentialReplaced
 	default:
 		return v1alpha1.ReasonEndpointUnreachable
 	}
@@ -375,6 +381,13 @@ var (
 	// obvious alternative, EndpointUnreachable, would be actively misleading: the
 	// endpoint answered, and said no.
 	errCredentialRejected = errors.New("minted credential rejected")
+
+	// errCredentialReplaced means something overwrote the credential between this
+	// tool publishing it and the next call in the same pass. Nothing here is broken
+	// — the token was good when it was written — but ArgoCD now holds one this tool
+	// did not mint and cannot renew, so the cluster is not in the state this object
+	// claims.
+	errCredentialReplaced = errors.New("published credential was overwritten")
 )
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.

@@ -273,12 +273,14 @@ type Fingerprint struct {
 	TokenExpiresAt time.Time
 	TokenIssuedAt  time.Time
 
-	// CredentialHash digests the credential this tool last published.
+	// CredentialHash digests the credential this tool last published, taken from
+	// the payload it sent.
 	//
-	// Every other field here describes what was *wanted*. This one records what
-	// was actually left on the server, so the next pass can tell its own
-	// credential apart from somebody else's — which is the one thing an apply
-	// response can reveal about a Secret nothing here may read.
+	// Every other field here describes what was wanted, and this one is no
+	// different: it is the credential this tool intended ArgoCD to hold. What the
+	// server actually holds arrives separately, from an apply response, and the two
+	// disagreeing is the whole signal — so this side of the comparison must never
+	// be sourced from a response, or it would agree with whatever it found.
 	CredentialHash string
 }
 
