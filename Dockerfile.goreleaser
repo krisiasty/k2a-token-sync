@@ -1,6 +1,9 @@
 # Used by GoReleaser only. GoReleaser builds the binary for each target arch
 # and places it in the Docker build context before calling docker buildx build.
 # For local builds use the main Dockerfile instead.
-FROM gcr.io/distroless/static-debian12:nonroot
+# Pinned by digest, and deliberately the same digest as the runtime stage of the
+# main Dockerfile: a local build and a released image should not differ in what
+# they are built on. Dependabot bumps both together.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35
 COPY k2a-token-sync /k2a-token-sync
 ENTRYPOINT ["/k2a-token-sync"]

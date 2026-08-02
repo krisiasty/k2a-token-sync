@@ -11,6 +11,15 @@ on:
 permissions:
   contents: read
 
+# Every external action is pinned to a full commit SHA rather than a tag, because
+# a tag is movable: whoever can push one can change what runs here, and this
+# workflow's sibling holds the token that publishes releases. The trailing comment
+# is the release that SHA is, and is what Dependabot rewrites when it bumps the pin.
+#
+# The tools an action downloads are pinned too, since a pinned action that fetches
+# "latest" still runs unreviewed code. Dependabot does not touch those version
+# inputs, so they are bumped by hand — the trade for a CI run that is the same
+# tomorrow as it was today.
 jobs:
   check:
     name: check
@@ -18,10 +27,12 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: setup go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
@@ -52,26 +63,31 @@ jobs:
         run: go test -race ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.12.2
           args: -v
 
+      # Pinned the same way controller-gen is in hack/gen-crd.sh, and for the same
+      # reason: 'go run pkg@version' resolves in isolation and touches neither
+      # go.mod nor the module graph. Pinning the scanner does not stale what it
+      # finds — the vulnerability database is fetched from vuln.go.dev at run time,
+      # so only the analysis improves with a bump, never the data.
       - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
       - name: markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v24
+        uses: DavidAnson/markdownlint-cli2-action@6bf21b07787794f89a243495939cd651942aeabe # v24.1.0
         with:
           globs: "**/*.md"
 
       - name: typos
-        uses: crate-ci/typos@v1
+        uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
       - name: actionlint
-        uses: raven-actions/actionlint@v2
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.12
 
   chart:
     name: chart
@@ -85,10 +101,14 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: setup helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
 
       - name: helm lint
         run: helm lint charts/k2a-token-sync --set "image.tag=${TAG}"

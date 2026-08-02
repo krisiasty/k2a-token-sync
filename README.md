@@ -605,6 +605,12 @@ Releases are published to `ghcr.io/krisiasty/k2a-token-sync` via GitHub Actions 
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
 
+Everything that release path pulls in is pinned to something that cannot move: actions to full commit SHAs, base images
+to digests, and each downloaded tool to an exact version. A tag is a name its owner can repoint at any time, and this is
+a binary that holds `cluster-admin` on every cluster it manages — so what goes into it should only ever change in a
+commit somebody reviewed. Dependabot proposes the bumps for actions and images weekly; tool versions in the workflows
+are bumped by hand.
+
 ### Cutting a release
 
 ```bash

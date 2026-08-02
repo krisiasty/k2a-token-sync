@@ -5,34 +5,55 @@ on:
     tags:
       - "v*"
 
+# Read-only by default, so a job added later has to ask for anything more. The
+# release job below is the only one that publishes, and it holds the write
+# permissions on its own rather than the whole workflow doing so.
 permissions:
-  contents: write  # create GitHub release
-  packages: write  # push to ghcr.io
+  contents: read
 
+# Every external action is pinned to a full commit SHA rather than a tag. This is
+# the workflow where it matters most: it runs with a token that can create
+# releases and push images, so a tag moved upstream would be a way to publish
+# artifacts nobody in this repository reviewed. The trailing comment is the
+# release that SHA is, and is what Dependabot rewrites when it bumps the pin.
 jobs:
   release:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # create GitHub release
+      packages: write  # push to ghcr.io
+
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0  # GoReleaser needs full history for changelog
+          # Without this, checkout leaves the token in .git/config where every
+          # later step can read it. Nothing here needs it: GoReleaser reads the
+          # changelog from local history, publishes over the API with the token
+          # passed to its step, and pushes images with the registry login.
+          persist-credentials: false
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: docker/login-action@v4.5.2
+      - uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - uses: goreleaser/goreleaser-action@v7
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          # An exact release rather than the "~> v2" range this used to carry: a
+          # range is resolved when the workflow runs, so the tool that builds and
+          # signs off the artefacts could differ between two releases cut from the
+          # same commit.
+          version: v2.17.1
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
