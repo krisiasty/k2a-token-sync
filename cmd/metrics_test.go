@@ -12,7 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// scrape returns the exposition as a map of series to value.
+// scrape returns the metrics as a map of series to value.
 //
 // Parsed rather than string-matched because Prometheus writes floats in
 // exponent form, so a timestamp asserted as a literal would be a test of
@@ -76,7 +76,7 @@ func TestClusterGaugesReportTheStatusSnapshot(t *testing.T) {
 	for name, expected := range want {
 		got, found := series[name]
 		if !found {
-			t.Errorf("%s is missing from the exposition", name)
+			t.Errorf("%s is missing from the metric", name)
 			continue
 		}
 		if got != expected {

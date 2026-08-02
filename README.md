@@ -487,7 +487,7 @@ prunes only what it tracks.
 | `/livez` | Liveness — fails if the reconciliation loop has stalled |
 | `/readyz` | Readiness — passes once every cluster in the inventory has reconciled in *this* process |
 | `/status` | JSON detail per cluster, including observed certificate expiry. Carries no credential material |
-| `/metrics` | Prometheus exposition: per-cluster deadlines, plus the standard Go and process collectors |
+| `/metrics` | Prometheus metrics: per-cluster deadlines, plus the standard Go and process collectors |
 
 ### What liveness actually checks
 
