@@ -4,10 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  # The dry run below, on demand. Nothing about a release is exercised by
+  # ordinary CI, so without this the first time the release path runs is the time
+  # it matters, and a failure part way through leaves images in ghcr.io for a
+  # version that has no release — GoReleaser pushes images before it creates one.
+  workflow_dispatch:
 
-# Read-only by default, so a job added later has to ask for anything more. The
-# release job below is the only one that publishes, and it holds the write
-# permissions on its own rather than the whole workflow doing so.
+# Read-only by default, so a job has to ask for anything more. Only the job that
+# actually publishes asks.
 permissions:
   contents: read
 
@@ -16,8 +20,13 @@ permissions:
 # releases and push images, so a tag moved upstream would be a way to publish
 # artifacts nobody in this repository reviewed. The trailing comment is the
 # release that SHA is, and is what Dependabot rewrites when it bumps the pin.
+#
+# The tools those actions would otherwise download are pinned by checksum in
+# .github/actions/release-tools, which both jobs below use.
 jobs:
   release:
+    name: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
 
     permissions:
@@ -39,57 +48,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # setup-buildx otherwise reuses the runner's moving Buildx binary, or
-      # downloads a replaceable release asset when none is installed. Verify the
-      # exact asset before putting it where the pinned action will find it.
-      - name: install buildx
-        env:
-          BUILDX_VERSION: v0.36.0
-          BUILDX_SHA256: 07823fdfcd82a41be90155a8b16876c1a780a6462de805a9f3f63b3119ccfb99
-        run: |
-          set -euo pipefail
-          binary="${RUNNER_TEMP}/docker-buildx"
-          url="https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
-          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "${url}" --output "${binary}"
-          printf '%s  %s\n' "${BUILDX_SHA256}" "${binary}" | sha256sum --check --strict
-          install -D -m 0755 "${binary}" "${HOME}/.docker/cli-plugins/docker-buildx"
-          # Shadowing the runner's copy relies on the CLI preferring
-          # ~/.docker/cli-plugins over the system plugin directory, which is
-          # precedence this workflow does not control. Every other pin here fails
-          # closed; this one would not. Losing it silently leaves the release built
-          # by whichever Buildx the runner image happens to ship, verified by nobody,
-          # and the job still green — so it is asserted rather than assumed.
-          installed="$(docker buildx version)"
-          echo "buildx in use: ${installed}"
-          printf '%s\n' "${installed}" | grep -qF "${BUILDX_VERSION}" || {
-            echo "::error::expected buildx ${BUILDX_VERSION}, but the CLI resolved: ${installed}"
-            exit 1
-          }
-
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-        with:
-          # The docker-container driver defaults to the mutable
-          # moby/buildkit:buildx-stable-1 tag. Keep the readable release tag, but
-          # make the registry resolve this exact multi-platform image index.
-          driver-opts: image=moby/buildkit:v0.32.0@sha256:1f8167fcb0eca5b7126353d35299386945cbb8949cc516c592a49f80cfce4fa2
-
-      # GoReleaser's action checks the archive against checksums.txt from the same
-      # replaceable release, then silently skips its signature when cosign is not
-      # on the runner. A committed digest makes substitution fail closed.
-      - name: install goreleaser
-        env:
-          GORELEASER_VERSION: v2.17.1
-          GORELEASER_SHA256: a99bbc7ae0d8d897b07c4c497a9b62f222558804715ef219d1af05a7e417bc80
-        run: |
-          set -euo pipefail
-          archive="${RUNNER_TEMP}/goreleaser.tar.gz"
-          tool_dir="${RUNNER_TEMP}/goreleaser"
-          url="https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz"
-          curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "${url}" --output "${archive}"
-          printf '%s  %s\n' "${GORELEASER_SHA256}" "${archive}" | sha256sum --check --strict
-          mkdir -p "${tool_dir}"
-          tar -xzf "${archive}" -C "${tool_dir}" goreleaser
-          printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
+      - uses: ./.github/actions/release-tools
 
       - uses: docker/login-action@371161bbe7024a29a25c5e19bfcbc0804fe9ad2c # v4.5.2
         with:
@@ -101,3 +60,41 @@ jobs:
         run: goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Everything the release job does short of publishing: the same checkout, the
+  # same pinned tools, the same binaries and the same multi-arch image builds
+  # through the pinned Buildx and BuildKit. Snapshot mode needs no tag, and the
+  # docker build runs in GoReleaser's build phase while only the push lives in
+  # publish — so skipping publish still exercises the part worth exercising.
+  #
+  # It reads git history the way the real changelog does, which is what makes it
+  # a genuine test of running with no persisted git credential.
+  #
+  # No write permissions and no registry login: this proves the release path
+  # works without holding the ability to use it.
+  dry-run:
+    name: dry run
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: ./.github/actions/release-tools
+
+      # --snapshot already implies --skip=publish. Both are given because this job
+      # is one flag away from publishing for real, and that is not a thing to leave
+      # implied.
+      - name: build a release without publishing it
+        run: goreleaser release --snapshot --clean --skip=publish

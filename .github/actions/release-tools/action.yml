@@ -1,0 +1,63 @@
+name: release tools
+description: >
+  Installs the pinned Buildx, BuildKit and GoReleaser that build a release.
+
+# Shared by the two jobs in release.yaml rather than written out in each. A dry
+# run that installed its tools separately would drift from the real path and stop
+# proving anything about it, which is the one thing it exists to do.
+runs:
+  using: composite
+  steps:
+    # setup-buildx otherwise reuses the runner's moving Buildx binary, or
+    # downloads a replaceable release asset when none is installed. Verify the
+    # exact asset before putting it where the pinned action will find it.
+    - name: install buildx
+      shell: bash
+      env:
+        BUILDX_VERSION: v0.36.0
+        BUILDX_SHA256: 07823fdfcd82a41be90155a8b16876c1a780a6462de805a9f3f63b3119ccfb99
+      run: |
+        set -euo pipefail
+        binary="${RUNNER_TEMP}/docker-buildx"
+        url="https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64"
+        curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "${url}" --output "${binary}"
+        printf '%s  %s\n' "${BUILDX_SHA256}" "${binary}" | sha256sum --check --strict
+        install -D -m 0755 "${binary}" "${HOME}/.docker/cli-plugins/docker-buildx"
+        # Shadowing the runner's copy relies on the CLI preferring
+        # ~/.docker/cli-plugins over the system plugin directory, which is
+        # precedence this workflow does not control. Every other pin here fails
+        # closed; this one would not. Losing it silently leaves the release built
+        # by whichever Buildx the runner image happens to ship, verified by nobody,
+        # and the job still green — so it is asserted rather than assumed.
+        installed="$(docker buildx version)"
+        echo "buildx in use: ${installed}"
+        printf '%s\n' "${installed}" | grep -qF "${BUILDX_VERSION}" || {
+          echo "::error::expected buildx ${BUILDX_VERSION}, but the CLI resolved: ${installed}"
+          exit 1
+        }
+
+    - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      with:
+        # The docker-container driver defaults to the mutable
+        # moby/buildkit:buildx-stable-1 tag. Keep the readable release tag, but
+        # make the registry resolve this exact multi-platform image index.
+        driver-opts: image=moby/buildkit:v0.32.0@sha256:1f8167fcb0eca5b7126353d35299386945cbb8949cc516c592a49f80cfce4fa2
+
+    # GoReleaser's action checks the archive against checksums.txt from the same
+    # replaceable release, then silently skips its signature when cosign is not
+    # on the runner. A committed digest makes substitution fail closed.
+    - name: install goreleaser
+      shell: bash
+      env:
+        GORELEASER_VERSION: v2.17.1
+        GORELEASER_SHA256: a99bbc7ae0d8d897b07c4c497a9b62f222558804715ef219d1af05a7e417bc80
+      run: |
+        set -euo pipefail
+        archive="${RUNNER_TEMP}/goreleaser.tar.gz"
+        tool_dir="${RUNNER_TEMP}/goreleaser"
+        url="https://github.com/goreleaser/goreleaser/releases/download/${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz"
+        curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error --retry 3 "${url}" --output "${archive}"
+        printf '%s  %s\n' "${GORELEASER_SHA256}" "${archive}" | sha256sum --check --strict
+        mkdir -p "${tool_dir}"
+        tar -xzf "${archive}" -C "${tool_dir}" goreleaser
+        printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
