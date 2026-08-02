@@ -139,10 +139,10 @@ func selfCredentialThreatensAccess(
 		return "", "", false
 	}
 
+	deadline, _ := describeDeadline(expiresAt, now)
 	return v1alpha1.ReasonSelfCredentialExpiring, fmt.Sprintf(
-		"ArgoCD still holds a usable credential, but k2a-token-sync cannot renew its own and that expires %s, "+
-			"in %s; see the SelfCredentialValid condition",
-		expiresAt.UTC().Format(time.RFC3339), expiresAt.Sub(now).Round(time.Minute)), true
+		"ArgoCD still holds a usable credential, but k2a-token-sync cannot renew its own and that one %s; "+
+			"see the SelfCredentialValid condition", deadline), true
 }
 
 func (r *Reconciler) reconcile(
@@ -156,7 +156,16 @@ func (r *Reconciler) reconcile(
 	if err != nil {
 		return err
 	}
-	if !access.expiresAt.IsZero() {
+	// Mirror what the credential in use actually says, including when it says
+	// nothing. Keeping a previous value would leave Ready judged against a deadline
+	// belonging to a credential that is no longer there, while the condition
+	// explaining the failure quoted a different one — two answers to one question.
+	// The issue time goes with it: this tool always writes an expiry, so a
+	// credential without one is not the one this tool last issued.
+	if access.expiresAt.IsZero() {
+		status.SelfCredentialExpiresAt = nil
+		status.SelfCredentialIssuedAt = nil
+	} else {
 		status.SelfCredentialExpiresAt = &metav1.Time{Time: access.expiresAt}
 	}
 
@@ -651,25 +660,35 @@ func (r *Reconciler) maintainSelfCredential(
 		return
 	}
 
-	remaining := access.expiresAt.Sub(now)
-	message := fmt.Sprintf("%v; the credential in use expires %s, in %s, after which this cluster has to be "+
-		"bootstrapped again", err, access.expiresAt.UTC().Format(time.RFC3339), remaining.Round(time.Minute))
+	deadline, remaining := describeDeadline(access.expiresAt, now)
 	setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionFalse, reason,
-		message, status.ObservedGeneration)
+		fmt.Sprintf("%v; the credential in use %s, after which this cluster has to be bootstrapped again",
+			err, deadline), status.ObservedGeneration)
 
 	// Severity follows what is left, not what went wrong. The same failure is
 	// unremarkable with eighty days in hand and an emergency with two hours.
 	if selfCredentialCritical(cluster, issuedAt, access.expiresAt, now) {
 		logger.Error("cannot renew k2a-token-sync's own credential, and it is running out",
-			"expires_at", access.expiresAt.UTC().Format(time.RFC3339),
-			"remaining", remaining.Round(time.Minute).String(),
-			"error", err)
+			"deadline", deadline, "remaining", remaining, "error", err)
 		return
 	}
 	logger.Warn("could not renew k2a-token-sync's own credential; the current one still works",
-		"expires_at", access.expiresAt.UTC().Format(time.RFC3339),
-		"remaining", remaining.Round(time.Minute).String(),
-		"error", err)
+		"deadline", deadline, "remaining", remaining, "error", err)
+}
+
+// describeDeadline renders a credential's expiry for people, including the case
+// where there is none to render.
+//
+// A missing or unparsable expires-at is deliberately tolerated when reading a
+// credential, so this has to survive the zero time. Subtracting it from now gives
+// -2562047h, which in a status message would look like a bug in this tool rather
+// than a fact about the Secret.
+func describeDeadline(expiresAt, now time.Time) (deadline, remaining string) {
+	if expiresAt.IsZero() {
+		return "has no recorded expiry, so how long it has left is unknown", "unknown"
+	}
+	left := expiresAt.Sub(now).Round(time.Minute)
+	return fmt.Sprintf("expires %s, in %s", expiresAt.UTC().Format(time.RFC3339), left), left.String()
 }
 
 // selfCredentialCritical reports whether a continuing renewal failure now
@@ -681,7 +700,13 @@ func (r *Reconciler) maintainSelfCredential(
 // waiting for a proportional one would mean waiting until it was nearly gone.
 func selfCredentialCritical(cluster config.Cluster, issuedAt, expiresAt, now time.Time) bool {
 	if expiresAt.IsZero() {
-		return false
+		// No recorded expiry, and renewal is what would have established one:
+		// reading a credential tolerates a missing expires-at precisely because the
+		// next renewal replaces it with a deadline that is known. Reaching here
+		// means that did not happen, so nothing rules out the credential expiring
+		// within the hour. An unanswerable question about losing a cluster is
+		// answered pessimistically.
+		return true
 	}
 	granted := cluster.SelfTokenTTL
 	if !issuedAt.IsZero() {

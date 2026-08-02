@@ -141,6 +141,11 @@ Once the remaining lifetime falls below a quarter of what was granted — or bel
 longer, so a credential the API server capped short counts as urgent immediately — `Ready` goes `False` too, because at
 that point the question is no longer freshness but whether this cluster is about to need bootstrapping by hand.
 
+A credential carrying no readable `expires-at` counts as urgent from the first failure. Reading one is tolerant of a
+missing expiry precisely because the next renewal replaces it with a deadline that is known; if that renewal is what
+fails, the tool holds something that works and cannot say whether it has ninety days or ninety seconds left, and an
+unanswerable question about losing a cluster is answered pessimistically.
+
 **The downtime budget.** `selfTokenTTL` measured from the *last renewal*, which happens daily, so about 90 days by
 default. Nothing else breaks meanwhile: ArgoCD's own token stays valid until its own expiry. Past that, bootstrap the
 cluster again — the `kubectl get ccon` output will say `CredentialExpired` rather than reporting a bare 401.

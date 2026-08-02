@@ -543,3 +543,81 @@ func TestASuccessfulRenewalClearsTheCondition(t *testing.T) {
 		t.Error("a successful renewal left the object still reporting a failure")
 	}
 }
+
+// A credential with no recorded expiry is explicitly tolerated when read, on the
+// understanding that the next renewal replaces it with one whose deadline is
+// known. When that renewal is what fails, the tool is blind: it holds a working
+// credential and cannot say whether it has ninety days or ninety seconds.
+func TestAFailingRenewalWithNoRecordedExpiryIsTreatedAsUrgent(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster()
+
+	local := fake.NewClientset(storedCredential(time.Time{})) // no expires-at
+	downstreamClient := fake.NewClientset(rootCA())
+	failsTo(downstreamClient, "create", "serviceaccounts", "serviceaccounts/token is forbidden")
+
+	r := newReconciler(local, func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil })
+	r.now = func() time.Time { return now }
+
+	var status v1alpha1.ClusterConnectionStatus
+	access := &clusterAccess{client: downstreamClient, ca: testCA}
+
+	r.maintainSelfCredential(t.Context(), cluster, access, &status, r.logger, now)
+
+	condition := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSelfCredentialValid)
+	if condition == nil || condition.Status != metav1.ConditionFalse {
+		t.Fatal("a failing renewal was not reported")
+	}
+
+	// The zero time subtracted from now is -2562047h, which in a status message
+	// reads as a bug in this tool rather than a fact about the Secret.
+	if strings.Contains(condition.Message, "0001-01-01") || strings.Contains(condition.Message, "-2562047") {
+		t.Errorf("the message renders the zero time as though it were a deadline: %q", condition.Message)
+	}
+	if !strings.Contains(condition.Message, "unknown") {
+		t.Errorf("the message does not say the expiry is unknown: %q", condition.Message)
+	}
+
+	// Policy: nothing rules out this credential expiring within the hour.
+	if _, _, threatened := selfCredentialThreatensAccess(cluster, status, now); !threatened {
+		t.Error("an unknown deadline with renewal failing was treated as comfortable")
+	}
+}
+
+// Status has to describe the credential actually in use. A previous expiry left
+// behind would have Ready judged against one deadline while the condition
+// explaining the failure quoted another.
+func TestAnUnknownExpiryClearsWhatStatusRemembered(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	cluster := testCluster()
+	stale := now.Add(2000 * time.Hour)
+
+	local := fake.NewClientset(storedCredential(time.Time{})) // the Secret lost its expires-at
+	downstreamClient := fake.NewClientset(rootCA())
+	failsTo(downstreamClient, "create", "serviceaccounts", "serviceaccounts/token is forbidden")
+
+	r := newReconciler(local, func() (kubernetes.Interface, error) { return fake.NewClientset(rootCA()), nil })
+	r.now = func() time.Time { return now }
+
+	status := v1alpha1.ClusterConnectionStatus{
+		SelfCredentialExpiresAt: &metav1.Time{Time: stale},
+		SelfCredentialIssuedAt:  &metav1.Time{Time: now.Add(-160 * time.Hour)},
+	}
+
+	if err := r.reconcile(t.Context(), cluster, &status, r.logger, now); err == nil {
+		t.Log("reconcile completed; only the recorded expiry matters here")
+	}
+
+	if status.SelfCredentialExpiresAt != nil {
+		t.Errorf("status still claims the credential expires %v, which belongs to a credential that is gone",
+			status.SelfCredentialExpiresAt)
+	}
+	if status.SelfCredentialIssuedAt != nil {
+		t.Errorf("status still claims an issue time of %v for a credential this tool did not write",
+			status.SelfCredentialIssuedAt)
+	}
+}
