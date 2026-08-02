@@ -188,6 +188,9 @@ func (f *fakeReconciler) Cluster(
 	status := prior
 	status.ObservedGeneration = generation
 	status.LastAction = "up-to-date"
+	// Stands for the pass's own work: the record of what it published, which a
+	// later writer must not drop.
+	status.AppliedCredentialHash = "sha256:published-" + cluster.Name
 	// The real reconciler sets Ready on every path it returns from, and tests about
 	// stale conditions depend on that, so the fake does too.
 	meta.SetStatusCondition(&status.Conditions, metav1.Condition{

@@ -243,3 +243,62 @@ func (r *refusingInventory) UpdateStatus(
 }
 
 var _ clusterInventory = (*refusingInventory)(nil)
+
+// A verdict can be formed while a pass is running, and the pass must not undo it.
+//
+// The pass computed its result before the conflict existed, so writing that result
+// puts Ready=True back on an object this tool has just stopped reconciling. In the
+// conflict case the fix is deleting the other object, so this one's generation
+// never changes and nothing about that Ready=True looks stale — it simply reads as
+// a healthy cluster that is quietly no longer being maintained.
+func TestAPassFinishingAfterTheVerdictDoesNotUndoIt(t *testing.T) {
+	t.Parallel()
+
+	const reason = `secretName "cluster-shared" is also claimed by "other"`
+
+	inv := newFakeInventory("late")
+	rec := newFakeReconciler("late")
+	s := testScheduler(t, inv, rec)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	s.tick(ctx)
+	waitFor(t, "the pass to start", func() bool { return rec.passes("late") == 1 })
+
+	// The other claimant appears while the pass is in flight, too late to stop it.
+	inv.mu.Lock()
+	inv.invalid["late"] = reason
+	inv.cause["late"] = v1alpha1.ReasonSecretNameConflict
+	inv.mu.Unlock()
+
+	s.tick(ctx)
+	if _, ok := inv.written["late"]; !ok {
+		t.Fatal("the poll did not write the verdict while the pass was running")
+	}
+
+	rec.releaseAll()
+	s.wg.Wait()
+
+	written := inv.written["late"]
+	ready := condition(t, written, v1alpha1.ConditionReady)
+	if ready.Status != metav1.ConditionFalse || ready.Reason != v1alpha1.ReasonSecretNameConflict {
+		t.Errorf("the finishing pass left Ready=%s/%s over the verdict", ready.Status, ready.Reason)
+	}
+	if conflict := condition(t, written, v1alpha1.ConditionConflict); conflict.Status != metav1.ConditionTrue {
+		t.Errorf("the finishing pass cleared the Conflict condition, which it does not get to decide")
+	}
+
+	// The pass did publish, and what it published is worth keeping: without it the
+	// next pass to run would reissue a credential that is perfectly current.
+	if written.AppliedCredentialHash != "sha256:published-late" {
+		t.Errorf("the pass's own record of what it published was dropped: %q", written.AppliedCredentialHash)
+	}
+
+	// And the two writers must agree, or every poll would rewrite the object.
+	before := inv.writes
+	s.tick(ctx)
+	if inv.writes != before {
+		t.Errorf("%d further writes; the pass and the poll disagree about the verdict", inv.writes-before)
+	}
+}

@@ -285,7 +285,7 @@ func (s *scheduler) rejectedNeedingStatus() []rejection {
 		if state.invalidReason == "" {
 			continue
 		}
-		desired := rejectedStatus(state)
+		desired := rejectedStatus(state.status, state)
 		// Compared exactly. Both sides come from the same read, so everything this
 		// does not touch is identical by construction, and the cost of being wrong is
 		// one redundant write rather than a missing one.
@@ -298,10 +298,15 @@ func (s *scheduler) rejectedNeedingStatus() []rejection {
 	return out
 }
 
-// rejectedStatus is what an object should say while this tool is declining to
-// reconcile it. The caller holds the lock.
-func rejectedStatus(state *clusterState) v1alpha1.ClusterConnectionStatus {
-	status := state.status
+// rejectedStatus lays the verdict over a status: what an object should say while
+// this tool is declining to reconcile it. The caller holds the lock.
+//
+// It takes the status to work from rather than reading state.status, because it
+// has two callers with two different starting points — the poll, which has only
+// what the object already says, and a pass that finished after the verdict was
+// formed, which has its own result and a fingerprint worth keeping. Applying it
+// twice changes nothing, so the two agreeing matters more than which writes last.
+func rejectedStatus(status v1alpha1.ClusterConnectionStatus, state *clusterState) v1alpha1.ClusterConnectionStatus {
 	status.Conditions = slices.Clone(status.Conditions)
 
 	// The generation that was rejected, so that fixing the object is visibly
@@ -532,6 +537,38 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	defer cancel()
 
 	status, err := s.rec.Cluster(passCtx, cluster, prior, generation)
+
+	// A verdict can be formed while a pass is running: any poll may find the object
+	// contested or its spec broken, and this pass started before that. Writing its
+	// own result now would put Ready=True back on an object this tool has just
+	// stopped reconciling — and in the conflict case the generation has not changed,
+	// so nothing about that Ready=True would look stale.
+	//
+	// So the verdict goes over the pass's result rather than the pass's result over
+	// the verdict. Both writers apply the same one, which is what makes it safe for
+	// either to write last; what the pass adds is its own fingerprint, since it did
+	// publish a credential and dropping that would cost a needless reissue later.
+	//
+	// Departure is deliberately not a verdict here, unlike at the start of a pass:
+	// there may no longer be an object to write to, and "no longer in the inventory"
+	// is not something to say about a spec.
+	//
+	// What this does not close is a verdict formed in the moment between this read
+	// and the write below: the object then carries the pass's result until the next
+	// poll writes the verdict over it. Closing that needs a per-object lock held
+	// across two API calls, which is a lot of machinery for one poll of staleness
+	// that repairs itself.
+	s.mu.Lock()
+	blocked := state.invalidReason
+	if blocked != "" {
+		status = rejectedStatus(status, state)
+	}
+	s.mu.Unlock()
+
+	if blocked != "" {
+		s.logger.Info("a pass finished for a cluster that has since been blocked",
+			"cluster", cluster.Name, "reason", blocked)
+	}
 
 	if writeErr := s.writeStatus(ctx, cluster.Name, status); writeErr != nil {
 		// Losing the status write is not fatal, but it does mean the next pass
