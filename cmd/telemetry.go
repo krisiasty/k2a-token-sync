@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	telemetrySampleInterval = 5 * time.Second
+	telemetrySampleInterval = time.Second
 	telemetryReportInterval = 10 * time.Minute
 )
 

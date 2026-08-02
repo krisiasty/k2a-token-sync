@@ -244,7 +244,7 @@ func TestTelemetrySamplingReportingAndCollectionAreConcurrentSafe(t *testing.T) 
 }
 
 func TestTelemetryIntervals(t *testing.T) {
-	if telemetrySampleInterval != 5*time.Second {
+	if telemetrySampleInterval != time.Second {
 		t.Fatalf("sample interval = %v", telemetrySampleInterval)
 	}
 	if telemetryReportInterval != 10*time.Minute {
