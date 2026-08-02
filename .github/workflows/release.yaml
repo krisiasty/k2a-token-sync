@@ -48,6 +48,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: verify third-party licenses and notices
+        run: |
+          ./hack/gen-notices.sh
+          git diff --exit-code -- internal/legal/THIRD_PARTY_NOTICES
+          git ls-files --error-unmatch internal/legal/THIRD_PARTY_NOTICES
+
       - uses: ./.github/actions/release-tools
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -90,6 +96,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: verify third-party licenses and notices
+        run: |
+          ./hack/gen-notices.sh
+          git diff --exit-code -- internal/legal/THIRD_PARTY_NOTICES
+          git ls-files --error-unmatch internal/legal/THIRD_PARTY_NOTICES
 
       - uses: ./.github/actions/release-tools
 

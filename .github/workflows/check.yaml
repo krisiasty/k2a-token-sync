@@ -45,6 +45,12 @@ jobs:
       - name: go mod verify
         run: go mod verify
 
+      - name: third-party licenses are allowed and notices are current
+        run: |
+          ./hack/gen-notices.sh
+          git diff --exit-code -- internal/legal/THIRD_PARTY_NOTICES
+          git ls-files --error-unmatch internal/legal/THIRD_PARTY_NOTICES
+
       # The CRD schema is generated from api/v1alpha1, so a field added to the
       # Go types without regenerating would be pruned by the API server rather
       # than reported. Same idea as the go mod tidy check above.

@@ -623,6 +623,9 @@ docker build -t k2a-token-sync:latest .
 go test ./...
 golangci-lint run
 
+# Regenerate and validate dependency license notices
+./hack/gen-notices.sh
+
 # image.tag is required, so the chart needs one to render — any value will do
 # when you are only checking the templates
 helm lint charts/k2a-token-sync --set image.tag=v0.10.0
@@ -634,6 +637,10 @@ The versions in the examples above are illustrative — deploy whatever is curre
 Releases are published to `ghcr.io/krisiasty/k2a-token-sync` via GitHub Actions using GoReleaser. Multi-arch images
 (`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
 archives for running the `bootstrap` subcommand from a workstation.
+
+Every binary embeds the dependency license texts and attribution notices generated from its released build graphs.
+Run `k2a-token-sync licenses` to print them. Release archives also contain `LICENSE`, `NOTICE` and
+`THIRD_PARTY_NOTICES` as separate files.
 
 Everything that release path pulls in is pinned to something that cannot move: actions to full commit SHAs, images to
 digests, and downloaded release tools to exact versions and committed SHA-256 checksums. A tag or release asset can be

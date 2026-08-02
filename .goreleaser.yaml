@@ -63,6 +63,12 @@ docker_manifests:
 archives:
   - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - src: internal/legal/THIRD_PARTY_NOTICES
+        dst: THIRD_PARTY_NOTICES
 
 checksum:
   name_template: checksums.txt
