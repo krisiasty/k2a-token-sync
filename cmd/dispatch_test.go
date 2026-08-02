@@ -39,6 +39,11 @@ type fakeInventory struct {
 
 	// hang holds List until it is closed or the call's context ends.
 	hang chan struct{}
+
+	// onFirstWrite runs once, during the first status write, and is how a test puts
+	// something in the gap between a writer deciding what to say and the API
+	// receiving it.
+	onFirstWrite func()
 }
 
 func newFakeInventory(names ...string) *fakeInventory {
@@ -119,12 +124,20 @@ func (f *fakeInventory) invalidCause(name string) string {
 
 func (f *fakeInventory) UpdateStatus(_ context.Context, name string, status v1alpha1.ClusterConnectionStatus) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.written[name] = status
 	f.writes++
 	// Read back by the next List, as the API server's copy would be. Without this a
 	// test cannot tell a write that happens once from one that repeats every poll.
 	f.prior[name] = status
+	hook := f.onFirstWrite
+	f.onFirstWrite = nil
+	f.mu.Unlock()
+
+	// Run outside the fake's own lock: hooks reach into the scheduler, and nothing
+	// that holds the scheduler's lock ever calls in here.
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 

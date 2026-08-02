@@ -302,3 +302,54 @@ func TestAPassFinishingAfterTheVerdictDoesNotUndoIt(t *testing.T) {
 		t.Errorf("%d further writes; the pass and the poll disagree about the verdict", inv.writes-before)
 	}
 }
+
+// The narrow ordering: a verdict formed while the pass's write was already in
+// flight. The pass cannot have seen it, so it writes Ready=True over a decision
+// this tool has already taken — and with the generation unmoved, that reads as a
+// healthy cluster rather than as a stale one.
+//
+// The hook puts the verdict in exactly that gap, which is the one place a test can
+// reach it: between the writer deciding what to say and the API receiving it.
+func TestAVerdictFormedDuringAPassesWriteStillLands(t *testing.T) {
+	t.Parallel()
+
+	const reason = `secretName "cluster-shared" is also claimed by "other"`
+
+	inv := newFakeInventory("racing")
+	rec := newFakeReconciler()
+	s := testScheduler(t, inv, rec)
+
+	inv.onFirstWrite = func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		state := s.state["racing"]
+		state.invalidReason = reason
+		state.invalidCause = v1alpha1.ReasonSecretNameConflict
+	}
+
+	s.tick(t.Context())
+	s.wg.Wait()
+
+	written := inv.written["racing"]
+	ready := condition(t, written, v1alpha1.ConditionReady)
+	if ready.Status != metav1.ConditionFalse || ready.Reason != v1alpha1.ReasonSecretNameConflict {
+		t.Errorf("the object was left saying Ready=%s/%s after being blocked mid-write",
+			ready.Status, ready.Reason)
+	}
+	if conflict := condition(t, written, v1alpha1.ConditionConflict); conflict.Status != metav1.ConditionTrue {
+		t.Error("no Conflict condition after being blocked mid-write")
+	}
+
+	// The second write is laid over the first, so what the pass published is still
+	// recorded. Losing it would cost a reissue of a credential that is current.
+	if written.AppliedCredentialHash != "sha256:published-racing" {
+		t.Errorf("the pass's record of what it published was dropped: %q", written.AppliedCredentialHash)
+	}
+
+	// And it settles: the poll that follows finds the object already saying it.
+	before := inv.writes
+	s.tick(t.Context())
+	if inv.writes != before {
+		t.Errorf("%d further writes after the verdict settled", inv.writes-before)
+	}
+}
