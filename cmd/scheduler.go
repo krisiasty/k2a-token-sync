@@ -129,8 +129,20 @@ type clusterState struct {
 	// the polls that happen during a long pass from starting a second one.
 	running bool
 
-	// invalidReason is set when the object's spec cannot be resolved. Such a
-	// cluster is never reconciled, but it is still reported.
+	// departed is set when a poll no longer finds this cluster in the inventory
+	// but a pass for it is still in flight, so the state cannot be dropped yet.
+	departed bool
+
+	// passedGeneration is the spec generation this process last reconciled
+	// successfully, and it is what readiness is judged on. Generations start at
+	// one, so a zero here means this process has not yet finished a pass for this
+	// cluster — which the persisted status cannot tell us, since it describes what
+	// some earlier process did.
+	passedGeneration int64
+
+	// invalidReason is set when the object's spec cannot be resolved, or when
+	// another ClusterConnection claims the same Secret. Such a cluster is never
+	// reconciled, but it is still reported.
 	invalidReason string
 }
 
@@ -255,6 +267,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		state.generation = entry.Generation
 		state.status = entry.Status
 		state.invalidReason = entry.InvalidReason
+		state.departed = false
 	}
 
 	for name, state := range s.state {
@@ -263,8 +276,11 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		}
 		// A pass still holds this state and will write its result to it. Dropping
 		// it now would let the same cluster be dispatched twice if it reappeared
-		// before the pass finished, so it goes at the next poll instead.
+		// before the pass finished, so it goes at the next poll instead — marked,
+		// so that a pass still waiting for a slot abandons rather than publishing a
+		// credential for a cluster that has just been decommissioned.
 		if state.running {
+			state.departed = true
 			continue
 		}
 		delete(s.state, name)
@@ -317,7 +333,7 @@ func (s *scheduler) claimDue() []*clusterState {
 	cutoff := s.now().Add(dueSlack)
 	var due []*clusterState
 	for _, state := range s.state {
-		if state.running || state.invalidReason != "" || state.dueAt.After(cutoff) {
+		if state.running || blockedReason(state) != "" || state.dueAt.After(cutoff) {
 			continue
 		}
 		state.running = true
@@ -329,6 +345,19 @@ func (s *scheduler) claimDue() []*clusterState {
 	return due
 }
 
+// blockedReason says why a cluster must not be reconciled, or returns empty if it
+// may be. The caller holds the lock.
+func blockedReason(state *clusterState) string {
+	switch {
+	case state.invalidReason != "":
+		return state.invalidReason
+	case state.departed:
+		return "it is no longer in the inventory"
+	default:
+		return ""
+	}
+}
+
 func (s *scheduler) releaseCluster(state *clusterState) {
 	s.mu.Lock()
 	state.running = false
@@ -336,7 +365,25 @@ func (s *scheduler) releaseCluster(state *clusterState) {
 }
 
 func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
+	// Passes no longer finish inside the poll that started them, so each one
+	// publishes its own result — on the way out of either branch, since a pass that
+	// failed is the one worth seeing. Without this /status and readiness would lag
+	// a whole poll behind the work they describe.
+	defer func() { s.health.record(s.report(), s.nextDueIn()) }()
+
 	s.mu.Lock()
+	// Claimed at dispatch, checked again here, because the two can be a slot's
+	// wait apart. In between, a poll may have found another ClusterConnection
+	// claiming this cluster's Secret, or the object may have been deleted
+	// altogether. Both are decided by refusing to write, so a pass that acts on the
+	// claim it was given rather than on what is true now would walk straight
+	// through a check that exists to fail closed.
+	if reason := blockedReason(state); reason != "" {
+		name := state.cluster.Name
+		s.mu.Unlock()
+		s.logger.Info("abandoning a pass that was waiting for a slot", "cluster", name, "reason", reason)
+		return
+	}
 	cluster, generation := state.cluster, state.generation
 	prior := state.status
 	// The reconciler edits the conditions it is given, and /status reads them from
@@ -381,12 +428,10 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	}
 	state.backoff = retryInterval
 	state.dueAt = dueAfterPass(startedAt, status)
+	// What readiness is judged on: this process has now reconciled this spec, as
+	// opposed to having read a status left behind by a process that did.
+	state.passedGeneration = generation
 	s.mu.Unlock()
-
-	// Passes no longer finish inside the poll that started them, so each one
-	// publishes its own result. Without this /status would lag a whole poll behind
-	// the work it describes.
-	s.health.record(s.report(), s.nextDueIn())
 }
 
 // writeStatus records a pass's result against the object it belongs to.
@@ -461,10 +506,18 @@ func (s *scheduler) report() []clusterReport {
 			ServingCertDaysRemaining: state.status.ServingCertDaysRemaining,
 			DueAt:                    state.dueAt,
 		}
+		// Synced means this process has reconciled the spec that is in the API now.
+		// A persisted Ready condition is not enough on its own: after a restart it
+		// describes what some earlier process managed, and after an edit it describes
+		// the spec before the edit — and taking either at face value would let
+		// readiness pass while every pass was still queued. The condition still has
+		// to agree, since a pass can succeed and report a cluster as not ready.
+		reconciledNow := state.passedGeneration != 0 && state.passedGeneration == state.generation
+
 		if state.invalidReason != "" {
 			report.Error = state.invalidReason
 		} else if cond := meta.FindStatusCondition(state.status.Conditions, v1alpha1.ConditionReady); cond != nil {
-			report.Synced = cond.Status == metav1.ConditionTrue
+			report.Synced = reconciledNow && cond.Status == metav1.ConditionTrue
 			if cond.Status != metav1.ConditionTrue {
 				report.Error = cond.Message
 			}

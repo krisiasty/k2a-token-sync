@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
 	"github.com/krisiasty/k2a-token-sync/internal/config"
 	"github.com/krisiasty/k2a-token-sync/internal/inventory"
@@ -24,12 +27,42 @@ type fakeInventory struct {
 	hadNo    bool
 	written  map[string]v1alpha1.ClusterConnectionStatus
 
+	// invalid, generation and prior stand for what the API would hold: a Secret
+	// another connection claims, an edited spec, and a status left behind by an
+	// earlier process.
+	invalid    map[string]string
+	generation int64
+	prior      map[string]v1alpha1.ClusterConnectionStatus
+
 	// hang holds List until it is closed or the call's context ends.
 	hang chan struct{}
 }
 
 func newFakeInventory(names ...string) *fakeInventory {
-	return &fakeInventory{names: names, written: map[string]v1alpha1.ClusterConnectionStatus{}}
+	return &fakeInventory{
+		names:      names,
+		written:    map[string]v1alpha1.ClusterConnectionStatus{},
+		invalid:    map[string]string{},
+		prior:      map[string]v1alpha1.ClusterConnectionStatus{},
+		generation: 1,
+	}
+}
+
+// readyStatus is a status of the kind a previous process would have left in the
+// API: the cluster reconciled, and said so.
+func readyStatus(generation int64) v1alpha1.ClusterConnectionStatus {
+	return v1alpha1.ClusterConnectionStatus{
+		ObservedGeneration: generation,
+		LastAction:         "up-to-date",
+		Conditions: []metav1.Condition{{
+			Type:               v1alpha1.ConditionReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             v1alpha1.ReasonReady,
+			Message:            "ArgoCD holds a current credential for this cluster",
+			ObservedGeneration: generation,
+			LastTransitionTime: metav1.Now(),
+		}},
+	}
 }
 
 func (f *fakeInventory) List(ctx context.Context) ([]inventory.Entry, error) {
@@ -43,9 +76,13 @@ func (f *fakeInventory) List(ctx context.Context) ([]inventory.Entry, error) {
 	hang := f.hang
 	entries := make([]inventory.Entry, 0, len(f.names))
 	for _, name := range f.names {
+		status := f.prior[name]
 		entries = append(entries, inventory.Entry{
-			Cluster:    config.Cluster{Name: name, Endpoint: name + ".example.com:6443"},
-			Generation: 1,
+			Cluster:            config.Cluster{Name: name, Endpoint: name + ".example.com:6443"},
+			Generation:         f.generation,
+			ObservedGeneration: status.ObservedGeneration,
+			Status:             status,
+			InvalidReason:      f.invalid[name],
 		})
 	}
 	f.mu.Unlock()
@@ -177,6 +214,186 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// fillPool takes every slot, so a pass dispatched afterwards is guaranteed to
+// queue rather than run. The returned function frees one slot, letting exactly
+// one queued pass proceed — which is what makes the wait deterministic instead of
+// a race against the scheduler.
+func fillPool(t *testing.T, s *scheduler) func() {
+	t.Helper()
+	for range maxConcurrentPasses {
+		s.slots <- struct{}{}
+	}
+	return func() { <-s.slots }
+}
+
+// A pass claims its cluster when it is dispatched and may then wait for a slot.
+// What was true at the claim need not still be true when the slot arrives, and
+// two of the things that can change in between are decided by refusing to write.
+func TestAQueuedPassRechecksItsClusterBeforeWriting(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// change happens while the pass is queued.
+		change func(inv *fakeInventory)
+	}{
+		{
+			// The fail-closed rule from the Secret-conflict work: when two
+			// ClusterConnections claim one Secret, both stand down. A queued pass that
+			// acted on its claim would walk straight through it and publish the
+			// contested Secret against its own endpoint.
+			name: "another connection claims the same Secret",
+			change: func(inv *fakeInventory) {
+				inv.invalid["queued"] = `"other" claims the same Secret`
+			},
+		},
+		{
+			// A cluster deleted while its pass was queued should not have a fresh
+			// credential published for it.
+			name:   "the cluster leaves the inventory",
+			change: func(inv *fakeInventory) { inv.names = nil },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			inv := newFakeInventory("queued")
+			rec := newFakeReconciler()
+			s := testScheduler(t, inv, rec)
+			free := fillPool(t, s)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			// Dispatched, claimed, and now waiting for a slot that nothing will free.
+			s.tick(ctx)
+			waitFor(t, "the pass to be claimed", func() bool {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				return s.state["queued"].running
+			})
+			if rec.passes("queued") != 0 {
+				t.Fatal("the pass ran although every slot was taken")
+			}
+
+			inv.mu.Lock()
+			tc.change(inv)
+			inv.mu.Unlock()
+			s.tick(ctx)
+
+			free()
+			s.wg.Wait()
+
+			if got := rec.passes("queued"); got != 0 {
+				t.Errorf("%d passes ran; the cluster was no longer one this tool may write", got)
+			}
+			if len(inv.written) != 0 {
+				t.Errorf("status was written for a cluster that must not be reconciled: %v", inv.written)
+			}
+		})
+	}
+}
+
+// Readiness means every cluster in the inventory has reconciled — and a status
+// this process merely read does not establish that.
+//
+// A restarted pod finds Ready=True on every object, from the process before it.
+// Reporting ready off the back of that would have /readyz pass while every pass
+// was still queued, which is exactly the window a rollout uses to decide the new
+// pod is serving.
+func TestReadinessWaitsForAPassInThisProcess(t *testing.T) {
+	t.Parallel()
+
+	inv := newFakeInventory("restarted")
+	inv.prior["restarted"] = readyStatus(1) // what the previous process left behind
+	rec := newFakeReconciler()
+	s := testScheduler(t, inv, rec)
+	free := fillPool(t, s)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	s.tick(ctx)
+	if s.health.isReady() {
+		t.Error("ready before this process reconciled anything, on the strength of a status it only read")
+	}
+	if report := s.report(); report[0].Synced {
+		t.Error("a cluster reads as synced although its first pass has not run")
+	}
+
+	free()
+	s.wg.Wait()
+
+	if !s.health.isReady() {
+		t.Error("not ready after every cluster reconciled")
+	}
+}
+
+// The same reasoning after an edit: the Ready condition on the object describes
+// the spec as it was before the edit.
+func TestReadinessDropsUntilAnEditedSpecHasReconciled(t *testing.T) {
+	t.Parallel()
+
+	inv := newFakeInventory("edited")
+	inv.prior["edited"] = readyStatus(1)
+	rec := newFakeReconciler()
+	s := testScheduler(t, inv, rec)
+
+	s.tick(t.Context())
+	s.wg.Wait()
+	if !s.health.isReady() {
+		t.Fatal("not ready after a successful pass")
+	}
+
+	inv.mu.Lock()
+	inv.generation = 2
+	inv.prior["edited"] = readyStatus(1) // status still describes generation 1
+	inv.mu.Unlock()
+
+	rec.holdAll("edited")
+	s.tick(t.Context())
+	if s.health.isReady() {
+		t.Error("ready while the edited spec has not been reconciled by anyone")
+	}
+
+	rec.releaseAll()
+	s.wg.Wait()
+	if !s.health.isReady() {
+		t.Error("not ready after the edited spec reconciled")
+	}
+}
+
+// A failed pass has to reach /status when it fails, not at the next poll.
+func TestAFailedPassPublishesItsResultImmediately(t *testing.T) {
+	t.Parallel()
+
+	inv := newFakeInventory("failing")
+	s := testScheduler(t, inv, &failingReconciler{fail: map[string]bool{"failing": true}})
+	free := fillPool(t, s)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// The poll publishes a snapshot from before the pass, and no further poll
+	// happens in this test: whatever appears afterwards came from the pass itself.
+	s.tick(ctx)
+	free()
+	s.wg.Wait()
+
+	report := s.health.report()
+	if len(report.Clusters) != 1 {
+		t.Fatalf("the health snapshot holds %d clusters, want 1", len(report.Clusters))
+	}
+	if report.Clusters[0].Error == "" {
+		t.Error("a failed pass left no error in /status until the next poll")
+	}
+	if report.Ready {
+		t.Error("ready although the only cluster's pass failed")
+	}
 }
 
 // The point of the whole change: a cluster stuck in its five-minute timeout must
@@ -417,12 +634,24 @@ func (f *failingReconciler) Cluster(
 	_ context.Context,
 	cluster config.Cluster,
 	prior v1alpha1.ClusterConnectionStatus,
-	_ int64,
+	generation int64,
 ) (v1alpha1.ClusterConnectionStatus, error) {
-	if f.fail[cluster.Name] {
-		return prior, errors.New("downstream is unreachable")
+	if !f.fail[cluster.Name] {
+		return prior, nil
 	}
-	return prior, nil
+	// A failing pass records why on the object, as the real reconciler does; that
+	// message is what /status and 'kubectl describe' show.
+	err := errors.New("downstream is unreachable")
+	status := prior
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               v1alpha1.ConditionReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             v1alpha1.ReasonEndpointUnreachable,
+		Message:            err.Error(),
+		ObservedGeneration: generation,
+	})
+	status.LastAction = "failed"
+	return status, err
 }
 
 // A cluster that disappears from the inventory mid-pass is dropped once its pass
