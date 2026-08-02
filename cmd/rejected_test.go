@@ -353,3 +353,101 @@ func TestAVerdictFormedDuringAPassesWriteStillLands(t *testing.T) {
 		t.Errorf("%d further writes after the verdict settled", inv.writes-before)
 	}
 }
+
+// The inverse ordering: the pass saw a conflict and overlaid its verdict, but the
+// conflict cleared while that write was in flight. The successful pass result is
+// now the current truth and must win in the same way a newly formed verdict does.
+func TestAVerdictClearedDuringAPassesWriteDoesNotOutrankThePass(t *testing.T) {
+	t.Parallel()
+
+	const reason = `secretName "cluster-shared" is also claimed by "other"`
+
+	inv := newFakeInventory("recovering")
+	rec := newFakeReconciler("recovering")
+	s := testScheduler(t, inv, rec)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	s.tick(ctx)
+	waitFor(t, "the pass to start", func() bool { return rec.passes("recovering") == 1 })
+
+	inv.mu.Lock()
+	inv.invalid["recovering"] = reason
+	inv.cause["recovering"] = v1alpha1.ReasonSecretNameConflict
+	inv.mu.Unlock()
+	s.tick(ctx)
+
+	// The pass has already returned its successful result when UpdateStatus runs.
+	// Clear the verdict there, after the pass decided to overlay it but before its
+	// post-write check.
+	inv.onFirstWrite = func() {
+		inv.mu.Lock()
+		delete(inv.invalid, "recovering")
+		delete(inv.cause, "recovering")
+		inv.mu.Unlock()
+
+		s.mu.Lock()
+		state := s.state["recovering"]
+		state.invalidReason = ""
+		state.invalidCause = ""
+		s.mu.Unlock()
+	}
+
+	rec.releaseAll()
+	s.wg.Wait()
+
+	written := inv.written["recovering"]
+	ready := condition(t, written, v1alpha1.ConditionReady)
+	if ready.Status != metav1.ConditionTrue || ready.Reason != v1alpha1.ReasonReady {
+		t.Errorf("the cleared verdict left Ready=%s/%s over the successful pass", ready.Status, ready.Reason)
+	}
+	if conflict := meta.FindStatusCondition(written.Conditions, v1alpha1.ConditionConflict); conflict != nil {
+		t.Errorf("the cleared verdict left its Conflict condition behind: %+v", conflict)
+	}
+	if written.AppliedCredentialHash != "sha256:published-recovering" {
+		t.Errorf("the pass's record of what it published was dropped: %q", written.AppliedCredentialHash)
+	}
+}
+
+// If a verdict clears after an old pass starts, resolving a same-generation
+// Secret conflict must remain immediately due after that pass finishes. Otherwise
+// the pass's ordinary cadence postpones repair for five minutes.
+func TestClearingAVerdictDuringAPassQueuesAFreshPass(t *testing.T) {
+	t.Parallel()
+
+	const reason = `secretName "cluster-shared" is also claimed by "other"`
+
+	inv := newFakeInventory("retry-clear")
+	rec := newFakeReconciler("retry-clear")
+	s := testScheduler(t, inv, rec)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	s.tick(ctx)
+	waitFor(t, "the first pass to start", func() bool { return rec.passes("retry-clear") == 1 })
+
+	inv.mu.Lock()
+	inv.invalid["retry-clear"] = reason
+	inv.cause["retry-clear"] = v1alpha1.ReasonSecretNameConflict
+	inv.mu.Unlock()
+	s.tick(ctx)
+
+	inv.mu.Lock()
+	delete(inv.invalid, "retry-clear")
+	delete(inv.cause, "retry-clear")
+	inv.mu.Unlock()
+	s.tick(ctx)
+
+	rec.releaseAll()
+	s.wg.Wait()
+
+	// The due time set by the clearing poll survives the old pass's scheduling,
+	// so the next poll starts a pass against the now-current verdict.
+	s.tick(ctx)
+	s.wg.Wait()
+	if got := rec.passes("retry-clear"); got != 2 {
+		t.Errorf("%d passes after the verdict cleared, want a fresh second pass", got)
+	}
+}
