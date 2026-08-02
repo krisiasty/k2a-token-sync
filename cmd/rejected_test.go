@@ -320,6 +320,16 @@ func TestAVerdictFormedDuringAPassesWriteStillLands(t *testing.T) {
 	s := testScheduler(t, inv, rec)
 
 	inv.onFirstWrite = func() {
+		// The conflict goes into the inventory as well as into the state the running
+		// pass is about to write from, because that is where a real one would be. Set
+		// only in the state, it resolves itself at the next poll — which makes the
+		// object due immediately, dispatches another pass, and tests the clearing
+		// path rather than this one.
+		inv.mu.Lock()
+		inv.invalid["racing"] = reason
+		inv.cause["racing"] = v1alpha1.ReasonSecretNameConflict
+		inv.mu.Unlock()
+
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		state := s.state["racing"]
@@ -327,7 +337,14 @@ func TestAVerdictFormedDuringAPassesWriteStillLands(t *testing.T) {
 		state.invalidCause = v1alpha1.ReasonSecretNameConflict
 	}
 
+	// The pool is filled first so the pass cannot start until this poll is over.
+	// Otherwise the poll's own verdict-writing step may happen to run after the hook
+	// has fired and write the verdict itself — which would let this test pass even
+	// with the pass's re-check removed, and re-checking after the write is the whole
+	// thing being tested.
+	free := fillPool(t, s)
 	s.tick(t.Context())
+	free()
 	s.wg.Wait()
 
 	written := inv.written["racing"]
@@ -347,10 +364,11 @@ func TestAVerdictFormedDuringAPassesWriteStillLands(t *testing.T) {
 	}
 
 	// And it settles: the poll that follows finds the object already saying it.
-	before := inv.writes
+	before := inv.writeCount()
 	s.tick(t.Context())
-	if inv.writes != before {
-		t.Errorf("%d further writes after the verdict settled", inv.writes-before)
+	s.wg.Wait()
+	if got := inv.writeCount(); got != before {
+		t.Errorf("%d further writes after the verdict settled", got-before)
 	}
 }
 
