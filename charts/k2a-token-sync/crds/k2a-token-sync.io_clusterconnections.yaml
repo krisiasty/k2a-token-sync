@@ -25,6 +25,9 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
       type: string
+    - jsonPath: .status.conditions[?(@.type=="SelfCredentialValid")].status
+      name: Self Valid
+      type: string
     - jsonPath: .status.tokenExpiresAt
       name: Token Expires
       type: string
