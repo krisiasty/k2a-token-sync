@@ -206,6 +206,48 @@ func TestFromSpecRejects(t *testing.T) {
 	}
 }
 
+func TestFromSpecAcceptsOrdinarySecretMetadata(t *testing.T) {
+	t.Parallel()
+
+	spec := minimalSpec()
+	spec.Labels = map[string]string{"environment": "production"}
+	spec.Annotations = map[string]string{"owner": "platform"}
+
+	cluster, err := FromSpec("downstream-1", spec)
+	if err != nil {
+		t.Fatalf("FromSpec rejected ordinary custom metadata: %v", err)
+	}
+	if cluster.Labels["environment"] != "production" || cluster.Annotations["owner"] != "platform" {
+		t.Errorf("custom metadata was not preserved: labels=%v annotations=%v", cluster.Labels, cluster.Annotations)
+	}
+}
+
+// Controller-owned keys are ignored by the renderer rather than rejected here.
+// Keeping the connection reconcilable matters on upgrade: an existing manifest
+// that repeats one of these keys must not have its credential renewal stopped.
+func TestFromSpecAcceptsControllerOwnedSecretMetadata(t *testing.T) {
+	t.Parallel()
+
+	spec := minimalSpec()
+	spec.Labels = map[string]string{
+		"argocd.argoproj.io/secret-type": "repository",
+		"app.kubernetes.io/managed-by":   "somebody-else",
+	}
+	spec.Annotations = map[string]string{
+		"k2a-token-sync.io/cluster":                 "another-cluster",
+		"k2a-token-sync.io/token-expires-at":        "never",
+		"k2a-token-sync.io/serving-cert-expires-at": "never",
+	}
+
+	cluster, err := FromSpec("downstream-1", spec)
+	if err != nil {
+		t.Fatalf("FromSpec stopped reconciliation for controller-owned metadata: %v", err)
+	}
+	if len(cluster.Labels) != 2 || len(cluster.Annotations) != 3 {
+		t.Errorf("metadata was changed before the renderer could enforce ownership: %+v", cluster)
+	}
+}
+
 func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "k2a-token-sync")
 

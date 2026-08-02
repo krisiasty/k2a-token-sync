@@ -129,27 +129,31 @@ type ClusterSecret struct {
 // ClusterConnection's status.lastSyncTime, alongside everything else this tool
 // records.
 func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguration {
-	labels := map[string]string{
-		SecretTypeLabel: secretTypeCluster,
-		managedByLabel:  managedByValue,
-	}
+	labels := make(map[string]string, len(c.ExtraLabels)+2)
 	for k, v := range c.ExtraLabels {
 		labels[k] = v
 	}
+	labels[SecretTypeLabel] = secretTypeCluster
+	labels[managedByLabel] = managedByValue
 
-	annotations := map[string]string{
-		ClusterNameAnnotation: c.ClusterName,
+	annotations := make(map[string]string, len(c.ExtraAnnotations)+3)
+	for k, v := range c.ExtraAnnotations {
+		// These two are conditional below. Copying a custom value when the real
+		// expiry is unknown would make the Secret claim something was published
+		// when it was not. The always-present cluster annotation is safely replaced
+		// after this loop instead.
+		if k == TokenExpiryAnnotation || k == ServingCertExpiryAnnotation {
+			continue
+		}
+		annotations[k] = v
 	}
+	annotations[ClusterNameAnnotation] = c.ClusterName
 	if !c.TokenExpiresAt.IsZero() {
 		annotations[TokenExpiryAnnotation] = c.TokenExpiresAt.UTC().Format(time.RFC3339)
 	}
 	if !c.ServingCertExpiresAt.IsZero() {
 		annotations[ServingCertExpiryAnnotation] = c.ServingCertExpiresAt.UTC().Format(time.RFC3339)
 	}
-	for k, v := range c.ExtraAnnotations {
-		annotations[k] = v
-	}
-
 	data := map[string][]byte{
 		nameKey:   []byte(c.DisplayName),
 		serverKey: []byte(c.Server),
