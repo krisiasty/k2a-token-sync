@@ -84,6 +84,11 @@ spec:
               annotations:
                 additionalProperties:
                   type: string
+                description: |-
+                  Annotations are merged into the generated ArgoCD Secret. The
+                  controller-owned k2a-token-sync.io/cluster,
+                  k2a-token-sync.io/token-expires-at and
+                  k2a-token-sync.io/serving-cert-expires-at keys cannot be overridden.
                 type: object
               displayName:
                 description: DisplayName is the name ArgoCD shows. Defaults to the
@@ -109,8 +114,10 @@ spec:
               labels:
                 additionalProperties:
                   type: string
-                description: Labels and Annotations are merged into the generated
-                  ArgoCD Secret.
+                description: |-
+                  Labels are merged into the generated ArgoCD Secret. The controller-owned
+                  argocd.argoproj.io/secret-type and app.kubernetes.io/managed-by keys cannot
+                  be overridden.
                 type: object
               project:
                 description: Project optionally scopes the cluster to a single ArgoCD

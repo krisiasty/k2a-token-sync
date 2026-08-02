@@ -3,6 +3,7 @@ package argocd
 import (
 	"encoding/base64"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -190,6 +191,43 @@ func TestApplyMergesExtraLabelsAndAnnotations(t *testing.T) {
 	}
 	if secret.Labels[SecretTypeLabel] != "cluster" {
 		t.Error("extra labels overwrote the ArgoCD secret-type label")
+	}
+}
+
+// Configuration resolution rejects these keys. The renderer also keeps its own
+// invariants when called directly, so another internal caller cannot accidentally
+// turn an ArgoCD cluster Secret into something else or falsify its bookkeeping.
+func TestRegistrationIgnoresControllerOwnedExtraMetadata(t *testing.T) {
+	t.Parallel()
+
+	desired := testSecret()
+	desired.TokenExpiresAt = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	desired.ServingCertExpiresAt = time.Date(2027, 7, 31, 12, 0, 0, 0, time.UTC)
+	desired.ExtraLabels = map[string]string{
+		SecretTypeLabel: "repository",
+		managedByLabel:  "somebody-else",
+	}
+	desired.ExtraAnnotations = map[string]string{
+		ClusterNameAnnotation:       "another-cluster",
+		TokenExpiryAnnotation:       "never",
+		ServingCertExpiryAnnotation: "never",
+	}
+
+	registration := desired.registrationConfig()
+	wantLabels := map[string]string{
+		SecretTypeLabel: "cluster",
+		managedByLabel:  managedByValue,
+	}
+	wantAnnotations := map[string]string{
+		ClusterNameAnnotation:       desired.ClusterName,
+		TokenExpiryAnnotation:       desired.TokenExpiresAt.Format(time.RFC3339),
+		ServingCertExpiryAnnotation: desired.ServingCertExpiresAt.Format(time.RFC3339),
+	}
+	if !reflect.DeepEqual(registration.Labels, wantLabels) {
+		t.Errorf("labels = %v, want controller-owned values %v", registration.Labels, wantLabels)
+	}
+	if !reflect.DeepEqual(registration.Annotations, wantAnnotations) {
+		t.Errorf("annotations = %v, want controller-owned values %v", registration.Annotations, wantAnnotations)
 	}
 }
 

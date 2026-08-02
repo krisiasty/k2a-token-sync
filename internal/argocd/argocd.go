@@ -18,12 +18,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/krisiasty/k2a-token-sync/internal/config"
 )
 
 const (
 	// SecretTypeLabel and secretTypeCluster are how ArgoCD identifies a cluster
 	// Secret.
-	SecretTypeLabel   = "argocd.argoproj.io/secret-type" //nolint:gosec // a label key, not a credential
+	SecretTypeLabel   = config.SecretTypeLabel
 	secretTypeCluster = "cluster"
 
 	// FieldManagerRegistration owns everything except the credential.
@@ -39,20 +41,20 @@ const (
 	// FieldManagerCredential owns data.config and nothing else.
 	FieldManagerCredential = "k2a-token-sync-credential" //nolint:gosec // a field manager name, not a credential
 
-	managedByLabel = "app.kubernetes.io/managed-by"
+	managedByLabel = config.ManagedByLabel
 	managedByValue = "k2a-token-sync"
 
 	// TokenExpiryAnnotation records when the credential we wrote expires. It is
 	// what lets k2a-token-sync decide whether a refresh is due without having to
 	// decode the token itself.
-	TokenExpiryAnnotation = "k2a-token-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
+	TokenExpiryAnnotation = config.TokenExpiryAnnotation
 
 	// ServingCertExpiryAnnotation records the observed expiry of the downstream
 	// API server's serving certificate, so it is visible with kubectl.
-	ServingCertExpiryAnnotation = "k2a-token-sync.io/serving-cert-expires-at"
+	ServingCertExpiryAnnotation = config.ServingCertExpiryAnnotation
 
 	// ClusterNameAnnotation records which configured cluster owns this Secret.
-	ClusterNameAnnotation = "k2a-token-sync.io/cluster"
+	ClusterNameAnnotation = config.ClusterNameAnnotation
 
 	nameKey    = "name"
 	serverKey  = "server"
@@ -129,27 +131,30 @@ type ClusterSecret struct {
 // ClusterConnection's status.lastSyncTime, alongside everything else this tool
 // records.
 func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguration {
-	labels := map[string]string{
-		SecretTypeLabel: secretTypeCluster,
-		managedByLabel:  managedByValue,
-	}
+	labels := make(map[string]string, len(c.ExtraLabels)+2)
 	for k, v := range c.ExtraLabels {
+		if config.IsReservedSecretLabel(k) {
+			continue
+		}
 		labels[k] = v
 	}
+	labels[SecretTypeLabel] = secretTypeCluster
+	labels[managedByLabel] = managedByValue
 
-	annotations := map[string]string{
-		ClusterNameAnnotation: c.ClusterName,
+	annotations := make(map[string]string, len(c.ExtraAnnotations)+3)
+	for k, v := range c.ExtraAnnotations {
+		if config.IsReservedSecretAnnotation(k) {
+			continue
+		}
+		annotations[k] = v
 	}
+	annotations[ClusterNameAnnotation] = c.ClusterName
 	if !c.TokenExpiresAt.IsZero() {
 		annotations[TokenExpiryAnnotation] = c.TokenExpiresAt.UTC().Format(time.RFC3339)
 	}
 	if !c.ServingCertExpiresAt.IsZero() {
 		annotations[ServingCertExpiryAnnotation] = c.ServingCertExpiresAt.UTC().Format(time.RFC3339)
 	}
-	for k, v := range c.ExtraAnnotations {
-		annotations[k] = v
-	}
-
 	data := map[string][]byte{
 		nameKey:   []byte(c.DisplayName),
 		serverKey: []byte(c.Server),

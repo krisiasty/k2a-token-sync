@@ -333,6 +333,35 @@ func TestAMalformedObjectKeepsItsGenerationAndPublishedState(t *testing.T) {
 	}
 }
 
+func TestReservedSecretMetadataIsReportedAsAnInvalidSpec(t *testing.T) {
+	t.Parallel()
+
+	reserved := connection("reserved", "reserved.example.com:6443", "cluster-reserved")
+	spec, ok := reserved.Object["spec"].(map[string]any)
+	if !ok {
+		t.Fatal("the fixture no longer has a spec map")
+	}
+	spec["labels"] = map[string]any{config.SecretTypeLabel: "repository"}
+
+	entries, err := newTestClient(reserved).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("List returned %d entries, want the invalid object reported", len(entries))
+	}
+
+	entry := entries[0]
+	if entry.InvalidCause != v1alpha1.ReasonInvalidSpec {
+		t.Errorf("InvalidCause is %q, want %q", entry.InvalidCause, v1alpha1.ReasonInvalidSpec)
+	}
+	for _, want := range []string{config.SecretTypeLabel, "reserved", "remove it"} {
+		if !strings.Contains(entry.InvalidReason, want) {
+			t.Errorf("InvalidReason = %q, want it to mention %q", entry.InvalidReason, want)
+		}
+	}
+}
+
 // The cause travels with the reason, since it is what decides which conditions
 // get written.
 func TestTheInventorySaysWhichKindOfProblemItFound(t *testing.T) {

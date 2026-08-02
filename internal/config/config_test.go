@@ -206,6 +206,60 @@ func TestFromSpecRejects(t *testing.T) {
 	}
 }
 
+func TestFromSpecRejectsControllerOwnedSecretMetadata(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		field string
+		key   string
+	}{
+		{field: "labels", key: SecretTypeLabel},
+		{field: "labels", key: ManagedByLabel},
+		{field: "annotations", key: ClusterNameAnnotation},
+		{field: "annotations", key: TokenExpiryAnnotation},
+		{field: "annotations", key: ServingCertExpiryAnnotation},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.field+"/"+tc.key, func(t *testing.T) {
+			t.Parallel()
+
+			spec := minimalSpec()
+			if tc.field == "labels" {
+				spec.Labels = map[string]string{tc.key: "user-controlled"}
+			} else {
+				spec.Annotations = map[string]string{tc.key: "user-controlled"}
+			}
+
+			_, err := FromSpec("downstream-1", spec)
+			if err == nil {
+				t.Fatalf("FromSpec accepted controller-owned %s key %q", tc.field, tc.key)
+			}
+			for _, want := range []string{"spec." + tc.field, tc.key, "reserved", "remove it"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("FromSpec error = %q, want it to mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestFromSpecAcceptsOrdinarySecretMetadata(t *testing.T) {
+	t.Parallel()
+
+	spec := minimalSpec()
+	spec.Labels = map[string]string{"environment": "production"}
+	spec.Annotations = map[string]string{"owner": "platform"}
+
+	cluster, err := FromSpec("downstream-1", spec)
+	if err != nil {
+		t.Fatalf("FromSpec rejected ordinary custom metadata: %v", err)
+	}
+	if cluster.Labels["environment"] != "production" || cluster.Annotations["owner"] != "platform" {
+		t.Errorf("custom metadata was not preserved: labels=%v annotations=%v", cluster.Labels, cluster.Annotations)
+	}
+}
+
 func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("POD_NAMESPACE", "k2a-token-sync")
 
