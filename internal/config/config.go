@@ -27,21 +27,6 @@ import (
 const (
 	defaultAPIPort = "6443"
 
-	// SecretTypeLabel makes ArgoCD recognize a generated cluster Secret.
-	SecretTypeLabel = "argocd.argoproj.io/secret-type" //nolint:gosec // a label key, not a credential
-
-	// ManagedByLabel records which controller owns the generated Secret.
-	ManagedByLabel = "app.kubernetes.io/managed-by"
-
-	// TokenExpiryAnnotation records the expiry of the published credential.
-	TokenExpiryAnnotation = "k2a-token-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
-
-	// ServingCertExpiryAnnotation records the downstream serving certificate expiry.
-	ServingCertExpiryAnnotation = "k2a-token-sync.io/serving-cert-expires-at"
-
-	// ClusterNameAnnotation records which ClusterConnection owns the Secret.
-	ClusterNameAnnotation = "k2a-token-sync.io/cluster"
-
 	defaultTokenTTL     = 720 * time.Hour  // 30 days
 	defaultSelfTokenTTL = 2160 * time.Hour // 90 days
 
@@ -196,9 +181,6 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 	out.DisplayName = orDefault(spec.DisplayName, name)
 	out.SecretName = orDefault(spec.SecretName, "cluster-"+name)
 	out.SelfServiceAccountName = orDefault(spec.SelfServiceAccountName, defaultSelfServiceAccount)
-	if err := validateSecretMetadata(spec.Labels, spec.Annotations); err != nil {
-		return out, err
-	}
 	out.Labels = spec.Labels
 	out.Annotations = spec.Annotations
 	out.Project = spec.Project
@@ -220,39 +202,6 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 	}
 
 	return out, nil
-}
-
-// IsReservedSecretLabel reports whether a label is owned by k2a-token-sync on
-// the generated ArgoCD Secret.
-func IsReservedSecretLabel(key string) bool {
-	return key == SecretTypeLabel || key == ManagedByLabel
-}
-
-// IsReservedSecretAnnotation reports whether an annotation is owned by
-// k2a-token-sync on the generated ArgoCD Secret.
-func IsReservedSecretAnnotation(key string) bool {
-	switch key {
-	case ClusterNameAnnotation, TokenExpiryAnnotation, ServingCertExpiryAnnotation:
-		return true
-	default:
-		return false
-	}
-}
-
-func validateSecretMetadata(labels, annotations map[string]string) error {
-	// Iterate the fixed keys rather than the user maps so an object containing more
-	// than one reserved key receives the same first error on every reconciliation.
-	for _, key := range []string{SecretTypeLabel, ManagedByLabel} {
-		if _, found := labels[key]; found {
-			return fmt.Errorf("spec.labels key %q is reserved for k2a-token-sync; remove it", key)
-		}
-	}
-	for _, key := range []string{ClusterNameAnnotation, TokenExpiryAnnotation, ServingCertExpiryAnnotation} {
-		if _, found := annotations[key]; found {
-			return fmt.Errorf("spec.annotations key %q is reserved for k2a-token-sync; remove it", key)
-		}
-	}
-	return nil
 }
 
 // normaliseEndpoint accepts "host", "host:port" or a full "https://host:port"

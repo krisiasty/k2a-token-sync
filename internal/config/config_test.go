@@ -206,44 +206,6 @@ func TestFromSpecRejects(t *testing.T) {
 	}
 }
 
-func TestFromSpecRejectsControllerOwnedSecretMetadata(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		field string
-		key   string
-	}{
-		{field: "labels", key: SecretTypeLabel},
-		{field: "labels", key: ManagedByLabel},
-		{field: "annotations", key: ClusterNameAnnotation},
-		{field: "annotations", key: TokenExpiryAnnotation},
-		{field: "annotations", key: ServingCertExpiryAnnotation},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.field+"/"+tc.key, func(t *testing.T) {
-			t.Parallel()
-
-			spec := minimalSpec()
-			if tc.field == "labels" {
-				spec.Labels = map[string]string{tc.key: "user-controlled"}
-			} else {
-				spec.Annotations = map[string]string{tc.key: "user-controlled"}
-			}
-
-			_, err := FromSpec("downstream-1", spec)
-			if err == nil {
-				t.Fatalf("FromSpec accepted controller-owned %s key %q", tc.field, tc.key)
-			}
-			for _, want := range []string{"spec." + tc.field, tc.key, "reserved", "remove it"} {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("FromSpec error = %q, want it to mention %q", err, want)
-				}
-			}
-		})
-	}
-}
-
 func TestFromSpecAcceptsOrdinarySecretMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -257,6 +219,32 @@ func TestFromSpecAcceptsOrdinarySecretMetadata(t *testing.T) {
 	}
 	if cluster.Labels["environment"] != "production" || cluster.Annotations["owner"] != "platform" {
 		t.Errorf("custom metadata was not preserved: labels=%v annotations=%v", cluster.Labels, cluster.Annotations)
+	}
+}
+
+// Controller-owned keys are ignored by the renderer rather than rejected here.
+// Keeping the connection reconcilable matters on upgrade: an existing manifest
+// that repeats one of these keys must not have its credential renewal stopped.
+func TestFromSpecAcceptsControllerOwnedSecretMetadata(t *testing.T) {
+	t.Parallel()
+
+	spec := minimalSpec()
+	spec.Labels = map[string]string{
+		"argocd.argoproj.io/secret-type": "repository",
+		"app.kubernetes.io/managed-by":   "somebody-else",
+	}
+	spec.Annotations = map[string]string{
+		"k2a-token-sync.io/cluster":                 "another-cluster",
+		"k2a-token-sync.io/token-expires-at":        "never",
+		"k2a-token-sync.io/serving-cert-expires-at": "never",
+	}
+
+	cluster, err := FromSpec("downstream-1", spec)
+	if err != nil {
+		t.Fatalf("FromSpec stopped reconciliation for controller-owned metadata: %v", err)
+	}
+	if len(cluster.Labels) != 2 || len(cluster.Annotations) != 3 {
+		t.Errorf("metadata was changed before the renderer could enforce ownership: %+v", cluster)
 	}
 }
 

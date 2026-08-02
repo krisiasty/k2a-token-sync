@@ -26,6 +26,17 @@ spec:
   # The name ArgoCD shows. Defaults to the object's name.
   displayName: standalone-1
 
+  # Optional ArgoCD project. Empty leaves the cluster available to every project.
+  project: ""
+
+  # Extra metadata copied to the generated ArgoCD Secret. Controller-owned keys
+  # documented by 'kubectl explain clusterconnection.spec.labels' and
+  # '.spec.annotations' are ignored so they cannot replace required values.
+  labels:
+    environment: production
+  annotations:
+    owner: platform
+
   # The downstream identity ArgoCD authenticates as. This default matches what
   # 'argocd cluster add' installs, so an existing registration can be taken over.
   serviceAccount:

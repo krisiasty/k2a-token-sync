@@ -48,4 +48,7 @@ func TestShippedExampleIsValid(t *testing.T) {
 	if cluster.Endpoint == "" || cluster.SecretName == "" {
 		t.Errorf("the example resolved to an incomplete cluster: %+v", cluster)
 	}
+	if cluster.Labels["environment"] != "production" || cluster.Annotations["owner"] != "platform" {
+		t.Errorf("the example no longer demonstrates custom Secret metadata: %+v", cluster)
+	}
 }

@@ -194,9 +194,9 @@ func TestApplyMergesExtraLabelsAndAnnotations(t *testing.T) {
 	}
 }
 
-// Configuration resolution rejects these keys. The renderer also keeps its own
-// invariants when called directly, so another internal caller cannot accidentally
-// turn an ArgoCD cluster Secret into something else or falsify its bookkeeping.
+// Controller-owned values are assigned after custom metadata, so direct callers
+// cannot turn an ArgoCD cluster Secret into something else or falsify its
+// bookkeeping.
 func TestRegistrationIgnoresControllerOwnedExtraMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -220,14 +220,32 @@ func TestRegistrationIgnoresControllerOwnedExtraMetadata(t *testing.T) {
 	}
 	wantAnnotations := map[string]string{
 		ClusterNameAnnotation:       desired.ClusterName,
-		TokenExpiryAnnotation:       desired.TokenExpiresAt.Format(time.RFC3339),
-		ServingCertExpiryAnnotation: desired.ServingCertExpiresAt.Format(time.RFC3339),
+		TokenExpiryAnnotation:       desired.TokenExpiresAt.UTC().Format(time.RFC3339),
+		ServingCertExpiryAnnotation: desired.ServingCertExpiresAt.UTC().Format(time.RFC3339),
 	}
 	if !reflect.DeepEqual(registration.Labels, wantLabels) {
 		t.Errorf("labels = %v, want controller-owned values %v", registration.Labels, wantLabels)
 	}
 	if !reflect.DeepEqual(registration.Annotations, wantAnnotations) {
 		t.Errorf("annotations = %v, want controller-owned values %v", registration.Annotations, wantAnnotations)
+	}
+}
+
+func TestExpiryAnnotationsCannotBeFakedWhenNothingWasPublished(t *testing.T) {
+	t.Parallel()
+
+	desired := testSecret()
+	fakeExpiry := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	desired.ExtraAnnotations = map[string]string{
+		TokenExpiryAnnotation:       fakeExpiry,
+		ServingCertExpiryAnnotation: fakeExpiry,
+	}
+
+	got := desired.registrationConfig().Annotations
+	for _, key := range []string{TokenExpiryAnnotation, ServingCertExpiryAnnotation} {
+		if value, found := got[key]; found {
+			t.Errorf("%s = %q, want it absent: nothing was published, so there is no expiry to record", key, value)
+		}
 	}
 }
 

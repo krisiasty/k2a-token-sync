@@ -180,17 +180,20 @@ type ClusterConnectionSpec struct {
 	// +kubebuilder:validation:Pattern=`^([0-9]+h)?([0-9]+m)?([0-9]+s)?$`
 	ExpiryWarnThreshold string `json:"expiryWarnThreshold,omitempty"`
 
-	// Labels are merged into the generated ArgoCD Secret. The controller-owned
-	// argocd.argoproj.io/secret-type and app.kubernetes.io/managed-by keys cannot
-	// be overridden.
+	// Labels are merged into the generated ArgoCD Secret. Values supplied for the
+	// controller-owned argocd.argoproj.io/secret-type and
+	// app.kubernetes.io/managed-by keys are ignored; k2a-token-sync always writes
+	// its required values while continuing to reconcile the connection.
 	//
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 
-	// Annotations are merged into the generated ArgoCD Secret. The
-	// controller-owned k2a-token-sync.io/cluster,
+	// Annotations are merged into the generated ArgoCD Secret. Values supplied for
+	// the controller-owned k2a-token-sync.io/cluster,
 	// k2a-token-sync.io/token-expires-at and
-	// k2a-token-sync.io/serving-cert-expires-at keys cannot be overridden.
+	// k2a-token-sync.io/serving-cert-expires-at keys are ignored; k2a-token-sync
+	// writes only the values it observed while continuing to reconcile the
+	// connection.
 	//
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`

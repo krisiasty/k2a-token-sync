@@ -18,14 +18,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	applycorev1 "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/krisiasty/k2a-token-sync/internal/config"
 )
 
 const (
 	// SecretTypeLabel and secretTypeCluster are how ArgoCD identifies a cluster
 	// Secret.
-	SecretTypeLabel   = config.SecretTypeLabel
+	SecretTypeLabel   = "argocd.argoproj.io/secret-type" //nolint:gosec // a label key, not a credential
 	secretTypeCluster = "cluster"
 
 	// FieldManagerRegistration owns everything except the credential.
@@ -41,20 +39,20 @@ const (
 	// FieldManagerCredential owns data.config and nothing else.
 	FieldManagerCredential = "k2a-token-sync-credential" //nolint:gosec // a field manager name, not a credential
 
-	managedByLabel = config.ManagedByLabel
+	managedByLabel = "app.kubernetes.io/managed-by"
 	managedByValue = "k2a-token-sync"
 
 	// TokenExpiryAnnotation records when the credential we wrote expires. It is
 	// what lets k2a-token-sync decide whether a refresh is due without having to
 	// decode the token itself.
-	TokenExpiryAnnotation = config.TokenExpiryAnnotation
+	TokenExpiryAnnotation = "k2a-token-sync.io/token-expires-at" //nolint:gosec // an annotation key, not a credential
 
 	// ServingCertExpiryAnnotation records the observed expiry of the downstream
 	// API server's serving certificate, so it is visible with kubectl.
-	ServingCertExpiryAnnotation = config.ServingCertExpiryAnnotation
+	ServingCertExpiryAnnotation = "k2a-token-sync.io/serving-cert-expires-at"
 
 	// ClusterNameAnnotation records which configured cluster owns this Secret.
-	ClusterNameAnnotation = config.ClusterNameAnnotation
+	ClusterNameAnnotation = "k2a-token-sync.io/cluster"
 
 	nameKey    = "name"
 	serverKey  = "server"
@@ -133,9 +131,6 @@ type ClusterSecret struct {
 func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguration {
 	labels := make(map[string]string, len(c.ExtraLabels)+2)
 	for k, v := range c.ExtraLabels {
-		if config.IsReservedSecretLabel(k) {
-			continue
-		}
 		labels[k] = v
 	}
 	labels[SecretTypeLabel] = secretTypeCluster
@@ -143,7 +138,11 @@ func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguratio
 
 	annotations := make(map[string]string, len(c.ExtraAnnotations)+3)
 	for k, v := range c.ExtraAnnotations {
-		if config.IsReservedSecretAnnotation(k) {
+		// These two are conditional below. Copying a custom value when the real
+		// expiry is unknown would make the Secret claim something was published
+		// when it was not. The always-present cluster annotation is safely replaced
+		// after this loop instead.
+		if k == TokenExpiryAnnotation || k == ServingCertExpiryAnnotation {
 			continue
 		}
 		annotations[k] = v
