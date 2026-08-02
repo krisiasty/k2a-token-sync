@@ -1,6 +1,13 @@
-k2a-token-sync - keeps ArgoCD's registrations for downstream Kubernetes clusters valid with short-lived ServiceAccount tokens it mints and rotates itself, letting ArgoCD connect directly to each cluster's API server.
+k2a-token-sync - keeps ArgoCD's registrations for downstream Kubernetes
+clusters valid with short-lived ServiceAccount tokens it mints and rotates
+itself, letting ArgoCD connect directly to each cluster's API server.
 
 Copyright 2026 Krzysztof Ciepłucha
 
 This product includes software developed by Krzysztof Ciepłucha.
 https://github.com/krisiasty/k2a-token-sync
+
+k2a-token-sync links third-party open-source modules. Their copyright notices,
+license texts, and upstream NOTICE contents are reproduced in
+THIRD_PARTY_NOTICES, embedded in the binary, and printed by
+`k2a-token-sync licenses`.

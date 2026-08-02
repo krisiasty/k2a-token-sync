@@ -53,6 +53,8 @@ func runSubcommand(name string, args []string) error {
 	switch name {
 	case "bootstrap":
 		return runBootstrap(args)
+	case "licenses":
+		return writeThirdPartyNotices(os.Stdout)
 	case "version":
 		fmt.Println(versionString())
 		return nil
@@ -71,6 +73,7 @@ func printUsage() {
 Usage:
   k2a-token-sync                 run the reconciliation loop (default)
   k2a-token-sync bootstrap ...   provision a standalone cluster for k2a-token-sync
+  k2a-token-sync licenses        print third-party license notices
   k2a-token-sync version         print version information
 
 Run 'k2a-token-sync bootstrap --help' for bootstrap options.
