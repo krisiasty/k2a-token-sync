@@ -295,6 +295,13 @@ excluded from reconciliation with its status frozen. ArgoCD would go on trusting
 else. There is no answer to which claimant should win that this tool can safely invent, so it declines to choose and
 writes nothing until one claim remains. That stalls a cluster; the alternative misdirects one.
 
+Both verdicts are written to the object rather than only to this process's `/status`, because the object is where you
+will look. A spec that does not resolve gets `Ready=False` with reason `InvalidSpec`; a contested `secretName` gets
+`Ready=False` with reason `SecretNameConflict` and a separate `Conflict` condition whose message names the other
+claimants. `observedGeneration` records the generation that was rejected, so a spec you have since edited is
+distinguishable from one the verdict still applies to. Fixing the object clears both — including the conflict case, where
+the fix is deleting the *other* object and this one's spec never changes at all.
+
 ### Adding a cluster
 
 ```bash
@@ -525,8 +532,9 @@ symptom.
 When a cluster is not `Ready`, three things answer it, in this order. The listing above says which cluster and for how
 long. `kubectl describe ccon <name>` gives the reason — `AwaitingCredential` for one that has not been bootstrapped,
 `CredentialExpired` for one whose own credential lapsed, `CertificateInvalid` for an endpoint whose certificate cannot
-work — alongside `lastAction`, which says what the most recent pass actually did. The logs then carry the underlying
-error, usually the downstream API server's own words.
+work, `InvalidSpec` or `SecretNameConflict` for one that is not being reconciled at all — alongside `lastAction`, which
+says what the most recent pass actually did, or why there was not one. The logs then carry the underlying error, usually
+the downstream API server's own words.
 
 Generated cluster Secrets also carry annotations you can read with `kubectl`:
 

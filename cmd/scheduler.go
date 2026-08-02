@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -142,8 +143,17 @@ type clusterState struct {
 
 	// invalidReason is set when the object's spec cannot be resolved, or when
 	// another ClusterConnection claims the same Secret. Such a cluster is never
-	// reconciled, but it is still reported.
+	// reconciled, but it is still reported — on the object as well as in /status,
+	// since the object is where an operator looks. invalidCause decides which
+	// conditions say so.
 	invalidReason string
+	invalidCause  string
+
+	// rerunAfterPass is set when a verdict clears while a pass that predates the
+	// change is still running. That pass may already have decided to write the old
+	// verdict, so its normal cadence must not postpone the fresh pass that removes
+	// it from status.
+	rerunAfterPass bool
 }
 
 // scheduler polls the inventory and reconciles each cluster on its own cadence.
@@ -219,9 +229,151 @@ func (s *scheduler) tick(ctx context.Context) {
 	}
 
 	s.dispatch(ctx)
+	s.reportRejected(ctx)
 
 	s.health.recordPoll()
 	s.publish()
+}
+
+// reportRejected writes the verdict onto every object this tool is declining to
+// reconcile.
+//
+// Those objects are the ones an operator goes looking at, and until now they were
+// the only ones that said nothing: excluded before reconciliation, so nothing ever
+// wrote their status. 'kubectl get ccon' showed an empty Ready column, or worse a
+// Ready=True left over from before the spec was broken, and the reason lived only
+// in this process's /status endpoint.
+//
+// The whole phase shares one deadline rather than one per write. A poll that
+// stretches is a poll that stops counting as progress, and a fleet of objects the
+// API server is refusing to accept must not be able to push it there.
+func (s *scheduler) reportRejected(ctx context.Context) {
+	rejected := s.blockedClusters()
+	if len(rejected) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, inventoryTimeout)
+	defer cancel()
+
+	for _, state := range rejected {
+		// The payload is built here rather than up front, so that a pass finishing
+		// during this loop is written on top of rather than under: what it recorded
+		// about the credential it published is worth keeping even though its verdict
+		// has since changed.
+		desired, name, reason, needed := s.verdictFor(state)
+		if !needed {
+			continue
+		}
+
+		if err := s.inv.UpdateStatus(ctx, name, desired); err != nil {
+			// Logged and stepped over: one object the API server will not accept must
+			// not stop the others from being told why they are stuck.
+			s.logger.Warn("writing the reason a cluster is not being reconciled failed",
+				"cluster", name, "error", err)
+			continue
+		}
+		s.logger.Info("cluster is not being reconciled", "cluster", name, "reason", reason)
+	}
+}
+
+// blockedClusters lists the clusters this tool is declining to reconcile, in a
+// stable order so logs read consistently.
+func (s *scheduler) blockedClusters() []*clusterState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []*clusterState
+	for _, state := range s.state {
+		if state.invalidReason != "" {
+			out = append(out, state)
+		}
+	}
+	slices.SortFunc(out, func(a, b *clusterState) int {
+		return strings.Compare(a.cluster.Name, b.cluster.Name)
+	})
+	return out
+}
+
+// verdictFor is what a blocked object should say, and whether it already says it.
+//
+// The comparison is against the status read in this poll, which is what makes a
+// steady state cost nothing: the write happens once, the next poll reads it back,
+// and from then on the desired status and the actual one are the same value. There
+// is no bookkeeping of what was written, so a status edited or rolled back out of
+// band is simply written again.
+func (s *scheduler) verdictFor(state *clusterState) (
+	desired v1alpha1.ClusterConnectionStatus, name, reason string, needed bool,
+) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if state.invalidReason == "" {
+		return desired, state.cluster.Name, "", false
+	}
+	desired = rejectedStatus(state.status, state)
+	// Compared exactly. Both sides come from the same read, so everything this does
+	// not touch is identical by construction, and the cost of being wrong is one
+	// redundant write rather than a missing one.
+	if reflect.DeepEqual(desired, state.status) {
+		return desired, state.cluster.Name, state.invalidReason, false
+	}
+	state.status = desired
+	return desired, state.cluster.Name, state.invalidReason, true
+}
+
+// rejectedStatus lays the verdict over a status: what an object should say while
+// this tool is declining to reconcile it. The caller holds the lock.
+//
+// It takes the status to work from rather than reading state.status, because it
+// has two callers with two different starting points — the poll, which has only
+// what the object already says, and a pass that finished after the verdict was
+// formed, which has its own result and a fingerprint worth keeping. Applying it
+// twice changes nothing, so the two agreeing matters more than which writes last.
+func rejectedStatus(status v1alpha1.ClusterConnectionStatus, state *clusterState) v1alpha1.ClusterConnectionStatus {
+	status.Conditions = slices.Clone(status.Conditions)
+
+	// The generation that was rejected, so that fixing the object is visibly
+	// different from this verdict still being current.
+	status.ObservedGeneration = state.generation
+
+	reason := state.invalidCause
+	if reason == "" {
+		// Not reachable from the inventory, which always says which kind it is. Here
+		// because a condition with no reason is one the API server rejects outright,
+		// which would lose the message as well as the reason.
+		reason = v1alpha1.ReasonInvalidSpec
+	}
+
+	status.LastAction = "not reconciled: " + state.invalidReason
+	setRejectedCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, state)
+
+	// Conflict is the one condition that names something outside this object, so it
+	// is set only for the conflict itself and removed as soon as the cause is
+	// something else. Leaving it behind would have an object blaming a neighbour for
+	// a problem in its own spec.
+	if reason == v1alpha1.ReasonSecretNameConflict {
+		setRejectedCondition(&status, v1alpha1.ConditionConflict, metav1.ConditionTrue, reason, state)
+	} else {
+		meta.RemoveStatusCondition(&status.Conditions, v1alpha1.ConditionConflict)
+	}
+	return status
+}
+
+func setRejectedCondition(
+	status *v1alpha1.ClusterConnectionStatus,
+	conditionType string,
+	value metav1.ConditionStatus,
+	reason string,
+	state *clusterState,
+) {
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             value,
+		Reason:             reason,
+		Message:            state.invalidReason,
+		ObservedGeneration: state.generation,
+	})
 }
 
 // refresh reconciles the in-memory schedule with the objects in the API.
@@ -262,11 +414,20 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		if entry.Edited() {
 			state.dueAt = now
 		}
+		// Resolving a Secret conflict does not change this object's generation, so
+		// Edited cannot notice it. Make the object due explicitly, and remember the
+		// transition if an older pass is still in flight: otherwise that pass can put
+		// the ordinary five-minute cadence back over this immediate work.
+		if state.invalidReason != "" && entry.InvalidReason == "" {
+			state.dueAt = now
+			state.rerunAfterPass = state.running
+		}
 
 		state.cluster = entry.Cluster
 		state.generation = entry.Generation
 		state.status = entry.Status
 		state.invalidReason = entry.InvalidReason
+		state.invalidCause = entry.InvalidCause
 		state.departed = false
 	}
 
@@ -386,9 +547,17 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	}
 	cluster, generation := state.cluster, state.generation
 	prior := state.status
+	// A request left by an earlier pass is satisfied by this one. A verdict that
+	// clears after this point sets it again and therefore queues another pass.
+	state.rerunAfterPass = false
 	// The reconciler edits the conditions it is given, and /status reads them from
 	// here while it does, so the pass gets a slice of its own.
 	prior.Conditions = slices.Clone(prior.Conditions)
+	// This pass running is itself the proof that the conflict is over — a contested
+	// cluster never gets one. The reconciler knows nothing about Conflict and would
+	// carry it forward untouched, leaving an object that reconciles perfectly well
+	// still accusing a neighbour that may not even exist any more.
+	meta.RemoveStatusCondition(&prior.Conditions, v1alpha1.ConditionConflict)
 	s.mu.Unlock()
 
 	// When the pass started, not when it finished. Scheduling from the end would add
@@ -403,6 +572,39 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	defer cancel()
 
 	status, err := s.rec.Cluster(passCtx, cluster, prior, generation)
+	reconciledStatus := status
+
+	// A verdict can be formed while a pass is running: any poll may find the object
+	// contested or its spec broken, and this pass started before that. Writing its
+	// own result now would put Ready=True back on an object this tool has just
+	// stopped reconciling — and in the conflict case the generation has not changed,
+	// so nothing about that Ready=True would look stale.
+	//
+	// So the verdict goes over the pass's result rather than the pass's result over
+	// the verdict. Both writers apply the same one, which is what makes it safe for
+	// either to write last; what the pass adds is its own fingerprint, since it did
+	// publish a credential and dropping that would cost a needless reissue later.
+	//
+	// Departure is deliberately not a verdict here, unlike at the start of a pass:
+	// there may no longer be an object to write to, and "no longer in the inventory"
+	// is not something to say about a spec.
+	s.mu.Lock()
+	blocked := state.invalidReason
+	if blocked != "" {
+		status = rejectedStatus(status, state)
+	}
+	s.mu.Unlock()
+
+	if blocked != "" {
+		s.logger.Info("a pass finished for a cluster that has since been blocked",
+			"cluster", cluster.Name, "reason", blocked)
+	}
+
+	// Checked again once the write is done, because a verdict can be formed in the
+	// moment between the read above and the write landing. Registered here so it
+	// covers both ways the pass can end, and carrying the status as it now stands —
+	// the value about to go to the API.
+	defer s.settleVerdict(ctx, state, reconciledStatus, status)
 
 	if writeErr := s.writeStatus(ctx, cluster.Name, status); writeErr != nil {
 		// Losing the status write is not fatal, but it does mean the next pass
@@ -413,12 +615,19 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 
 	s.mu.Lock()
 	state.status = status
+	rerun := state.rerunAfterPass
+	state.rerunAfterPass = false
 	if err != nil {
 		// Backoff is measured from the end of a failed pass on purpose: a pass that
 		// fails slowly, on a timeout say, should not be retried the instant it
 		// returns.
-		state.dueAt = s.now().Add(state.backoff)
+		now := s.now()
+		state.dueAt = now.Add(state.backoff)
 		retryIn := state.backoff
+		if rerun {
+			state.dueAt = now
+			retryIn = 0
+		}
 		state.backoff = min(state.backoff*2, maxRetryInterval)
 		s.mu.Unlock()
 
@@ -428,10 +637,69 @@ func (s *scheduler) reconcileOne(ctx context.Context, state *clusterState) {
 	}
 	state.backoff = retryInterval
 	state.dueAt = dueAfterPass(startedAt, status)
+	if rerun {
+		state.dueAt = s.now()
+	}
 	// What readiness is judged on: this process has now reconciled this spec, as
 	// opposed to having read a status left behind by a process that did.
 	state.passedGeneration = generation
 	s.mu.Unlock()
+}
+
+// settleVerdict re-reads the verdict once a pass's status write is done, and
+// makes the status agree in either direction if the two now contradict each
+// other.
+//
+// This is what makes the two writers of one object safe against each other. The
+// poll only ever writes after the verdict it is writing was formed, so the one
+// ordering left is a pass whose write was already in flight when the verdict
+// appeared: it published Ready=True over a decision that had already been taken,
+// and in the conflict case the generation has not moved, so nothing about that
+// Ready=True looks stale.
+//
+// Reading the verdict again afterwards catches that case and its inverse: a pass
+// that had already overlaid a verdict which cleared while the write was in flight.
+// In the latter case the pass's original result is restored, including its record
+// of the credential it published.
+//
+// The alternative was a per-object lock held across both writers' API calls, which
+// would have the poll loop waiting on whichever pass happens to be mid-write —
+// paying for a rare race with a stall on every one of them.
+func (s *scheduler) settleVerdict(
+	ctx context.Context,
+	state *clusterState,
+	reconciled v1alpha1.ClusterConnectionStatus,
+	written v1alpha1.ClusterConnectionStatus,
+) {
+	s.mu.Lock()
+	desired := reconciled
+	name, reason := state.cluster.Name, state.invalidReason
+	if reason != "" {
+		desired = rejectedStatus(reconciled, state)
+	}
+	settled := reflect.DeepEqual(desired, written)
+	if !settled {
+		state.status = desired
+	}
+	s.mu.Unlock()
+
+	if settled {
+		return // the verdict was already known when the pass wrote, and is in there
+	}
+
+	if reason == "" {
+		s.logger.Info("a verdict cleared while a pass was writing; restoring the pass's result",
+			"cluster", name)
+	} else {
+		s.logger.Info("a verdict arrived while a pass was writing; writing it again over the result",
+			"cluster", name, "reason", reason)
+	}
+	if err := s.writeStatus(ctx, name, desired); err != nil {
+		// The next poll either reapplies the current verdict or dispatches the fresh
+		// pass queued when the verdict cleared.
+		s.logger.Warn("settling status after the reconciliation verdict changed failed",
+			"cluster", name, "error", err)
+	}
 }
 
 // writeStatus records a pass's result against the object it belongs to.

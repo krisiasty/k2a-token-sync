@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ type fakeInventory struct {
 	mu       sync.Mutex
 	names    []string
 	calls    int
+	writes   int
 	deadline time.Time
 	hadNo    bool
 	written  map[string]v1alpha1.ClusterConnectionStatus
@@ -31,11 +33,17 @@ type fakeInventory struct {
 	// another connection claims, an edited spec, and a status left behind by an
 	// earlier process.
 	invalid    map[string]string
+	cause      map[string]string
 	generation int64
 	prior      map[string]v1alpha1.ClusterConnectionStatus
 
 	// hang holds List until it is closed or the call's context ends.
 	hang chan struct{}
+
+	// onFirstWrite runs once, during the first status write, and is how a test puts
+	// something in the gap between a writer deciding what to say and the API
+	// receiving it.
+	onFirstWrite func()
 }
 
 func newFakeInventory(names ...string) *fakeInventory {
@@ -43,6 +51,7 @@ func newFakeInventory(names ...string) *fakeInventory {
 		names:      names,
 		written:    map[string]v1alpha1.ClusterConnectionStatus{},
 		invalid:    map[string]string{},
+		cause:      map[string]string{},
 		prior:      map[string]v1alpha1.ClusterConnectionStatus{},
 		generation: 1,
 	}
@@ -86,6 +95,7 @@ func (f *fakeInventory) List(ctx context.Context) ([]inventory.Entry, error) {
 			ObservedGeneration: status.ObservedGeneration,
 			Status:             status,
 			InvalidReason:      f.invalid[name],
+			InvalidCause:       f.invalidCause(name),
 		})
 	}
 	f.mu.Unlock()
@@ -100,10 +110,34 @@ func (f *fakeInventory) List(ctx context.Context) ([]inventory.Entry, error) {
 	return entries, nil
 }
 
+// invalidCause mirrors the real inventory, which never reports a reason without
+// saying which kind it is.
+func (f *fakeInventory) invalidCause(name string) string {
+	if f.invalid[name] == "" {
+		return ""
+	}
+	if cause := f.cause[name]; cause != "" {
+		return cause
+	}
+	return v1alpha1.ReasonInvalidSpec
+}
+
 func (f *fakeInventory) UpdateStatus(_ context.Context, name string, status v1alpha1.ClusterConnectionStatus) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.written[name] = status
+	f.writes++
+	// Read back by the next List, as the API server's copy would be. Without this a
+	// test cannot tell a write that happens once from one that repeats every poll.
+	f.prior[name] = status
+	hook := f.onFirstWrite
+	f.onFirstWrite = nil
+	f.mu.Unlock()
+
+	// Run outside the fake's own lock: hooks reach into the scheduler, and nothing
+	// that holds the scheduler's lock ever calls in here.
+	if hook != nil {
+		hook()
+	}
 	return nil
 }
 
@@ -167,6 +201,18 @@ func (f *fakeReconciler) Cluster(
 	status := prior
 	status.ObservedGeneration = generation
 	status.LastAction = "up-to-date"
+	// Stands for the pass's own work: the record of what it published, which a
+	// later writer must not drop.
+	status.AppliedCredentialHash = "sha256:published-" + cluster.Name
+	// The real reconciler sets Ready on every path it returns from, and tests about
+	// stale conditions depend on that, so the fake does too.
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               v1alpha1.ConditionReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             v1alpha1.ReasonReady,
+		Message:            "ArgoCD holds a current credential for this cluster",
+		ObservedGeneration: generation,
+	})
 	return status, nil
 }
 
@@ -294,8 +340,11 @@ func TestAQueuedPassRechecksItsClusterBeforeWriting(t *testing.T) {
 			if got := rec.passes("queued"); got != 0 {
 				t.Errorf("%d passes ran; the cluster was no longer one this tool may write", got)
 			}
-			if len(inv.written) != 0 {
-				t.Errorf("status was written for a cluster that must not be reconciled: %v", inv.written)
+			for name, status := range inv.written {
+				if !strings.HasPrefix(status.LastAction, "not reconciled") {
+					t.Errorf("%s had a reconciliation result written (lastAction %q); the pass must not have run",
+						name, status.LastAction)
+				}
 			}
 		})
 	}
