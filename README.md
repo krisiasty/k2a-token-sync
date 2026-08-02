@@ -622,16 +622,18 @@ That is the whole release. GoReleaser builds and publishes the images, archives 
 `image.tag` to the new version where you deploy — your values file, or the ArgoCD Application — and the upgrade
 rolls out.
 
-Nothing in ordinary CI exercises that path, so after changing anything in it, run the **Release** workflow by hand first:
+Nothing in ordinary CI exercises that path, so after changing anything in it, run the **Release** workflow by hand — on
+the branch that changed it, before merging rather than after:
 
 ```bash
-gh workflow run Release --ref main
+gh workflow run Release --ref my-branch
 ```
 
-That runs the same checkout and the same pinned tools and builds the same binaries and multi-arch images, then publishes
-none of it — a snapshot build with no write permissions and no registry login. It is worth doing because a release that
-fails half way through is the expensive kind: GoReleaser pushes images before it creates the GitHub release, so an
-interrupted one leaves `ghcr.io` tags, including `latest`, pointing at a version that has no release behind it.
+That takes about four minutes and publishes nothing: the same checkout and the same pinned tools, the same binaries and
+the same multi-arch images, built by a job with no write permissions and no registry login. It is worth doing because a
+release that fails half way through is the expensive kind — GoReleaser pushes images before it creates the GitHub
+release, so an interrupted one leaves `ghcr.io` tags, including `latest`, pointing at a version that has no release
+behind it.
 
 ### Versioning
 
