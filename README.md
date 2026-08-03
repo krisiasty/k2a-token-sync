@@ -696,7 +696,9 @@ Example PowerShell session:
 
 ```powershell
 # Download the archive (replace vX.Y.Z with the actual version)
-Invoke-WebRequest -Uri "https://github.com/krisiasty/k2a-token-sync/releases/download/vX.Y.Z/k2a-token-sync_X.Y.Z_windows_amd64.zip" -OutFile "k2a-token-sync.zip"
+Invoke-WebRequest `
+  -Uri "https://github.com/krisiasty/k2a-token-sync/releases/download/vX.Y.Z/k2a-token-sync_X.Y.Z_windows_amd64.zip" `
+  -OutFile "k2a-token-sync.zip"
 
 # Verify checksum (compare with checksums.txt)
 $hash = Get-FileHash -Algorithm SHA256 -Path "k2a-token-sync.zip"
@@ -706,7 +708,10 @@ echo $hash.Hash
 Expand-Archive -Path "k2a-token-sync.zip" -DestinationPath "k2a-token-sync"
 
 # Run the bootstrap command
-.\k2a-token-sync\k2a-token-sync.exe bootstrap --cluster my-cluster --endpoint my-cluster.example.com:6443 --from-kubeconfig C:\path\to\kubeconfig
+.\k2a-token-sync\k2a-token-sync.exe `
+  bootstrap --cluster my-cluster `
+  --endpoint my-cluster.example.com:6443 `
+  --from-kubeconfig C:\path\to\kubeconfig
 ```
 
 **Note:** The Windows executable is an administrative CLI client for running the `bootstrap` subcommand. It is not a
