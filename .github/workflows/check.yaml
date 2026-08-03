@@ -158,9 +158,11 @@ jobs:
           # Verify Windows zip archives contain expected files
           $requiredFiles = @("k2a-token-sync.exe", "LICENSE", "NOTICE", "README.md", "THIRD_PARTY_NOTICES")
           foreach ($arch in @("amd64", "arm64")) {
-            $zipFile = "dist/k2a-token-sync_windows_${arch}.zip"
+            # goreleaser v2 uses _v1 suffix for amd64/arm64
+            $zipFile = "dist/k2a-token-sync_windows_${arch}_v1.zip"
             if (-not (Test-Path $zipFile)) {
-              Write-Error "Windows archive for $arch not created"
+              Write-Error "Windows archive for $arch not created at $zipFile"
+              Get-ChildItem "dist/*.zip" | Select-Object Name
               exit 1
             }
             $extractDir = "dist/verify-windows-$arch"
@@ -169,7 +171,7 @@ jobs:
             $files = Get-ChildItem $extractDir -Name
             foreach ($reqFile in $requiredFiles) {
               if ($reqFile -notin $files) {
-                Write-Error "Windows archive for $arch missing $reqFile"
+                Write-Error "Windows archive for $arch missing $reqFile. Found: $($files -join ', ')"
                 exit 1
               }
             }

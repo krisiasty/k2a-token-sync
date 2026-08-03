@@ -62,7 +62,7 @@ docker_manifests:
       - "ghcr.io/krisiasty/k2a-token-sync:{{ .Tag }}-arm64"
 
 archives:
-  - id: unix
+  - id: all
     formats: [tar.gz]
     format_overrides:
       - goos: windows
