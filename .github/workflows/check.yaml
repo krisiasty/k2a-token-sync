@@ -95,6 +95,77 @@ jobs:
         with:
           version: 1.7.12
 
+  windows:
+    name: windows
+    runs-on: windows-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: setup go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go mod verify
+        run: go mod verify
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+          args: -v
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      # Build Windows binary and verify command-line interfaces
+      - name: build Windows binary
+        run: |
+          go build -o k2a-token-sync.exe ./cmd
+
+      - name: smoke test version command
+        run: ./k2a-token-sync.exe version
+
+      - name: smoke test bootstrap help
+        run: ./k2a-token-sync.exe bootstrap --help
+
+      - name: smoke test licenses command
+        run: ./k2a-token-sync.exe licenses
+
+      # Verify goreleaser produces Windows artifacts correctly
+      - name: verify goreleaser Windows build
+        run: |
+          go install github.com/goreleaser/goreleaser/v2@latest
+          goreleaser build --snapshot --single-target --id k2a-token-sync --clean
+          # Verify Windows zip archive contains expected files
+          if (Test-Path "dist/k2a-token-sync_windows_amd64_v1.zip") {
+            Expand-Archive -Path "dist/k2a-token-sync_windows_amd64_v1.zip" -DestinationPath "dist/verify-windows"
+            $files = Get-ChildItem "dist/verify-windows" -Name
+            if ("k2a-token-sync.exe" -notin $files) {
+              Write-Error "Windows archive missing k2a-token-sync.exe"
+              exit 1
+            }
+          } else {
+            Write-Error "Windows archive not created"
+            exit 1
+          }
+
   chart:
     name: chart
     runs-on: ubuntu-latest
