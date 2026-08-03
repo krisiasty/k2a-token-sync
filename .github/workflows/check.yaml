@@ -152,19 +152,43 @@ jobs:
       - name: verify goreleaser Windows build
         run: |
           go install github.com/goreleaser/goreleaser/v2@latest
-          goreleaser build --snapshot --single-target --id k2a-token-sync --clean
-          # Verify Windows zip archive contains expected files
-          if (Test-Path "dist/k2a-token-sync_windows_amd64_v1.zip") {
-            Expand-Archive -Path "dist/k2a-token-sync_windows_amd64_v1.zip" -DestinationPath "dist/verify-windows"
-            $files = Get-ChildItem "dist/verify-windows" -Name
-            if ("k2a-token-sync.exe" -notin $files) {
-              Write-Error "Windows archive missing k2a-token-sync.exe"
+          # Build both Windows architectures
+          goreleaser build --snapshot --single-target --id k2a-token-sync --clean --target windows_amd64
+          goreleaser build --snapshot --single-target --id k2a-token-sync --clean --target windows_arm64
+          # Verify Windows zip archives contain expected files
+          $requiredFiles = @("k2a-token-sync.exe", "LICENSE", "NOTICE", "README.md", "THIRD_PARTY_NOTICES")
+          foreach ($arch in @("amd64", "arm64")) {
+            $zipFile = "dist/k2a-token-sync_windows_${arch}.zip"
+            if (-not (Test-Path $zipFile)) {
+              Write-Error "Windows archive for $arch not created"
               exit 1
             }
-          } else {
-            Write-Error "Windows archive not created"
+            $extractDir = "dist/verify-windows-$arch"
+            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+            Expand-Archive -Path $zipFile -DestinationPath $extractDir
+            $files = Get-ChildItem $extractDir -Name
+            foreach ($reqFile in $requiredFiles) {
+              if ($reqFile -notin $files) {
+                Write-Error "Windows archive for $arch missing $reqFile"
+                exit 1
+              }
+            }
+          }
+          Write-Host "All Windows archives verified successfully"
+
+      # Verify licenses command output contains third-party notices
+      - name: verify licenses output
+        run: |
+          $licensesOutput = ./k2a-token-sync.exe licenses
+          if (-not ($licensesOutput -match "third-party notices")) {
+            Write-Error "licenses command output does not contain expected notice header"
             exit 1
           }
+          if (-not ($licensesOutput -match "google/go-licenses")) {
+            Write-Error "licenses command output does not contain go-licenses attribution"
+            exit 1
+          }
+          Write-Host "licenses output verified successfully"
 
   chart:
     name: chart
