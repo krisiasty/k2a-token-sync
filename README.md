@@ -667,8 +667,11 @@ The versions in the examples above are illustrative — deploy whatever is curre
 [releases page](https://github.com/krisiasty/k2a-token-sync/releases).
 
 Releases are published to `ghcr.io/krisiasty/k2a-token-sync` via GitHub Actions using GoReleaser. Multi-arch images
-(`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside `linux` and `darwin`
-archives for running the `bootstrap` subcommand from a workstation.
+(`linux/amd64`, `linux/arm64`) are built and published as a combined manifest, alongside archives for running the
+`bootstrap` subcommand from a workstation:
+
+- `linux` and `darwin` — tar.gz archives
+- `windows` — ZIP archives (`.exe` executable)
 
 Every binary embeds the dependency license texts and attribution notices generated from its released build graphs.
 Run `k2a-token-sync licenses` to print them. Release archives also contain `LICENSE`, `NOTICE` and
@@ -679,6 +682,40 @@ digests, and downloaded release tools to exact versions and committed SHA-256 ch
 replaced by its owner, and this is a binary that holds `cluster-admin` on every cluster it manages — so what goes into it
 should only ever change in a commit somebody reviewed. Dependabot proposes action and Dockerfile image bumps weekly;
 release-tool versions and checksums, and the BuildKit image pin in the workflow, are bumped by hand.
+
+### Windows users
+
+Windows archives are published as `.zip` files containing `k2a-token-sync.exe`. To use the Windows binary:
+
+1. Download the archive for your architecture (`windows_amd64` or `windows_arm64`)
+2. Verify the checksum against the `checksums.txt` file in the release
+3. Extract the ZIP archive
+4. Run the executable from PowerShell or Command Prompt
+
+Example PowerShell session:
+
+```powershell
+# Download the archive (replace vX.Y.Z with the actual version)
+Invoke-WebRequest `
+  -Uri "https://github.com/krisiasty/k2a-token-sync/releases/download/vX.Y.Z/k2a-token-sync_X.Y.Z_windows_amd64.zip" `
+  -OutFile "k2a-token-sync.zip"
+
+# Verify checksum (compare with checksums.txt)
+$hash = Get-FileHash -Algorithm SHA256 -Path "k2a-token-sync.zip"
+echo $hash.Hash
+
+# Extract the archive
+Expand-Archive -Path "k2a-token-sync.zip" -DestinationPath "k2a-token-sync"
+
+# Run the bootstrap command
+.\k2a-token-sync\k2a-token-sync.exe `
+  bootstrap --cluster my-cluster `
+  --endpoint my-cluster.example.com:6443 `
+  --from-kubeconfig C:\path\to\kubeconfig
+```
+
+**Note:** The Windows executable is an administrative CLI client for running the `bootstrap` subcommand. It is not a
+supported Windows container or controller deployment — the controller remains Linux-only.
 
 ### Cutting a release
 

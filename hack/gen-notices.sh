@@ -23,6 +23,8 @@ targets=(
 	"linux arm64"
 	"darwin amd64"
 	"darwin arm64"
+	"windows amd64"
+	"windows arm64"
 )
 target_root="$work_dir/targets"
 mkdir -p "$target_root"
@@ -68,7 +70,7 @@ generated="$work_dir/THIRD_PARTY_NOTICES"
 	printf '%s\n' 'copyright notices, and upstream NOTICE contents required for binary'
 	printf '%s\n' 'redistribution are reproduced below.'
 	printf '\n'
-	printf 'Generated from the Linux and Darwin build graphs by google/go-licenses %s.\n' "$go_licenses_version"
+	printf 'Generated from the Linux, Darwin, and Windows build graphs by google/go-licenses %s.\n' "$go_licenses_version"
 	printf '\n'
 
 	while IFS= read -r relative; do
