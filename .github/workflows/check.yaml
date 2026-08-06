@@ -7,6 +7,10 @@ on:
     branches: ["**"]
   schedule:
     - cron: "0 8 * * 1"  # weekly on monday — catches new vulnerabilities
+  # workflow_dispatch goes through the REST API rather than a webhook
+  # delivery, so a run can still be started by hand when push/pull_request
+  # webhooks are delayed or dropped (e.g. during a GitHub Actions incident).
+  workflow_dispatch: {}
 
 permissions:
   contents: read
