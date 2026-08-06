@@ -156,36 +156,26 @@ jobs:
       - name: verify goreleaser Windows build
         run: |
           go install github.com/goreleaser/goreleaser/v2@v2.17.1
-          # Build both Windows architectures. `build` has no --target flag —
-          # --single-target builds for the GOOS/GOARCH in the environment, so
-          # that's set per architecture instead. --clean wipes the whole dist/
-          # directory, so it only runs before the first build; a second --clean
-          # would delete the amd64 archive before the arm64 build ever starts.
-          $env:GOOS = "windows"
-          $clean = $true
-          foreach ($arch in @("amd64", "arm64")) {
-            $env:GOARCH = $arch
-            if ($clean) {
-              goreleaser build --snapshot --single-target --id k2a-token-sync --clean
-              $clean = $false
-            } else {
-              goreleaser build --snapshot --single-target --id k2a-token-sync
-            }
-          }
-          Remove-Item Env:\GOOS, Env:\GOARCH
-          # Verify Windows zip archives contain expected files
+          # `goreleaser build` only runs the build pipeline and never produces
+          # archives — the zip/tar.gz output only comes out of `release`. Skip
+          # docker: this runner has no Linux buildx backend to build the
+          # images, and --snapshot already skips announce/publish/validate,
+          # so nothing is actually published.
+          goreleaser release --snapshot --clean --skip=docker
+          # Verify Windows zip archives contain expected files. The archive
+          # name embeds the snapshot version (e.g. 0.11.0-SNAPSHOT-<sha>), so
+          # match by suffix rather than a hardcoded name.
           $requiredFiles = @("k2a-token-sync.exe", "LICENSE", "NOTICE", "README.md", "THIRD_PARTY_NOTICES")
           foreach ($arch in @("amd64", "arm64")) {
-            # goreleaser v2 uses _v1 suffix for amd64/arm64
-            $zipFile = "dist/k2a-token-sync_windows_${arch}_v1.zip"
-            if (-not (Test-Path $zipFile)) {
-              Write-Error "Windows archive for $arch not created at $zipFile"
+            $zipFile = Get-ChildItem "dist/*_windows_${arch}.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $zipFile) {
+              Write-Error "Windows archive for $arch not created"
               Get-ChildItem "dist/*.zip" | Select-Object Name
               exit 1
             }
             $extractDir = "dist/verify-windows-$arch"
             New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-            Expand-Archive -Path $zipFile -DestinationPath $extractDir
+            Expand-Archive -Path $zipFile.FullName -DestinationPath $extractDir
             $files = Get-ChildItem $extractDir -Name
             foreach ($reqFile in $requiredFiles) {
               if ($reqFile -notin $files) {
