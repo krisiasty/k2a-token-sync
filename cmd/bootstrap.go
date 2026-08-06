@@ -95,8 +95,7 @@ Modes:
 The credential never passes through your terminal, and the manifest contains
 nothing secret:
 
-  k2a-token-sync bootstrap --cluster prod-1 --endpoint prod-1.example.com:6443 \
-    --from-kubeconfig ./prod-1.kubeconfig
+  k2a-token-sync bootstrap --cluster prod-1 --endpoint prod-1.example.com:6443 --from-kubeconfig ./prod-1.kubeconfig
 
 Flags:
 `)
