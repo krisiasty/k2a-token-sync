@@ -151,10 +151,24 @@ jobs:
       # Verify goreleaser produces Windows artifacts correctly
       - name: verify goreleaser Windows build
         run: |
-          go install github.com/goreleaser/goreleaser/v2@latest
-          # Build both Windows architectures
-          goreleaser build --snapshot --single-target --id k2a-token-sync --clean --target windows_amd64
-          goreleaser build --snapshot --single-target --id k2a-token-sync --clean --target windows_arm64
+          go install github.com/goreleaser/goreleaser/v2@v2.17.1
+          # Build both Windows architectures. `build` has no --target flag —
+          # --single-target builds for the GOOS/GOARCH in the environment, so
+          # that's set per architecture instead. --clean wipes the whole dist/
+          # directory, so it only runs before the first build; a second --clean
+          # would delete the amd64 archive before the arm64 build ever starts.
+          $env:GOOS = "windows"
+          $clean = $true
+          foreach ($arch in @("amd64", "arm64")) {
+            $env:GOARCH = $arch
+            if ($clean) {
+              goreleaser build --snapshot --single-target --id k2a-token-sync --clean
+              $clean = $false
+            } else {
+              goreleaser build --snapshot --single-target --id k2a-token-sync
+            }
+          }
+          Remove-Item Env:\GOOS, Env:\GOARCH
           # Verify Windows zip archives contain expected files
           $requiredFiles = @("k2a-token-sync.exe", "LICENSE", "NOTICE", "README.md", "THIRD_PARTY_NOTICES")
           foreach ($arch in @("amd64", "arm64")) {
