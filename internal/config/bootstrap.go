@@ -52,3 +52,42 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 
 	return FromSpec(in.Name, spec)
 }
+
+// RemovalClusterInput is the subset of cluster settings the remove subcommand
+// falls back to when the ClusterConnection object is already gone.
+type RemovalClusterInput struct {
+	Name                    string
+	ServiceAccountName      string
+	ServiceAccountNamespace string
+	SelfServiceAccountName  string
+	SecretName              string
+}
+
+// RemovalCluster derives the object names 'remove' needs when there is no
+// ClusterConnection left to read them from — the common case, since deleting
+// the object is the first and only step anyone has been able to take until now.
+//
+// It applies the same defaults FromSpec would, without requiring an endpoint:
+// remove never dials the downstream API server for anything this function
+// touches, and inventing a fake one to satisfy FromSpec would be a lie sitting
+// in the code for no reason. Duplicating just the defaulting logic here is the
+// deliberate trade — the alternative, teaching FromSpec to accept a missing
+// endpoint, would let a real ClusterConnection through admission with no
+// endpoint set, which is a hole this package does not want.
+func RemovalCluster(in RemovalClusterInput) (Cluster, error) {
+	if in.Name == "" {
+		return Cluster{}, errors.New("cluster name must not be empty")
+	}
+	if len(in.Name) > maxClusterNameLength {
+		return Cluster{}, fmt.Errorf("cluster name %q exceeds %d characters", in.Name, maxClusterNameLength)
+	}
+
+	out := Cluster{Name: in.Name}
+	out.SecretName = orDefault(in.SecretName, "cluster-"+in.Name)
+	out.SelfServiceAccountName = orDefault(in.SelfServiceAccountName, defaultSelfServiceAccount)
+	out.ServiceAccount = ServiceAccountRef{
+		Name:      orDefault(in.ServiceAccountName, defaultServiceAccountName),
+		Namespace: orDefault(in.ServiceAccountNamespace, defaultServiceAccountNS),
+	}
+	return out, nil
+}
