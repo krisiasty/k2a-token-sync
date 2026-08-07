@@ -149,6 +149,9 @@ jobs:
       - name: smoke test bootstrap help
         run: ./k2a-token-sync.exe bootstrap --help
 
+      - name: smoke test remove help
+        run: ./k2a-token-sync.exe remove --help
+
       - name: smoke test licenses command
         run: ./k2a-token-sync.exe licenses
 
