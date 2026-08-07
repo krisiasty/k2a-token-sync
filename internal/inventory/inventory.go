@@ -83,6 +83,21 @@ func NewClient(dyn dynamic.Interface, namespace string) *Client {
 	return &Client{resource: dyn.Resource(GroupVersionResource).Namespace(namespace)}
 }
 
+// Get reads one ClusterConnection and resolves it exactly as List does, so
+// removal can act on the same names and annotations the daemon would.
+//
+// Absence is reported as k8s.ErrNotFound (via apierrors.IsNotFound), not as an
+// Entry with InvalidReason: a connection that was never there is a different
+// situation from one whose spec cannot be parsed, and only the latter is what
+// InvalidReason exists for.
+func (c *Client) Get(ctx context.Context, name string) (Entry, error) {
+	obj, err := c.resource.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return Entry{}, fmt.Errorf("getting clusterconnection %s: %w", name, err)
+	}
+	return decode(obj), nil
+}
+
 // List returns every ClusterConnection in the namespace, resolved into clusters.
 //
 // Entries whose spec cannot be resolved are returned with InvalidReason set,

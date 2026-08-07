@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -445,5 +446,66 @@ func TestAdoptionIsReadFromTheObjectsAnnotation(t *testing.T) {
 					entry.Cluster.AdoptedRegistration, tc.want, tc.value)
 			}
 		})
+	}
+}
+
+// Get resolves the same Cluster fields as List would, including the adoption
+// annotation, so that removal acts on the same names and annotations the daemon
+// would.
+func TestGetResolvesTheSameFieldsAsListDoes(t *testing.T) {
+	t.Parallel()
+
+	object := connection("my-cluster", "10.1.0.10", "cluster-my-cluster")
+	object.SetAnnotations(map[string]string{v1alpha1.AnnotationAdopted: "true"})
+	object.SetGeneration(2)
+
+	client := newTestClient(object)
+
+	// Get the entry via Get
+	got, err := client.Get(t.Context(), "my-cluster")
+	if err != nil {
+		t.Fatalf("Get returned unexpected error: %v", err)
+	}
+
+	// Get the entry via List
+	entries, err := client.List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("List returned %d entries, want 1", len(entries))
+	}
+	listed := entries[0]
+
+	// Verify that Get and List agree on the Cluster fields
+	if got.Cluster.Name != listed.Cluster.Name {
+		t.Errorf("Get and List disagree on name: %q vs %q", got.Cluster.Name, listed.Cluster.Name)
+	}
+	if got.Cluster.Endpoint != listed.Cluster.Endpoint {
+		t.Errorf("Get and List disagree on endpoint: %q vs %q", got.Cluster.Endpoint, listed.Cluster.Endpoint)
+	}
+	if got.Cluster.SecretName != listed.Cluster.SecretName {
+		t.Errorf("Get and List disagree on secret name: %q vs %q", got.Cluster.SecretName, listed.Cluster.SecretName)
+	}
+	if got.Cluster.AdoptedRegistration != listed.Cluster.AdoptedRegistration {
+		t.Errorf("Get and List disagree on AdoptedRegistration: %v vs %v", got.Cluster.AdoptedRegistration, listed.Cluster.AdoptedRegistration)
+	}
+	if got.Generation != listed.Generation {
+		t.Errorf("Get and List disagree on Generation: %d vs %d", got.Generation, listed.Generation)
+	}
+}
+
+// Get on a missing object returns an error where apierrors.IsNotFound is true.
+func TestGetOnAMissingObjectReturnsNotFound(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient()
+
+	_, err := client.Get(t.Context(), "absent")
+	if err == nil {
+		t.Fatal("Get succeeded for an object that does not exist")
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("Get returned an error that is not a not-found error: %v", err)
 	}
 }
