@@ -8,7 +8,7 @@ type: application
 #
 # There is deliberately no appVersion: the application version is image.tag,
 # supplied in deployment values. See the image helper in templates/_helpers.tpl.
-version: 0.4.0
+version: 0.5.0
 home: https://github.com/krisiasty/k2a-token-sync
 sources:
   - https://github.com/krisiasty/k2a-token-sync

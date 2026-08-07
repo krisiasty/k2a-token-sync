@@ -218,6 +218,15 @@ schema does not know, so a new binary writing to an old CRD loses exactly the st
 silently. `kubectl diff -f charts/k2a-token-sync/crds/` answers whether there is anything to do — it exits 0 when there
 is not, which is the common case.
 
+**Upgrade the chart, not just the tag.** k2a-token-sync's permissions live in the chart, so a release that needs a new one
+gets it from `helm upgrade` and not from changing `image.tag` where you deploy. The signal is the chart's own `version`
+moving: it stands still across releases that leave the templates alone, so when it has moved, something in there has to
+be applied. Chart 0.5.0 added `create` on Events, for instance.
+
+A permission that never arrives is not fatal — nothing in this tool treats its own observability as load-bearing — but it
+is quiet. A missing `events` grant costs one warning per attempted write and an Events section that stays empty, which
+reads as a feature that does not work rather than as RBAC that was not applied.
+
 **Name the version.** `image.tag` has no default, so an upgrade that omits it fails to render rather than quietly
 keeping the running one. That is deliberate, and it is why `--reuse-values` is the wrong habit here: the version you are
 deploying should be stated, not inherited from whatever was set last time.
