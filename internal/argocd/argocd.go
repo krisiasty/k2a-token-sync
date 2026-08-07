@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,8 +40,17 @@ const (
 	// FieldManagerCredential owns data.config and nothing else.
 	FieldManagerCredential = "k2a-token-sync-credential" //nolint:gosec // a field manager name, not a credential
 
-	managedByLabel = "app.kubernetes.io/managed-by"
-	managedByValue = "k2a-token-sync"
+	// ManagedByLabel and ManagedByValue mark a cluster Secret as this tool's own.
+	//
+	// Exported because bootstrap reads them: a Secret from 'argocd cluster add'
+	// cannot be told from one k2a-token-sync would create by name — same cluster-
+	// prefix, same cluster-<name> default — and this label is the difference. It is
+	// only ever written by a pass, so its absence means the Secret is not this
+	// tool's.
+	ManagedByLabel = "app.kubernetes.io/managed-by"
+
+	// ManagedByValue is the value ManagedByLabel carries on a Secret this tool wrote.
+	ManagedByValue = "k2a-token-sync"
 
 	// TokenExpiryAnnotation records when the credential we wrote expires. It is
 	// what lets k2a-token-sync decide whether a refresh is due without having to
@@ -134,7 +144,7 @@ func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguratio
 		labels[k] = v
 	}
 	labels[SecretTypeLabel] = secretTypeCluster
-	labels[managedByLabel] = managedByValue
+	labels[ManagedByLabel] = ManagedByValue
 
 	annotations := make(map[string]string, len(c.ExtraAnnotations)+3)
 	for k, v := range c.ExtraAnnotations {
@@ -190,23 +200,75 @@ func (c ClusterSecret) credentialConfig() (*applycorev1.SecretApplyConfiguration
 		WithData(map[string][]byte{configKey: payload}), payload, nil
 }
 
-// ApplyRegistration writes everything except the credential and reports the
-// credential that is on the server afterwards, digested.
+// Registration is what an apply of the registration half observed about the
+// Secret as it stands on the server.
+type Registration struct {
+	// CredentialHash digests the credential the Secret carries, or is empty when
+	// there is effectively none.
+	CredentialHash string
+
+	// ForeignManagers names the field managers holding fields on the Secret that
+	// are not k2a-token-sync's own, sorted so a status message built from them does
+	// not reshuffle between passes.
+	//
+	// Non-empty means this registration was taken over rather than created, which
+	// is the supported migration from 'argocd cluster add' and also what a cluster
+	// name colliding with an existing registration looks like. Nothing here can
+	// tell those apart; the ClusterConnection says which was meant.
+	ForeignManagers []string
+}
+
+// ApplyRegistration writes everything except the credential and reports what the
+// Secret looks like afterwards.
 //
 // An apply returns the object it produced, and needs only the patch verb, so
 // this doubles as k2a-token-sync's only view of what it has published: no get, list
 // or watch permission in ArgoCD's namespace is required anywhere. That is what
 // makes a deleted or emptied Secret self-healing — the next pass recreates the
 // registration and sees that the credential is gone.
-func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (string, error) {
+//
+// The response is also the only place a co-owner can be noticed, which is why the
+// managedFields are read out of it here rather than by a caller doing its own get:
+// there is no permission for that get, by design.
+func ApplyRegistration(ctx context.Context, client kubernetes.Interface, desired ClusterSecret) (Registration, error) {
 	applied, err := client.CoreV1().Secrets(desired.Namespace).Apply(ctx, desired.registrationConfig(), metav1.ApplyOptions{
 		FieldManager: FieldManagerRegistration,
 		Force:        true,
 	})
 	if err != nil {
-		return "", fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
+		return Registration{}, fmt.Errorf("applying cluster secret %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
-	return hashCredential(applied), nil
+	return Registration{
+		CredentialHash:  hashCredential(applied),
+		ForeignManagers: ForeignManagers(applied),
+	}, nil
+}
+
+// ForeignManagers names the field managers on a Secret that are not
+// k2a-token-sync's own.
+//
+// Force: true takes the fields this tool manages away from whoever held them, but
+// it does not evict the previous manager: an entry survives for anything it set
+// that this tool does not manage. That residue is the signal — it is what
+// distinguishes a Secret this tool created from one it took over, and it is the
+// only such signal available to something that cannot read the Secret.
+//
+// The manager that created the Secret before this tool arrived is normally
+// 'argocd' or a kubectl variant. Names are not interpreted, only reported: a
+// takeover is worth stating whoever the other party is.
+func ForeignManagers(secret *corev1.Secret) []string {
+	var foreign []string
+	for _, entry := range secret.GetManagedFields() {
+		switch entry.Manager {
+		case FieldManagerRegistration, FieldManagerCredential, "":
+			continue
+		}
+		if !slices.Contains(foreign, entry.Manager) {
+			foreign = append(foreign, entry.Manager)
+		}
+	}
+	slices.Sort(foreign)
+	return foreign
 }
 
 // ApplyCredential writes the credential half and returns a digest of exactly what

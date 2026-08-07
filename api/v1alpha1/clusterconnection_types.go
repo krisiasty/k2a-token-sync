@@ -29,6 +29,19 @@ const (
 	// ConditionConflict reports that another ClusterConnection claims the same
 	// secretName. Admission cannot see this, since it spans objects.
 	ConditionConflict = "Conflict"
+
+	// ConditionSecretExclusivelyOwned reports whether k2a-token-sync is the only
+	// thing managing the ArgoCD cluster Secret this connection publishes.
+	//
+	// It cannot be checked before the fact. k2a-token-sync holds no read permission
+	// on those Secrets, so the first it can learn of a co-owner is the managedFields
+	// an apply hands back — by which point the write has happened. What this
+	// condition is for is that the takeover does not then go unrecorded: a
+	// registration made by 'argocd cluster add' carries the same cluster- prefix and
+	// the same default name, so a typo in a cluster name repoints an existing
+	// registration at a different cluster and looks exactly like the documented
+	// migration.
+	ConditionSecretExclusivelyOwned = "SecretExclusivelyOwned"
 )
 
 // Reasons accompanying those conditions. They are read by operators far more
@@ -56,7 +69,32 @@ const (
 	// the credential in use is running out. Access to the cluster is at stake, not
 	// just freshness.
 	ReasonSelfCredentialExpiring = "SelfCredentialExpiring" //nolint:gosec // a condition reason, not a credential
+
+	// ReasonForeignFieldManager means something other than k2a-token-sync holds
+	// fields on the cluster Secret, and nothing said that was intended. The likely
+	// readings are a registration created by 'argocd cluster add' and taken over, or
+	// a cluster name that collided with one.
+	ReasonForeignFieldManager = "ForeignFieldManager"
+
+	// ReasonAdoptedRegistration means the same co-ownership, on a connection whose
+	// adoption was requested deliberately. The distinction is the whole point of
+	// recording it: a migration reported identically to an accident, permanently, is
+	// a warning people learn to scroll past.
+	ReasonAdoptedRegistration = "AdoptedRegistration"
 )
+
+// AnnotationAdopted marks a ClusterConnection whose ArgoCD cluster Secret was
+// deliberately taken over from whatever created it, rather than created by
+// k2a-token-sync.
+//
+// Written by 'bootstrap --adopt', which is the only place the decision can be
+// made: it runs with administrative credentials, so it can read the Secret before
+// anything is written, and there is a person there to mean it.
+//
+// An annotation rather than a spec field because it records what was done once,
+// not what is desired continuously — and because adding it needs no schema change,
+// so an older CRD does not silently prune it.
+const AnnotationAdopted = "k2a-token-sync.io/adopted"
 
 // Reasons naming an action rather than a state. They accompany the Events
 // k2a-token-sync records on a ClusterConnection, where what matters is that

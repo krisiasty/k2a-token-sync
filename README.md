@@ -364,6 +364,63 @@ git](#keeping-the-objects-in-git). Order never matters either way: an object app
 Editing works the same way: `kubectl edit ccon standalone-1`, and the change takes effect within a poll. k2a-token-sync
 compares the spec's generation against the one recorded in status, so an edit made while it was down is noticed too.
 
+### Migrating from `argocd cluster add`
+
+Taking over a registration `argocd cluster add` made is the supported path, and the point of the tool: it replaces that
+permanent token with one that rotates. What it is not is something that should happen by accident, and until you say so
+bootstrap treats it as one.
+
+`spec.secretName` defaults to `cluster-<name>`, which is exactly the name `argocd cluster add` uses. So a mistyped
+`--cluster`, or onboarding a cluster whose name collides with an existing registration, does the same thing a migration
+does — it repoints a Secret ArgoCD authenticates with at a different cluster entirely. Bootstrap therefore looks at the
+target before provisioning anything and refuses if a Secret is there that k2a-token-sync did not create:
+
+```console
+$ k2a-token-sync bootstrap --cluster standalone-1 --endpoint 10.1.0.10 --from-kubeconfig ./standalone-1.kubeconfig
+error: argocd/cluster-standalone-1 already exists and was not created by k2a-token-sync, so putting this cluster into
+service would replace its credential with one for this cluster
+  If that is the migration you intend, from 'argocd cluster add', re-run with --adopt.
+  If it is not, this cluster's name has collided with an existing registration: choose another --cluster name, or set
+  spec.secretName on the ClusterConnection to something unclaimed.
+  Nothing has been changed
+```
+
+Add `--adopt` and it proceeds, recording `k2a-token-sync.io/adopted: "true"` on the ClusterConnection. That annotation is
+what distinguishes a registration this tool inherited from one it created, months later when nobody remembers — and it is
+also what stops the condition below from crying wolf. `--print` includes it, so a connection kept in git carries the
+record too.
+
+Two cases are deliberately not refusals. Re-running bootstrap for a cluster already in service is routine: the Secret
+carries `app.kubernetes.io/managed-by: k2a-token-sync`, so it is recognised as this tool's own. And if bootstrap cannot
+*read* ArgoCD's namespace — it runs with your kubeconfig, which need not cover it — it warns and carries on rather than
+blocking on a check it could not run. `--argocd-namespace` sets where it looks, defaulting to `argocd`.
+
+#### What the reconciler can and cannot do about it
+
+Only report. k2a-token-sync holds no read permission on those Secrets by design, so the earliest it can learn of a
+co-owner is the `managedFields` a server-side apply hands back — after the write. Nothing about that is fixable without
+giving the daemon read access to every Secret in ArgoCD's namespace, which is a considerably worse trade.
+
+What it does is make the takeover visible and keep it visible. A pass that finds another field manager sets
+`SecretExclusivelyOwned=False` with reason `ForeignFieldManager`, whose message names the Secret and the other manager,
+and records one Warning event the first time it notices. On a connection annotated as adopted the same finding reports
+`SecretExclusivelyOwned=True` with reason `AdoptedRegistration` — still stated, since nothing else records that the
+Secret was inherited, but not a warning and not an event.
+
+The condition persists, because the situation does: `Force: true` takes the fields this tool manages but does not evict
+the previous manager, so an entry survives for anything it set that k2a-token-sync does not manage.
+
+**If the takeover was not intended**, the credential that was there is gone and was never readable by this tool, so
+there is nothing to restore from. Recovery is:
+
+```bash
+kubectl delete ccon <the-mistyped-name>          # stop k2a-token-sync maintaining it
+argocd cluster add <the-original-context>        # reissue the registration it overwrote
+```
+
+Then re-run bootstrap under a name that does not collide. The downstream identities the mistaken run installed are
+harmless and can be left or removed as under [Removing a cluster](#removing-a-cluster).
+
 ### Removing a cluster
 
 ```bash
@@ -637,6 +694,7 @@ rather than states are recorded there too.
 | `RenewalRecovered` | Normal | It can again, after one of those |
 | `InvalidSpec`, `SecretNameConflict` | Warning | The object is not being reconciled, and why |
 | `ReconciliationResumed` | Normal | That reason is resolved |
+| `ForeignFieldManager` | Warning | Something else manages the cluster Secret and no adoption was recorded — see [Migrating from `argocd cluster add`](#migrating-from-argocd-cluster-add) |
 
 The reasons are the condition reasons wherever one already fits, so the Events section and the `Ready` condition never
 name one situation two different ways.

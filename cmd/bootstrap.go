@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +18,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
+	"github.com/krisiasty/k2a-token-sync/internal/argocd"
 	"github.com/krisiasty/k2a-token-sync/internal/config"
 	"github.com/krisiasty/k2a-token-sync/internal/downstream"
 	"github.com/krisiasty/k2a-token-sync/internal/inventory"
@@ -60,7 +62,13 @@ func runBootstrap(args []string) error {
 		kubeContext = fs.String("context", "",
 			"context of the cluster running ArgoCD and k2a-token-sync (default: current context)")
 
-		namespace   = fs.String("namespace", "k2a-token-sync", "namespace k2a-token-sync runs in; the credential is written here")
+		namespace = fs.String("namespace", "k2a-token-sync", "namespace k2a-token-sync runs in; the credential is written here")
+		// Needed only to look at the registration this cluster would claim. The
+		// default matches the chart's, and the daemon's ARGOCD_NAMESPACE.
+		argocdNamespace = fs.String("argocd-namespace", "argocd",
+			"namespace holding ArgoCD's cluster Secrets, checked for a registration this would take over")
+		adopt = fs.Bool("adopt", false,
+			"take over an existing cluster Secret that k2a-token-sync did not create, e.g. migrating from 'argocd cluster add'")
 		saName      = fs.String("serviceaccount", "argocd-manager", "downstream ServiceAccount ArgoCD authenticates as")
 		saNamespace = fs.String("serviceaccount-namespace", "kube-system", "namespace for the downstream ServiceAccounts")
 		selfSAName  = fs.String("self-serviceaccount", "k2a-token-sync", "downstream ServiceAccount k2a-token-sync authenticates as")
@@ -91,6 +99,14 @@ Modes:
   --print      provision and store the credential, but write the manifest to
                stdout instead of applying it — for keeping those objects in git
   --dry-run    change nothing; report the plan and show the manifest
+
+Before provisioning anything, this checks whether ArgoCD already holds a cluster
+Secret under the name this cluster would claim, and refuses if one is there that
+k2a-token-sync did not create. That Secret is what ArgoCD authenticates with, and
+the name 'argocd cluster add' uses is the same one — so a mistyped cluster name
+would silently repoint an existing registration at a different cluster. Migrating
+from 'argocd cluster add' is the case where you do want that, and --adopt is how
+you say so.
 
 The credential never passes through your terminal, and the manifest contains
 nothing secret:
@@ -170,6 +186,21 @@ Flags:
 	out.stepf("endpoint certificate", "valid until %s (%d days left)",
 		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
 
+	// Before provisioning, and before the dry-run branch, because this is the only
+	// point at which taking over somebody else's registration can be *prevented*
+	// rather than reported after the fact: there are administrative credentials here
+	// and a person to answer to, where the daemon holds no read permission on those
+	// Secrets by design. Refusing after provisioning would also leave two identities
+	// behind downstream with no credential stored for them.
+	//
+	// Only the refusal happens here. What was found is reported further down, under
+	// the heading for the cluster it was found on.
+	target := inspectRegistrationTarget(ctx, localClient, *argocdNamespace, cluster.SecretName)
+	if err := target.refusal(*adopt, *argocdNamespace, cluster.SecretName); err != nil {
+		return err
+	}
+	adopted := target.recordsAdoption(*adopt)
+
 	if *dryRun {
 		out.stepf("identities", "would create %s and %s",
 			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
@@ -177,12 +208,13 @@ Flags:
 		out.blank()
 		out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
 		out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
+		target.report(out, *argocdNamespace, cluster.SecretName, adopted)
 		out.stepf("credential", "would write %s", *namespace+"/"+cluster.CredentialsSecretName())
 		out.stepf("registration", "would apply %s", *namespace+"/"+cluster.Name)
 		out.blank()
 		out.notef("Nothing was changed. The manifest below is what would be applied.")
 		out.blank()
-		return printConnection(cluster, *namespace)
+		return printConnection(cluster, *namespace, adopted)
 	}
 
 	provisioned, err := reconcile.Provision(ctx, downstreamClient, cluster)
@@ -207,6 +239,7 @@ Flags:
 	out.blank()
 	out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
 	out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
+	target.report(out, *argocdNamespace, cluster.SecretName, adopted)
 
 	if err := kubeclient.WriteCredentials(ctx, localClient, *namespace, cluster.CredentialsSecretName(), provisioned,
 		map[string]string{
@@ -224,10 +257,10 @@ Flags:
 		out.notef("Apply or commit the manifest below, to %s, to put %s into service.",
 			describeCluster(*kubeContext, localCfg.Host), cluster.Name)
 		out.blank()
-		return printConnection(cluster, *namespace)
+		return printConnection(cluster, *namespace, adopted)
 	}
 
-	if err := applyConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext); err != nil {
+	if err := applyConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext, adopted); err != nil {
 		return err
 	}
 	out.stepf("registration", "%s", *namespace+"/"+cluster.Name)
@@ -283,6 +316,112 @@ func (s *steps) sameClusterNote(downstreamHost, localHost string) {
 	}
 }
 
+// registrationTarget is what was found where this cluster's ArgoCD registration
+// will be written.
+type registrationTarget int
+
+const (
+	// targetAbsent means nothing is there: an ordinary create, and the common case.
+	targetAbsent registrationTarget = iota
+
+	// targetOurs means a previous k2a-token-sync pass created it. Re-running
+	// bootstrap for a cluster already in service lands here, and must not be
+	// mistaken for a takeover.
+	targetOurs
+
+	// targetForeign means something else created it. This is the case worth
+	// stopping for.
+	targetForeign
+
+	// targetUnreadable means the check could not run.
+	targetUnreadable
+)
+
+// inspectRegistrationTarget looks at the cluster Secret this bootstrap would put
+// into service, and reports who owns it.
+//
+// A Secret created by 'argocd cluster add' is indistinguishable by name from one
+// k2a-token-sync would create: the same cluster- prefix, and cluster-<name> is the
+// default on both sides. The managed-by label is the difference, and it is only
+// ever written by a k2a-token-sync pass — so its absence means "not this tool's",
+// which is exactly the question being asked.
+//
+// Being unable to read is not a failure. Bootstrap runs with whatever kubeconfig
+// the operator has, which need not cover ArgoCD's namespace, and refusing on that
+// basis would break bootstrap for everyone with narrower rights in order to guard
+// a case where a person is present anyway.
+// It returns no error for the same reason: every outcome, including not being
+// allowed to look, is one of the states above.
+func inspectRegistrationTarget(
+	ctx context.Context,
+	client kubernetes.Interface,
+	argocdNamespace, secretName string,
+) registrationTarget {
+	secret, err := client.CoreV1().Secrets(argocdNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	switch {
+	case apierrors.IsNotFound(err):
+		return targetAbsent
+	case err != nil:
+		return targetUnreadable
+	case secret.Labels[argocd.ManagedByLabel] == argocd.ManagedByValue:
+		return targetOurs
+	default:
+		return targetForeign
+	}
+}
+
+// refusal is the error for a takeover that was not asked for, or nil when there is
+// nothing to stop.
+//
+// It names the Secret and what would happen to it, because the reader has to be
+// able to tell which of two very different situations they are in — a migration
+// they meant, or a cluster name that collided with a registration other
+// Applications depend on — and only they can.
+func (t registrationTarget) refusal(adopt bool, argocdNamespace, secretName string) error {
+	if t != targetForeign || adopt {
+		return nil
+	}
+	return fmt.Errorf("%s/%s already exists and was not created by k2a-token-sync, so putting this cluster "+
+		"into service would replace its credential with one for this cluster\n"+
+		"  If that is the migration you intend, from 'argocd cluster add', re-run with --adopt.\n"+
+		"  If it is not, this cluster's name has collided with an existing registration: choose another "+
+		"--cluster name, or set spec.secretName on the ClusterConnection to something unclaimed.\n"+
+		"  Nothing has been changed",
+		argocdNamespace, secretName)
+}
+
+// recordsAdoption reports whether the ClusterConnection should carry the adoption
+// annotation.
+//
+// Only where adoption actually applies. Marking a Secret this tool created as
+// adopted would leave a permanent claim that something was inherited when nothing
+// was, and the annotation's whole job is to tell those two apart later. The
+// unreadable case defers to the operator: they asked for adoption and nothing here
+// can contradict them.
+func (t registrationTarget) recordsAdoption(adopt bool) bool {
+	return adopt && (t == targetForeign || t == targetUnreadable)
+}
+
+// report says what was found, under the heading for the cluster it was found on.
+func (t registrationTarget) report(out *steps, argocdNamespace, secretName string, adopted bool) {
+	secret := argocdNamespace + "/" + secretName
+	switch t {
+	case targetAbsent:
+		out.stepf("registration", "%s does not exist yet", secret)
+	case targetOurs:
+		out.stepf("registration", "%s already managed by k2a-token-sync", secret)
+	case targetForeign:
+		out.stepf("registration", "adopting %s, which k2a-token-sync did not create", secret)
+		out.warnf("its existing credential will be replaced and cannot be recovered; " +
+			"'argocd cluster add' is what restores it")
+	case targetUnreadable:
+		out.warnf("could not read %s, so whether this would take over an existing registration is unknown", secret)
+		if adopted {
+			out.stepf("registration", "adopting %s on request", secret)
+		}
+	}
+}
+
 // preflight checks that the endpoint ArgoCD will use presents a certificate that
 // covers it and verifies against the cluster's own CA.
 func preflight(ctx context.Context, client kubernetes.Interface, cluster config.Cluster) (*downstream.ServingCert, error) {
@@ -321,15 +460,25 @@ func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubecl
 // Only the fields the operator chose are set. Everything else is left to the
 // schema's defaults, so the printed manifest stays short and does not freeze
 // today's defaults into a file that outlives them.
-func connectionFor(cluster config.Cluster, namespace string) *v1alpha1.ClusterConnection {
+//
+// adopted adds the annotation that tells later passes a co-owner on the cluster
+// Secret was expected. It goes on the object rather than being remembered here
+// because the pass that notices is a different process, days later: bootstrap is
+// the only place the intent exists, and the object is the only place it survives.
+func connectionFor(cluster config.Cluster, namespace string, adopted bool) *v1alpha1.ClusterConnection {
+	var annotations map[string]string
+	if adopted {
+		annotations = map[string]string{v1alpha1.AnnotationAdopted: "true"}
+	}
 	return &v1alpha1.ClusterConnection{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "k2a-token-sync.io/v1alpha1",
 			Kind:       "ClusterConnection",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name,
-			Namespace: namespace,
+			Name:        cluster.Name,
+			Namespace:   namespace,
+			Annotations: annotations,
 		},
 		Spec: v1alpha1.ClusterConnectionSpec{
 			Endpoint:   cluster.Endpoint,
@@ -343,8 +492,8 @@ func connectionFor(cluster config.Cluster, namespace string) *v1alpha1.ClusterCo
 // Only apiVersion, kind, metadata and spec are included: status belongs to
 // k2a-token-sync, and a "status: {}" stanza in a committed file is noise at best
 // and an invitation to edit it at worst.
-func renderConnection(cluster config.Cluster, namespace string) ([]byte, error) {
-	conn := connectionFor(cluster, namespace)
+func renderConnection(cluster config.Cluster, namespace string, adopted bool) ([]byte, error) {
+	conn := connectionFor(cluster, namespace, adopted)
 	raw, err := yaml.Marshal(struct {
 		metav1.TypeMeta `json:",inline"`
 		Metadata        metav1.ObjectMeta              `json:"metadata"`
@@ -358,8 +507,8 @@ func renderConnection(cluster config.Cluster, namespace string) ([]byte, error) 
 
 // printConnection writes the manifest to stdout, where a redirect or a pipe into
 // kubectl can take it.
-func printConnection(cluster config.Cluster, namespace string) error {
-	raw, err := renderConnection(cluster, namespace)
+func printConnection(cluster config.Cluster, namespace string, adopted bool) error {
+	raw, err := renderConnection(cluster, namespace, adopted)
 	if err != nil {
 		return err
 	}
@@ -374,13 +523,18 @@ func printConnection(cluster config.Cluster, namespace string) error {
 //
 // It uses the dynamic client for the same reason k2a-token-sync does: no
 // generated clientset is needed to write one object.
-func applyConnection(ctx context.Context, cluster config.Cluster, namespace, kubeconfig, kubeContext string) error {
+func applyConnection(
+	ctx context.Context,
+	cluster config.Cluster,
+	namespace, kubeconfig, kubeContext string,
+	adopted bool,
+) error {
 	dyn, err := kubeclient.DynamicClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return err
 	}
 
-	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(connectionFor(cluster, namespace))
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(connectionFor(cluster, namespace, adopted))
 	if err != nil {
 		return fmt.Errorf("encoding the ClusterConnection: %w", err)
 	}

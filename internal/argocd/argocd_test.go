@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -131,7 +132,7 @@ func TestApplyRegistrationKeepsTheCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
-	if published == "" {
+	if published.CredentialHash == "" {
 		t.Error("ApplyRegistration reported no credential, but one was applied before it")
 	}
 
@@ -160,7 +161,7 @@ func TestApplyRegistrationReportsAMissingCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
-	if published != "" {
+	if published.CredentialHash != "" {
 		t.Error("ApplyRegistration reported a credential on a Secret that has none")
 	}
 }
@@ -205,7 +206,7 @@ func TestRegistrationIgnoresControllerOwnedExtraMetadata(t *testing.T) {
 	desired.ServingCertExpiresAt = time.Date(2027, 7, 31, 12, 0, 0, 0, time.UTC)
 	desired.ExtraLabels = map[string]string{
 		SecretTypeLabel: "repository",
-		managedByLabel:  "somebody-else",
+		ManagedByLabel:  "somebody-else",
 	}
 	desired.ExtraAnnotations = map[string]string{
 		ClusterNameAnnotation:       "another-cluster",
@@ -216,7 +217,7 @@ func TestRegistrationIgnoresControllerOwnedExtraMetadata(t *testing.T) {
 	registration := desired.registrationConfig()
 	wantLabels := map[string]string{
 		SecretTypeLabel: "cluster",
-		managedByLabel:  managedByValue,
+		ManagedByLabel:  ManagedByValue,
 	}
 	wantAnnotations := map[string]string{
 		ClusterNameAnnotation:       desired.ClusterName,
@@ -591,19 +592,22 @@ func TestTheRecordedDigestIsWhatWasSentNotWhatCameBack(t *testing.T) {
 		t.Fatalf("ApplyRegistration returned unexpected error: %v", err)
 	}
 
-	if observed == written {
+	if observed.CredentialHash == written {
 		t.Fatal("the two calls reported the same digest; this test is no longer simulating interference")
 	}
-	if observed != hashConfig([]byte(intruder)) {
-		t.Errorf("the observation is %q, want the intruder's credential — the response reports what is there", observed)
+	if observed.CredentialHash != hashConfig([]byte(intruder)) {
+		t.Errorf("the observation is %q, want the intruder's credential — the response reports what is there",
+			observed.CredentialHash)
 	}
 
 	// The recorded value must still identify this tool's own credential, so the
 	// next pass sees the mismatch rather than blessing the replacement.
-	if reason := NeedsRefresh(fingerprintWith(written), observed, desired, 720*time.Hour, time.Now()); reason != ReasonCredentialReplaced {
+	if reason := NeedsRefresh(fingerprintWith(written), observed.CredentialHash, desired,
+		720*time.Hour, time.Now()); reason != ReasonCredentialReplaced {
 		t.Errorf("NeedsRefresh = %q, want %q", reason, ReasonCredentialReplaced)
 	}
-	if reason := NeedsRefresh(fingerprintWith(observed), observed, desired, 720*time.Hour, time.Now()); reason == ReasonCredentialReplaced {
+	if reason := NeedsRefresh(fingerprintWith(observed.CredentialHash), observed.CredentialHash, desired,
+		720*time.Hour, time.Now()); reason == ReasonCredentialReplaced {
 		t.Error("recording the response's digest hides the replacement entirely, which is the bug this guards")
 	}
 }
@@ -619,5 +623,69 @@ func fingerprintWith(credential string) Fingerprint {
 		CAHash:         HashCA(desired.CAData),
 		TokenExpiresAt: time.Now().Add(700 * time.Hour),
 		CredentialHash: credential,
+	}
+}
+
+// ForeignManagers is the only signal available to something that cannot read the
+// Secret it writes. Force takes the fields this tool manages but does not evict the
+// previous manager, so an entry survives for anything it set that this tool does
+// not manage — and that residue is what distinguishes a Secret this tool created
+// from one it took over.
+func TestForeignManagersNamesOnlyOtherManagers(t *testing.T) {
+	t.Parallel()
+
+	managed := func(names ...string) *corev1.Secret {
+		entries := make([]metav1.ManagedFieldsEntry, 0, len(names))
+		for _, name := range names {
+			entries = append(entries, metav1.ManagedFieldsEntry{Manager: name, Operation: metav1.ManagedFieldsOperationApply})
+		}
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Name: "cluster-standalone-1", Namespace: "argocd", ManagedFields: entries,
+		}}
+	}
+
+	cases := []struct {
+		name     string
+		managers []string
+		want     []string
+	}{
+		{
+			// A Secret this tool created. Both of its own managers are present, because
+			// the registration and the credential are deliberately applied separately.
+			name:     "only this tool",
+			managers: []string{FieldManagerRegistration, FieldManagerCredential},
+			want:     nil,
+		},
+		{
+			// The migration from 'argocd cluster add', and also what a collided cluster
+			// name looks like. Nothing here can tell them apart.
+			name:     "taken over from argocd",
+			managers: []string{FieldManagerRegistration, "argocd", FieldManagerCredential},
+			want:     []string{"argocd"},
+		},
+		{
+			// Sorted and deduplicated, because the result goes into a status message and
+			// a value that reshuffles between passes reads as something having changed.
+			name:     "several, repeated and out of order",
+			managers: []string{"kubectl-client-side-apply", "argocd", "argocd", FieldManagerRegistration},
+			want:     []string{"argocd", "kubectl-client-side-apply"},
+		},
+		{
+			// An entry with no manager names nobody, so it cannot be reported as a party
+			// to anything.
+			name:     "an unnamed entry",
+			managers: []string{FieldManagerRegistration, ""},
+			want:     nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := ForeignManagers(managed(tc.managers...))
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("ForeignManagers = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

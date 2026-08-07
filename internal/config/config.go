@@ -107,6 +107,16 @@ type Cluster struct {
 
 	// Project optionally scopes the cluster to a single ArgoCD project.
 	Project string
+
+	// AdoptedRegistration records that this connection's ArgoCD cluster Secret was
+	// deliberately taken over rather than created, so that a co-owner found on it is
+	// reported as the intended migration rather than as a collision.
+	//
+	// The only field here that does not come from the spec: it is an annotation on
+	// the object, set by 'bootstrap --adopt', so FromSpec cannot see it and the
+	// inventory fills it in. It says what was decided once, which is not the same
+	// kind of thing as the desired state around it.
+	AdoptedRegistration bool
 }
 
 // ServiceAccountRef identifies a downstream ServiceAccount.

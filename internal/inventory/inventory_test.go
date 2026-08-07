@@ -404,3 +404,46 @@ func TestReferenceToAMissingObjectFails(t *testing.T) {
 		t.Fatal("Reference succeeded for an object that does not exist")
 	}
 }
+
+// Adoption is an annotation rather than a spec field, so FromSpec cannot see it and
+// this is the only place it can reach the reconciler. Getting it wrong in the
+// permissive direction would have a collided cluster name reported as an intended
+// migration, which is the whole thing the record exists to distinguish.
+func TestAdoptionIsReadFromTheObjectsAnnotation(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		value string
+		set   bool
+		want  bool
+	}{
+		{name: "absent", want: false},
+		{name: "true", value: "true", set: true, want: true},
+		// Anything that is not exactly "true" reads as no adoption. A half-written or
+		// misspelt value must report the takeover rather than excuse it.
+		{name: "misspelt", value: "yes", set: true, want: false},
+		{name: "empty", value: "", set: true, want: false},
+		{name: "capitalised", value: "True", set: true, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			object := connection("standalone-1", "10.1.0.10", "cluster-standalone-1")
+			if tc.set {
+				object.SetAnnotations(map[string]string{v1alpha1.AnnotationAdopted: tc.value})
+			}
+
+			entry := decode(object)
+			if entry.InvalidReason != "" {
+				t.Fatalf("the object did not resolve: %s", entry.InvalidReason)
+			}
+			if entry.Cluster.AdoptedRegistration != tc.want {
+				t.Errorf("AdoptedRegistration = %v, want %v for annotation %q",
+					entry.Cluster.AdoptedRegistration, tc.want, tc.value)
+			}
+		})
+	}
+}
