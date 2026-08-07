@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -179,6 +180,31 @@ func (c *Client) UpdateStatus(ctx context.Context, name string, status v1alpha1.
 		return fmt.Errorf("updating status of %s: %w", name, err)
 	}
 	return nil
+}
+
+// Reference names one ClusterConnection as the involvedObject of an Event.
+//
+// It is a read because of the UID. kubectl's Events section field-selects on
+// involvedObject.uid, so a reference assembled from the name alone produces an
+// Event the API server accepts and 'kubectl describe' never shows — the one
+// command it exists for. Kind and apiVersion come off the object for the same
+// reason: they are also selected on, and taking them from the object is one fewer
+// thing to keep in step with the CRD.
+//
+// One extra read per Event, which is affordable precisely because Events here are
+// rare: an unchanged pass records none.
+func (c *Client) Reference(ctx context.Context, name string) (corev1.ObjectReference, error) {
+	obj, err := c.resource.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return corev1.ObjectReference{}, fmt.Errorf("reading %s to record an event against it: %w", name, err)
+	}
+	return corev1.ObjectReference{
+		APIVersion: obj.GetAPIVersion(),
+		Kind:       obj.GetKind(),
+		Namespace:  obj.GetNamespace(),
+		Name:       obj.GetName(),
+		UID:        obj.GetUID(),
+	}, nil
 }
 
 // decode converts one object into an Entry, resolving its spec into the runtime

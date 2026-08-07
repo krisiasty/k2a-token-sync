@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/krisiasty/k2a-token-sync/internal/config"
+	"github.com/krisiasty/k2a-token-sync/internal/events"
 	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 	kubeclient "github.com/krisiasty/k2a-token-sync/internal/k8s"
 	"github.com/krisiasty/k2a-token-sync/internal/reconcile"
@@ -121,9 +122,16 @@ func runSync(logger *slog.Logger) error {
 		"telemetry_report_interval", telemetryReportInterval.String(),
 	)
 
+	// One recorder for both writers. The poll records what it decided about an
+	// object and a pass records what it did with one, and they are the same handful
+	// of Events on the same objects.
+	inv := inventory.NewClient(dyn, cfg.Namespace)
+	recorder := events.New(local, cfg.Namespace, inv, logger)
+
 	newScheduler(
-		inventory.NewClient(dyn, cfg.Namespace),
-		reconcile.New(cfg, local, logger),
+		inv,
+		reconcile.New(cfg, local, recorder, logger),
+		recorder,
 		logger,
 		state,
 	).run(ctx)

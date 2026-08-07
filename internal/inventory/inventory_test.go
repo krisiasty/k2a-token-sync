@@ -364,3 +364,43 @@ func TestTheInventorySaysWhichKindOfProblemItFound(t *testing.T) {
 		}
 	}
 }
+
+// An Event carrying only a name and a namespace is accepted by the API server and
+// then never shown by 'kubectl describe', which field-selects on
+// involvedObject.uid alongside the kind. That failure is invisible from this side
+// — the write succeeds — so the reference is worth asserting field by field.
+func TestReferenceCarriesWhatKubectlSelectsOn(t *testing.T) {
+	t.Parallel()
+
+	object := connection("standalone-1", "10.1.0.10", "cluster-standalone-1")
+	object.SetUID("1b4e28ba-2fa1-11d2-883f-0016d3cca427")
+	client := newTestClient(object)
+
+	ref, err := client.Reference(t.Context(), "standalone-1")
+	if err != nil {
+		t.Fatalf("Reference returned an error: %v", err)
+	}
+
+	if ref.UID != "1b4e28ba-2fa1-11d2-883f-0016d3cca427" {
+		t.Errorf("uid = %q, want the object's; without it the event is written and never shown", ref.UID)
+	}
+	if ref.Kind != "ClusterConnection" {
+		t.Errorf("kind = %q, want %q", ref.Kind, "ClusterConnection")
+	}
+	if ref.APIVersion != "k2a-token-sync.io/v1alpha1" {
+		t.Errorf("apiVersion = %q, want %q", ref.APIVersion, "k2a-token-sync.io/v1alpha1")
+	}
+	if ref.Namespace != testNamespace || ref.Name != "standalone-1" {
+		t.Errorf("reference names %s/%s, want %s/standalone-1", ref.Namespace, ref.Name, testNamespace)
+	}
+}
+
+// A reference that cannot be read must say so rather than producing a reference
+// with an empty UID, which would write an event nothing can find.
+func TestReferenceToAMissingObjectFails(t *testing.T) {
+	t.Parallel()
+
+	if _, err := newTestClient().Reference(t.Context(), "absent"); err == nil {
+		t.Fatal("Reference succeeded for an object that does not exist")
+	}
+}

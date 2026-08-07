@@ -58,6 +58,37 @@ const (
 	ReasonSelfCredentialExpiring = "SelfCredentialExpiring" //nolint:gosec // a condition reason, not a credential
 )
 
+// Reasons naming an action rather than a state. They accompany the Events
+// k2a-token-sync records on a ClusterConnection, where what matters is that
+// something happened; the conditions above say how the object stands now.
+//
+// They live here, beside those, rather than in the package that emits them.
+// Several of the Events reuse the reasons above verbatim — a renewal failure
+// reports the same RenewalMintFailed that goes on the condition — and two sets of
+// names for one situation is precisely what would have 'kubectl describe' and
+// 'kubectl get ccon' disagreeing about the same event.
+const (
+	// ReasonCredentialReissued accompanies a new credential published for ArgoCD.
+	// The reason it was due is the one already recorded in lastAction.
+	ReasonCredentialReissued = "CredentialReissued" //nolint:gosec // an event reason, not a credential
+
+	// ReasonIdentityRestored means ArgoCD's downstream ServiceAccount or its
+	// binding was missing and has been recreated. It is the rarest thing here and
+	// the hardest to reconstruct afterwards, since the published Secret goes on
+	// looking perfectly healthy either way.
+	ReasonIdentityRestored = "IdentityRestored"
+
+	// ReasonRenewalRecovered means k2a-token-sync can renew its own credential for
+	// this cluster again. Paired with a preceding RenewalMintFailed,
+	// RenewalUnverified or RenewalNotStored, which is the only case it is emitted
+	// in.
+	ReasonRenewalRecovered = "RenewalRecovered"
+
+	// ReasonReconciliationResumed means the spec problem or Secret conflict that
+	// stopped this object being reconciled is resolved.
+	ReasonReconciliationResumed = "ReconciliationResumed"
+)
+
 // ClusterConnection declares how to reach one downstream cluster, how to
 // authenticate to it, and how long the credentials it publishes should live.
 //

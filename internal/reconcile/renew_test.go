@@ -182,6 +182,7 @@ func newReconciler(local kubernetes.Interface, verify func() (kubernetes.Interfa
 	return &Reconciler{
 		cfg:    &config.Config{Namespace: testNamespace, ArgoCDNamespace: "argocd"},
 		local:  local,
+		events: &fakeRecorder{},
 		logger: slog.New(slog.DiscardHandler),
 		now:    func() time.Time { return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC) },
 		clientForToken: func(_, _ string, _ []byte) (kubernetes.Interface, error) {

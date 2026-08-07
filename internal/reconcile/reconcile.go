@@ -45,10 +45,25 @@ const clientTimeout = 30 * time.Second
 // continuously would achieve.
 const selfRenewInterval = 24 * time.Hour
 
+// EventRecorder records the few things a pass does that are worth finding after
+// the fact, on the ClusterConnection itself.
+//
+// Declared here, next to the code that uses it, so that a test can count what a
+// pass emitted — and in particular assert that an unchanged pass emits nothing,
+// which is what keeps the five-minute cadence free of API writes.
+//
+// Neither method returns an error. An Event records work that has already
+// happened, so failing to write one must not be able to fail the work.
+type EventRecorder interface {
+	Normal(ctx context.Context, cluster, reason, message string)
+	Warning(ctx context.Context, cluster, reason, message string)
+}
+
 // Reconciler holds the collaborators needed to reconcile a cluster.
 type Reconciler struct {
 	cfg    *config.Config
 	local  kubernetes.Interface
+	events EventRecorder
 	logger *slog.Logger
 
 	// now and clientForToken are injectable for tests. clientForToken exists so
@@ -60,10 +75,11 @@ type Reconciler struct {
 }
 
 // New builds a Reconciler.
-func New(cfg *config.Config, local kubernetes.Interface, logger *slog.Logger) *Reconciler {
+func New(cfg *config.Config, local kubernetes.Interface, recorder EventRecorder, logger *slog.Logger) *Reconciler {
 	return &Reconciler{
 		cfg:            cfg,
 		local:          local,
+		events:         recorder,
 		logger:         logger,
 		now:            time.Now,
 		clientForToken: clientFromToken,
@@ -199,6 +215,11 @@ func (r *Reconciler) reconcile(
 			"recreated_serviceaccount", repairs.ServiceAccount,
 			"recreated_binding", repairs.Binding,
 		)
+		// The rarest thing recorded here and the hardest to reconstruct afterwards:
+		// the published Secret goes on looking healthy either way, so without this
+		// the only trace is a log line from whichever pass happened to catch it.
+		r.events.Warning(ctx, cluster.Name, v1alpha1.ReasonIdentityRestored,
+			identityRestoredMessage(cluster, repairs))
 	}
 
 	if err := r.probe(ctx, cluster, ca, status, logger); err != nil {
@@ -340,7 +361,36 @@ func (r *Reconciler) reconcile(
 		"token_expires_at", token.ExpiresAt.UTC().Format(time.RFC3339),
 		"serving_cert_days_remaining", status.ServingCertDaysRemaining,
 	)
+	// Worded like lastAction, and carrying the same reason, so that the object and
+	// its history do not describe one reissue in two different ways.
+	r.events.Normal(ctx, cluster.Name, v1alpha1.ReasonCredentialReissued,
+		fmt.Sprintf("reissued ArgoCD's credential: %s; the new one expires %s",
+			reason, token.ExpiresAt.UTC().Format(time.RFC3339)))
 	return nil
+}
+
+// identityRestoredMessage says which half of ArgoCD's downstream identity was put
+// back, because the two differ in consequence. A recreated ServiceAccount has a
+// new UID, so every token ever issued for it — ArgoCD's included — stopped
+// authenticating; a recreated binding restores permissions to a token that works
+// perfectly well.
+//
+// It says the credential must be reissued rather than that it was. This is
+// recorded before the reissue is attempted, and the rest of the pass can still
+// fail; what is certain here is that the old token is dead.
+func identityRestoredMessage(cluster config.Cluster, repairs downstream.Repairs) string {
+	account := cluster.ServiceAccount.Namespace + "/" + cluster.ServiceAccount.Name
+	switch {
+	case repairs.ServiceAccount && repairs.Binding:
+		return fmt.Sprintf("recreated ServiceAccount %s and its cluster-admin binding; "+
+			"ArgoCD's credential no longer authenticates and must be reissued", account)
+	case repairs.ServiceAccount:
+		return fmt.Sprintf("recreated ServiceAccount %s; ArgoCD's credential no longer "+
+			"authenticates and must be reissued", account)
+	default:
+		return fmt.Sprintf("recreated the cluster-admin binding for ServiceAccount %s; "+
+			"ArgoCD's credential still authenticates", account)
+	}
 }
 
 // fingerprintFrom reads back what a previous pass recorded.
@@ -647,6 +697,12 @@ func (r *Reconciler) maintainSelfCredential(
 		issuedAt = status.SelfCredentialIssuedAt.Time
 	}
 
+	// Read before the condition below is written over it. Whether renewal was
+	// already failing, and for what, is what decides whether this pass has anything
+	// new to report: a renewal broken for a fortnight would otherwise record an
+	// Event every five minutes and bury the one that said it started.
+	wasFailing, wasReason := failingRenewal(*status)
+
 	if !selfCredentialDue(cluster, issuedAt, access.expiresAt, now) {
 		setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionTrue, v1alpha1.ReasonReady,
 			"current, and not yet due for renewal", status.ObservedGeneration)
@@ -657,6 +713,13 @@ func (r *Reconciler) maintainSelfCredential(
 	if err == nil {
 		setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionTrue, v1alpha1.ReasonReady,
 			"renewed", status.ObservedGeneration)
+		// Recorded only as the other half of a failure that was recorded. An ordinary
+		// daily renewal is not news, and there is one per cluster per day.
+		if wasFailing {
+			r.events.Normal(ctx, cluster.Name, v1alpha1.ReasonRenewalRecovered,
+				fmt.Sprintf("renewed k2a-token-sync's own credential for this cluster, which had been failing to "+
+					"renew (%s); the replacement %s", wasReason, renewedDeadline(*status)))
+		}
 		return
 	}
 
@@ -664,6 +727,16 @@ func (r *Reconciler) maintainSelfCredential(
 	setCondition(status, v1alpha1.ConditionSelfCredentialValid, metav1.ConditionFalse, reason,
 		fmt.Sprintf("%v; the credential in use %s, after which this cluster has to be bootstrapped again",
 			err, deadline), status.ObservedGeneration)
+
+	// On the transition, and again when the reason changes, since that names a
+	// different place to go and look. Not on every failing pass: the condition is
+	// what carries "still broken", and one Event per cluster per five minutes is
+	// exactly what would make the Events section worthless.
+	if !wasFailing || wasReason != reason {
+		r.events.Warning(ctx, cluster.Name, reason,
+			fmt.Sprintf("cannot renew k2a-token-sync's own credential for this cluster: %v; the credential in "+
+				"use %s, after which this cluster has to be bootstrapped again", err, deadline))
+	}
 
 	// Severity follows what is left, not what went wrong. The same failure is
 	// unremarkable with eighty days in hand and an emergency with two hours.
@@ -674,6 +747,35 @@ func (r *Reconciler) maintainSelfCredential(
 	}
 	logger.Warn("could not renew k2a-token-sync's own credential; the current one still works",
 		"deadline", deadline, "remaining", remaining, "error", err)
+}
+
+// failingRenewal reports whether the status it is given already says renewal is
+// failing, and with which reason.
+//
+// Taken from the condition rather than from any state of this process's own, so it
+// survives a restart: a renewal that has been failing since before this process
+// started is not a transition, and recording it as one on every restart would put
+// a fresh Event in the history each time the pod was rescheduled.
+func failingRenewal(status v1alpha1.ClusterConnectionStatus) (failing bool, reason string) {
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSelfCredentialValid)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		return false, ""
+	}
+	return true, cond.Reason
+}
+
+// renewedDeadline describes when a credential just stored will expire, for the
+// Event that says renewal is working again.
+//
+// Separate from describeDeadline because it reads the expiry that renewal has just
+// recorded rather than the one the old credential carried, and because a renewal
+// that succeeded always wrote one — so the nil is a defence against a future
+// caller, not a case that happens.
+func renewedDeadline(status v1alpha1.ClusterConnectionStatus) string {
+	if status.SelfCredentialExpiresAt == nil {
+		return "has no recorded expiry"
+	}
+	return "expires " + status.SelfCredentialExpiresAt.UTC().Format(time.RFC3339)
 }
 
 // describeDeadline renders a credential's expiry for people, including the case

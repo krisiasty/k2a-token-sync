@@ -115,6 +115,17 @@ type clusterReconciler interface {
 	) (v1alpha1.ClusterConnectionStatus, error)
 }
 
+// eventRecorder records what the poll decided about an object, as opposed to what
+// a pass did with it: the two verdicts, and their withdrawal.
+//
+// Same shape as the reconciler's own recorder and satisfied by the same value.
+// Declared separately for the same reason the two above are — so a test can count
+// what a poll emitted, and assert that the polls after a verdict emit nothing.
+type eventRecorder interface {
+	Normal(ctx context.Context, cluster, reason, message string)
+	Warning(ctx context.Context, cluster, reason, message string)
+}
+
 // clusterState is what the scheduler remembers between passes. The durable half
 // lives in the object's status; this is only the timing.
 type clusterState struct {
@@ -170,6 +181,7 @@ type clusterState struct {
 type scheduler struct {
 	inv    clusterInventory
 	rec    clusterReconciler
+	events eventRecorder
 	logger *slog.Logger
 	health *healthState
 
@@ -182,10 +194,17 @@ type scheduler struct {
 	now func() time.Time
 }
 
-func newScheduler(inv clusterInventory, rec clusterReconciler, logger *slog.Logger, health *healthState) *scheduler {
+func newScheduler(
+	inv clusterInventory,
+	rec clusterReconciler,
+	recorder eventRecorder,
+	logger *slog.Logger,
+	health *healthState,
+) *scheduler {
 	return &scheduler{
 		inv:    inv,
 		rec:    rec,
+		events: recorder,
 		logger: logger,
 		health: health,
 		state:  make(map[string]*clusterState),
@@ -261,7 +280,7 @@ func (s *scheduler) reportRejected(ctx context.Context) {
 		// during this loop is written on top of rather than under: what it recorded
 		// about the credential it published is worth keeping even though its verdict
 		// has since changed.
-		desired, name, reason, needed := s.verdictFor(state)
+		desired, name, reason, cause, needed := s.verdictFor(state)
 		if !needed {
 			continue
 		}
@@ -274,6 +293,10 @@ func (s *scheduler) reportRejected(ctx context.Context) {
 			continue
 		}
 		s.logger.Info("cluster is not being reconciled", "cluster", name, "reason", reason)
+		// Only where the status write was needed, which is what makes this the
+		// transition rather than every poll: once the verdict is on the object, the
+		// desired status and the actual one are the same value and nothing is written.
+		s.events.Warning(ctx, name, cause, reason)
 	}
 }
 
@@ -302,24 +325,41 @@ func (s *scheduler) blockedClusters() []*clusterState {
 // and from then on the desired status and the actual one are the same value. There
 // is no bookkeeping of what was written, so a status edited or rolled back out of
 // band is simply written again.
+//
+// reason is the message, for a person; cause is the condition reason, which is
+// also the reason the Event carries, so that the two never name one situation two
+// different ways.
 func (s *scheduler) verdictFor(state *clusterState) (
-	desired v1alpha1.ClusterConnectionStatus, name, reason string, needed bool,
+	desired v1alpha1.ClusterConnectionStatus, name, reason, cause string, needed bool,
 ) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if state.invalidReason == "" {
-		return desired, state.cluster.Name, "", false
+		return desired, state.cluster.Name, "", "", false
 	}
 	desired = rejectedStatus(state.status, state)
 	// Compared exactly. Both sides come from the same read, so everything this does
 	// not touch is identical by construction, and the cost of being wrong is one
 	// redundant write rather than a missing one.
 	if reflect.DeepEqual(desired, state.status) {
-		return desired, state.cluster.Name, state.invalidReason, false
+		return desired, state.cluster.Name, state.invalidReason, verdictCause(state), false
 	}
 	state.status = desired
-	return desired, state.cluster.Name, state.invalidReason, true
+	return desired, state.cluster.Name, state.invalidReason, verdictCause(state), true
+}
+
+// verdictCause is the condition reason a verdict is written under. The caller
+// holds the lock.
+//
+// The fallback is not reachable from the inventory, which always says which kind
+// of verdict it is. It is here because a condition with no reason is one the API
+// server rejects outright, which would lose the message along with the reason.
+func verdictCause(state *clusterState) string {
+	if state.invalidCause == "" {
+		return v1alpha1.ReasonInvalidSpec
+	}
+	return state.invalidCause
 }
 
 // rejectedStatus lays the verdict over a status: what an object should say while
@@ -337,13 +377,7 @@ func rejectedStatus(status v1alpha1.ClusterConnectionStatus, state *clusterState
 	// different from this verdict still being current.
 	status.ObservedGeneration = state.generation
 
-	reason := state.invalidCause
-	if reason == "" {
-		// Not reachable from the inventory, which always says which kind it is. Here
-		// because a condition with no reason is one the API server rejects outright,
-		// which would lose the message as well as the reason.
-		reason = v1alpha1.ReasonInvalidSpec
-	}
+	reason := verdictCause(state)
 
 	status.LastAction = "not reconciled: " + state.invalidReason
 	setRejectedCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, state)
@@ -386,6 +420,20 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		return err
 	}
 
+	// Recorded after the lock is released, because writing an Event is an API call
+	// and this lock is held over every cluster's bookkeeping. The withdrawal of a
+	// verdict is worth a note: nothing else marks it, since fixing a conflict does
+	// not change either object's generation.
+	for _, name := range s.updateSchedule(entries) {
+		s.events.Normal(ctx, name, v1alpha1.ReasonReconciliationResumed,
+			"the reason this cluster was not being reconciled is resolved; a pass is due immediately")
+	}
+	return nil
+}
+
+// updateSchedule brings the in-memory state in line with the objects the poll
+// found, and returns the clusters whose verdict has just been withdrawn.
+func (s *scheduler) updateSchedule(entries []inventory.Entry) (resumed []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -421,6 +469,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		if state.invalidReason != "" && entry.InvalidReason == "" {
 			state.dueAt = now
 			state.rerunAfterPass = state.running
+			resumed = append(resumed, name)
 		}
 
 		state.cluster = entry.Cluster
@@ -451,7 +500,7 @@ func (s *scheduler) refresh(ctx context.Context) error {
 		s.logger.Info("cluster removed from the inventory; its ArgoCD Secret is left in place",
 			"cluster", name)
 	}
-	return nil
+	return resumed
 }
 
 // dispatch starts a pass for every cluster whose time has come and returns

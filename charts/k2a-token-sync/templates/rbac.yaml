@@ -35,6 +35,15 @@ rules:
   - apiGroups: ["k2a-token-sync.io"]
     resources: ["clusterconnections/status"]
     verbs: ["get", "update", "patch"]
+  # Events for the handful of things that are genuinely events rather than states
+  # — a credential reissued, a downstream identity restored — so that they show up
+  # in 'kubectl describe ccon' rather than only in this process's logs.
+  #
+  # Create only. Each event is a new object, and k2a-token-sync neither reads them
+  # back nor aggregates them into a series.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
