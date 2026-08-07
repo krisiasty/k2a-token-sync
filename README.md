@@ -458,8 +458,14 @@ one of the two is required unless `--skip-downstream` is given instead. Nothing 
 `--dry-run` reports the same plan and changes nothing, without needing it.
 
 Deleting something that is not this tool's is refused object by object rather than aborting the whole run: a Secret
-without k2a-token-sync's managed-by label, or one whose recorded owner names a different cluster, is left alone and
-named in the output, and the rest of the teardown still proceeds. If another ClusterConnection resolves to the same
+without k2a-token-sync's managed-by label, one whose recorded owner names a different cluster, or one that could not
+be read at all, is left alone and named in the output, and the rest of the teardown still proceeds. Anything left
+behind is listed at the end with the reason and the command that deals with it by hand, and the exit status is
+non-zero — including under `--dry-run`, where a preview whose whole job is to answer "will this work" should not
+report success when the answer is no. A Secret refused because it belongs elsewhere gets a read-only `get` to
+inspect it, never a `delete`: following that advice would break the cluster the guard just protected.
+
+If another ClusterConnection resolves to the same
 downstream endpoint, the whole downstream half is refused instead, since the two identities are cluster-scoped and
 shared between every connection to that cluster — removing them for one would break the other. That comparison only
 ever looks at ClusterConnections in `--namespace` on the cluster `remove` is pointed at, so a second ArgoCD instance
@@ -472,6 +478,17 @@ by design, so the daemon could neither tear a registration down nor notice on it
 `remove` runs with whatever kubeconfig you give it, normally your own, and depends on your access rather than the
 daemon's; if the ClusterConnection is already gone, it recovers the conventional names from `--serviceaccount`,
 `--serviceaccount-namespace`, `--self-serviceaccount` and `--secret-name` instead.
+
+Two things follow from that object being the tool's own memory. The endpoint-collision guard has nothing to compare
+against once it is gone, so it is skipped and the run says so. And `bootstrap --adopt` recorded an inherited
+registration as an annotation on it, so that record is gone too — `remove` falls back to the cluster Secret's own
+field managers, and warns that a registration something else also manages *may* have come from
+`argocd cluster add`, whose credential only re-running that command can restore.
+
+A cluster that is already switched off is the ordinary case, not an error: if every downstream object fails, `remove`
+says the cluster looks unreachable and points at `--skip-downstream` rather than printing five identical timeouts.
+The downstream half also gets its own slice of the timeout, so five dials against a dead endpoint cannot starve the
+final re-check of the ArgoCD Secret.
 
 ## Bootstrap
 

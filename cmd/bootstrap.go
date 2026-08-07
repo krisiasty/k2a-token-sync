@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -358,6 +359,18 @@ func inspectRegistrationTarget(
 	argocdNamespace, secretName string,
 ) registrationTarget {
 	secret, err := client.CoreV1().Secrets(argocdNamespace).Get(ctx, secretName, metav1.GetOptions{})
+	return classifyRegistrationSecret(secret, err)
+}
+
+// classifyRegistrationSecret turns the result of reading a cluster Secret into
+// the verdict above.
+//
+// Split out from the read so a caller that already holds the Secret can reach
+// the same verdict without a second Get. 'remove' is that caller: it needs the
+// cluster annotation and the field managers off the very same object, and
+// reading it twice would both cost a round trip and open a window in which the
+// Secret it classified is not the Secret it went on to inspect.
+func classifyRegistrationSecret(secret *corev1.Secret, err error) registrationTarget {
 	switch {
 	case apierrors.IsNotFound(err):
 		return targetAbsent

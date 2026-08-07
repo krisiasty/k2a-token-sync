@@ -278,14 +278,14 @@ func TestDryRunPerformsNoDeleteActions(t *testing.T) {
 			credentialClusterLabel: "standalone-1",
 		}),
 	)
-	if _, err := removeArgoCDSecret(t.Context(), client, "argocd", "cluster-standalone-1", true); err != nil {
+	if _, err := removeOwnedSecret(t.Context(), client, "argocd", "cluster-standalone-1", true); err != nil {
 		t.Fatalf("removeArgoCDSecret returned unexpected error: %v", err)
 	}
 	credGuard := inspectCredentialSecretForRemoval(t.Context(), client, removeNamespace, "standalone-1-credentials", "standalone-1")
 	if reason := credGuard.refusalReason(); reason != "" {
 		t.Fatalf("inspectCredentialSecretForRemoval refused an owned credential Secret: %q", reason)
 	}
-	if _, err := removeCredentialSecret(t.Context(), client, removeNamespace, "standalone-1-credentials", true); err != nil {
+	if _, err := removeOwnedSecret(t.Context(), client, removeNamespace, "standalone-1-credentials", true); err != nil {
 		t.Fatalf("removeCredentialSecret returned unexpected error: %v", err)
 	}
 	for _, action := range client.Actions() {
@@ -418,14 +418,6 @@ func TestAnAdoptedConnectionWarnsButStillDeletesTheSecret(t *testing.T) {
 		t.Fatal("AdoptedRegistration was not carried over from the object's annotation")
 	}
 
-	warning := adoptionWarning(cluster, "argocd")
-	if warning == "" {
-		t.Fatal("an adopted connection produced no warning")
-	}
-	if !strings.Contains(warning, "argocd cluster add") {
-		t.Errorf("warning = %q, does not name the command that can restore the credential", warning)
-	}
-
 	// The Secret carries the managed-by label the first pass after adoption
 	// always writes, so the guard must clear it for deletion.
 	client := fake.NewClientset(argocdSecret(cluster.SecretName,
@@ -438,12 +430,162 @@ func TestAnAdoptedConnectionWarnsButStillDeletesTheSecret(t *testing.T) {
 		t.Errorf("an adopted registration's Secret was refused: %q", reason)
 	}
 
-	outcome, err := removeArgoCDSecret(t.Context(), client, "argocd", cluster.SecretName, false)
+	warning := adoptionWarning(cluster, guard, usedFallback, "argocd")
+	if warning == "" {
+		t.Fatal("an adopted connection produced no warning")
+	}
+	if !strings.Contains(warning, "argocd cluster add") {
+		t.Errorf("warning = %q, does not name the command that can restore the credential", warning)
+	}
+
+	outcome, err := removeOwnedSecret(t.Context(), client, "argocd", cluster.SecretName, false)
 	if err != nil {
-		t.Fatalf("removeArgoCDSecret returned unexpected error: %v", err)
+		t.Fatalf("removeOwnedSecret returned unexpected error: %v", err)
 	}
 	if outcome != downstream.RemovedOutcome {
 		t.Fatalf("outcome = %v, want RemovedOutcome — an adopted Secret is still ours to delete", outcome)
+	}
+}
+
+// The adoption annotation lives on the ClusterConnection, so once that object
+// is gone the definitive record of an inherited registration is gone with it —
+// and that is precisely the run the fallback path exists for. Saying nothing
+// would silently throw away a credential only 'argocd cluster add' can
+// re-mint. The Secret's own field managers are the surviving evidence, and
+// this checks they are turned into a warning that names the command.
+func TestAnInheritedRegistrationIsStillFlaggedWhenTheConnectionIsGone(t *testing.T) {
+	t.Parallel()
+
+	// No ClusterConnection at all: resolveRemovalCluster must fall back.
+	cluster, usedFallback, _, err := resolveRemovalCluster(t.Context(), newTestInventory(), "standalone-1",
+		config.RemovalClusterInput{Name: "standalone-1"})
+	if err != nil {
+		t.Fatalf("resolveRemovalCluster returned unexpected error: %v", err)
+	}
+	if !usedFallback {
+		t.Fatal("usedFallback = false although no ClusterConnection exists")
+	}
+	if cluster.AdoptedRegistration {
+		t.Fatal("AdoptedRegistration = true with no object to have recorded it")
+	}
+
+	// A Secret this tool manages that still carries the manager which created
+	// it — what taking over an 'argocd cluster add' registration leaves behind.
+	secret := argocdSecret(cluster.SecretName, map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil)
+	secret.ManagedFields = []metav1.ManagedFieldsEntry{
+		{Manager: argocd.FieldManagerRegistration},
+		{Manager: "argocd"},
+	}
+	client := fake.NewClientset(secret)
+
+	guard := inspectArgoCDSecretForRemoval(t.Context(), client, "argocd", cluster.SecretName, cluster.Name)
+	if reason := guard.refusalReason(); reason != "" {
+		t.Fatalf("the Secret was refused (%q); a co-owner is a reason to warn, not to refuse", reason)
+	}
+
+	warning := adoptionWarning(cluster, guard, usedFallback, "argocd")
+	if warning == "" {
+		t.Fatal("a co-owned registration produced no warning on the fallback path")
+	}
+	for _, want := range []string{"argocd cluster add", "argocd", "may have been adopted"} {
+		if !strings.Contains(warning, want) {
+			t.Errorf("warning = %q, does not mention %q", warning, want)
+		}
+	}
+}
+
+// The counterpart: a fallback run against a Secret this tool alone manages has
+// nothing to warn about, and inventing a hedge for every such run would train
+// people to scroll past the one that matters.
+func TestAFallbackRunWarnsNothingWhenTheRegistrationIsSolelyOurs(t *testing.T) {
+	t.Parallel()
+
+	cluster, usedFallback, _, err := resolveRemovalCluster(t.Context(), newTestInventory(), "standalone-1",
+		config.RemovalClusterInput{Name: "standalone-1"})
+	if err != nil {
+		t.Fatalf("resolveRemovalCluster returned unexpected error: %v", err)
+	}
+
+	secret := argocdSecret(cluster.SecretName, map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil)
+	secret.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: argocd.FieldManagerRegistration}}
+	client := fake.NewClientset(secret)
+
+	guard := inspectArgoCDSecretForRemoval(t.Context(), client, "argocd", cluster.SecretName, cluster.Name)
+	if warning := adoptionWarning(cluster, guard, usedFallback, "argocd"); warning != "" {
+		t.Errorf("warning = %q, want none: nothing else manages this Secret", warning)
+	}
+}
+
+// A retirement very often runs against a cluster that is already gone, and
+// five dial failures are one problem, not five. Reporting them individually
+// buries the only useful next step under five kubectl invocations that would
+// fail exactly the same way, so they collapse into a single item that names
+// --skip-downstream.
+func TestAnUnreachableDownstreamCollapsesIntoOneActionableItem(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := config.RemovalCluster(config.RemovalClusterInput{Name: "standalone-1"})
+	if err != nil {
+		t.Fatalf("RemovalCluster returned unexpected error: %v", err)
+	}
+	cluster.Endpoint = testEndpoint
+
+	dial := errors.New("dial tcp 10.1.0.10:6443: i/o timeout")
+	all := []namedOutcome{
+		{name: "argocd-manager-role-binding", err: dial},
+		{name: "k2a-token-sync", err: dial},
+		{name: "kube-system/argocd-manager", err: dial},
+		{name: "kube-system/k2a-token-sync", err: dial},
+		{name: "k2a-token-sync", err: dial},
+	}
+
+	item := unreachableDownstream(all, cluster)
+	if item == nil {
+		t.Fatal("five failed downstream objects did not collapse into one item")
+	}
+	for _, want := range []string{"--skip-downstream", testEndpoint, "unreachable"} {
+		if !strings.Contains(item.why+" "+item.kubectl, want) {
+			t.Errorf("item does not mention %q: why=%q kubectl=%q", want, item.why, item.kubectl)
+		}
+	}
+
+	// One success means the cluster answered, so the failures are about
+	// individual objects and each deserves its own line again.
+	all[2].err = nil
+	if item := unreachableDownstream(all, cluster); item != nil {
+		t.Errorf("collapsed to %q although one object succeeded, so the cluster was reachable", item.why)
+	}
+}
+
+// A Secret that cannot be read at all must be refused, not deleted. The check
+// that would prove it belongs to this cluster is the very thing that failed,
+// so proceeding would mean deleting on the strength of a question never
+// answered — and a transient Forbidden or API error is exactly when that
+// happens.
+func TestAnUnreadableArgoCDSecretIsRefusedRatherThanDeleted(t *testing.T) {
+	t.Parallel()
+
+	client := fake.NewClientset()
+	client.PrependReactor("get", "secrets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(
+			schema.GroupResource{Resource: "secrets"}, "cluster-standalone-1", errors.New("no access to ArgoCD's namespace"))
+	})
+
+	guard := inspectArgoCDSecretForRemoval(t.Context(), client, "argocd", "cluster-standalone-1", "standalone-1")
+	if guard.target != targetUnreadable {
+		t.Fatalf("target = %v, want targetUnreadable", guard.target)
+	}
+	if guard.refusalReason() == "" {
+		t.Fatal("an unreadable Secret was cleared for deletion")
+	}
+	if !guard.unverifiable() {
+		t.Error("unverifiable() = false for a Secret that could not be read")
+	}
+	// And the hand-fix must not tell anyone to delete something whose owner
+	// was never established.
+	fix := refusedSecretHandFix("argocd", "cluster-standalone-1", guard.belongsToDifferentCluster(), guard.unverifiable())
+	if strings.Contains(fix, "delete") {
+		t.Errorf("hand-fix suggests a delete for an unverifiable Secret: %q", fix)
 	}
 }
 
@@ -460,7 +602,7 @@ func TestAForbiddenSecretSurfacesAsAnError(t *testing.T) {
 			schema.GroupResource{Resource: "secrets"}, "cluster-standalone-1", errors.New("no access to ArgoCD's namespace"))
 	})
 
-	_, err := removeArgoCDSecret(t.Context(), client, "argocd", "cluster-standalone-1", false)
+	_, err := removeOwnedSecret(t.Context(), client, "argocd", "cluster-standalone-1", false)
 	if err == nil {
 		t.Fatal("a Forbidden Get was not surfaced as an error")
 	}
