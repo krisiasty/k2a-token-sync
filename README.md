@@ -615,10 +615,37 @@ addition to make.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 
+### Events
+
+`kubectl describe ccon <name>` is the first place most people look, so the handful of things that are genuinely *events*
+rather than states are recorded there too.
+
+| Reason | Type | When |
+| --- | --- | --- |
+| `CredentialReissued` | Normal | A new credential was published for ArgoCD, carrying the same reason as `lastAction` |
+| `IdentityRestored` | Warning | ArgoCD's downstream ServiceAccount or its binding was missing and has been recreated |
+| `RenewalMintFailed`, `RenewalUnverified`, `RenewalNotStored` | Warning | This tool cannot renew its own credential |
+| `RenewalRecovered` | Normal | It can again, after one of those |
+| `InvalidSpec`, `SecretNameConflict` | Warning | The object is not being reconciled, and why |
+| `ReconciliationResumed` | Normal | That reason is resolved |
+
+The reasons are the condition reasons wherever one already fits, so the Events section and the `Ready` condition never
+name one situation two different ways.
+
+**An unchanged pass records nothing**, and neither does an ordinary pass failure. The great majority of passes write
+nothing at all — that is what makes a five-minute cadence affordable — and an event every five minutes per cluster would
+drown the rare ones while putting API writes back into a loop built to avoid them. A renewal that is failing records one
+event when it starts and another if the reason changes, not one per pass; `Ready=False` for an unreachable endpoint or an
+expiring certificate records none, because the condition already carries it and backoff would repeat it.
+
+Events expire from the API server on its own schedule, usually an hour. They are where you find the sequence, not where
+state lives: conditions and `lastAction` remain authoritative for how a connection stands now.
+
 ## Security notes
 
 k2a-token-sync holds no cluster-scoped permissions on the cluster it runs in. Its objects are namespaced and only its own
-namespace is listed, so a Role suffices everywhere.
+namespace is listed, so a Role suffices everywhere. In that namespace it also holds `create` on Events, and only
+`create`: each one is a new object, and it neither reads them back nor aggregates them into a series.
 
 **In ArgoCD's namespace it holds `create` and `patch` on Secrets, and nothing else.** It cannot read — not the Secrets it
 writes, and not ArgoCD's own. It learns the result of its own writes from what an apply returns, and keeps everything

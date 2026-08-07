@@ -254,7 +254,7 @@ func (f *fakeReconciler) releaseAll() { close(f.release) }
 func testScheduler(t *testing.T, inv clusterInventory, rec clusterReconciler) *scheduler {
 	t.Helper()
 	logger := slog.New(slog.DiscardHandler)
-	return newScheduler(inv, rec, logger, newHealthState())
+	return newScheduler(inv, rec, &fakeRecorder{}, logger, newHealthState())
 }
 
 // waitFor blocks until cond holds, and fails the test if it never does. The
