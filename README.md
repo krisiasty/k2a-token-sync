@@ -424,20 +424,71 @@ harmless and can be left or removed as under [Removing a cluster](#removing-a-cl
 ### Removing a cluster
 
 ```bash
-kubectl delete ccon standalone-1
-kubectl -n argocd delete secret cluster-standalone-1     # not done for you
+k2a-token-sync remove --cluster standalone-1 --from-kubeconfig ./standalone-1.kubeconfig --confirm
 ```
 
-Deleting the ClusterConnection (ccon) object stops maintenance. It deliberately does **not** delete the generated Secret:
-k2a-token-sync holds no delete permission in ArgoCD's namespace, so removing a registration ArgoCD is actively using
-stays an explicit act. Left alone, the credential in it expires within `tokenTTL`.
+```text
+Removing standalone-1
 
-Two more objects outlive the ClusterConnection, and can be removed once ArgoCD no longer needs the cluster: the
-`argocd-manager` and `k2a-token-sync` ServiceAccounts downstream, along with their bindings.
+Cluster running ArgoCD — context gitops (https://gitops.example.com:6443)
+  connection            deleted k2a-token-sync/standalone-1
+  registration          deleted argocd/cluster-standalone-1
+  credential            deleted k2a-token-sync/standalone-1-credentials
 
-With no `list` permission in ArgoCD's namespace, k2a-token-sync cannot detect a Secret left behind by a connection
-that was removed while it was down. That is the cost of the RBAC posture below, and it is why cleanup is a documented
-step rather than a promise.
+Downstream cluster — standalone-1
+  reached via           https://standalone-1.example.com:6443
+  bindings              deleted argocd-manager-role-binding, k2a-token-sync
+  identities            deleted kube-system/argocd-manager, kube-system/k2a-token-sync
+  clusterrole           deleted k2a-token-sync
+
+Done. ArgoCD no longer holds a registration for standalone-1.
+```
+
+`remove` is the deliberate counterpart to bootstrap. `kubectl delete ccon` alone stops maintenance but leaves the
+ArgoCD cluster Secret, this tool's own credential, and the downstream `argocd-manager` and `k2a-token-sync`
+ServiceAccounts, their ClusterRoleBindings and their ClusterRole all behind — a live, escalatable identity nobody is
+watching any more. `remove` deletes all of it: the ClusterConnection first, so the daemon stops republishing the
+registration while the rest comes down, then the ArgoCD Secret and the credential, then — unless `--skip-downstream`
+says to leave the downstream side alone — the downstream objects themselves.
+
+Two clusters are involved, as in bootstrap. `--kubeconfig`/`--context` pick the one running ArgoCD and
+k2a-token-sync, where the ClusterConnection, the Secret and the credential all live, and default to your usual
+kubeconfig and current context. `--from-kubeconfig`/`--from-context` pick the downstream cluster being cleaned up;
+one of the two is required unless `--skip-downstream` is given instead. Nothing is deleted without `--confirm`;
+`--dry-run` reports the same plan and changes nothing, without needing it.
+
+Deleting something that is not this tool's is refused object by object rather than aborting the whole run: a Secret
+without k2a-token-sync's managed-by label, one whose recorded owner names a different cluster, or one that could not
+be read at all, is left alone and named in the output, and the rest of the teardown still proceeds. Anything left
+behind is listed at the end with the reason and the command that deals with it by hand, and the exit status is
+non-zero — including under `--dry-run`, where a preview whose whole job is to answer "will this work" should not
+report success when the answer is no. A Secret refused because it belongs elsewhere gets a read-only `get` to
+inspect it, never a `delete`: following that advice would break the cluster the guard just protected.
+
+If another ClusterConnection resolves to the same
+downstream endpoint, the whole downstream half is refused instead, since the two identities are cluster-scoped and
+shared between every connection to that cluster — removing them for one would break the other. That comparison only
+ever looks at ClusterConnections in `--namespace` on the cluster `remove` is pointed at, so a second ArgoCD instance
+elsewhere, registered against the same downstream cluster, stays invisible to it and can still be broken by a run
+against this one.
+
+This is a command a person runs, not something the daemon does on its own. k2a-token-sync's own RBAC in ArgoCD's
+namespace still grants only `create` and `patch`, never `delete` or `list` (see [Security notes](#security-notes)) —
+by design, so the daemon could neither tear a registration down nor notice on its own that one had been orphaned.
+`remove` runs with whatever kubeconfig you give it, normally your own, and depends on your access rather than the
+daemon's; if the ClusterConnection is already gone, it recovers the conventional names from `--serviceaccount`,
+`--serviceaccount-namespace`, `--self-serviceaccount` and `--secret-name` instead.
+
+Two things follow from that object being the tool's own memory. The endpoint-collision guard has nothing to compare
+against once it is gone, so it is skipped and the run says so. And `bootstrap --adopt` recorded an inherited
+registration as an annotation on it, so that record is gone too — `remove` falls back to the cluster Secret's own
+field managers, and warns that a registration something else also manages *may* have come from
+`argocd cluster add`, whose credential only re-running that command can restore.
+
+A cluster that is already switched off is the ordinary case, not an error: if every downstream object fails, `remove`
+says the cluster looks unreachable and points at `--skip-downstream` rather than printing five identical timeouts.
+The downstream half also gets its own slice of the timeout, so five dials against a dead endpoint cannot starve the
+final re-check of the ArgoCD Secret.
 
 ## Bootstrap
 

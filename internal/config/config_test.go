@@ -355,3 +355,92 @@ func TestBootstrapClusterHonoursItsFlags(t *testing.T) {
 		t.Errorf("Namespace is %q, want the default %q", cluster.ServiceAccount.Namespace, defaultServiceAccountNS)
 	}
 }
+
+// RemovalCluster is used when the ClusterConnection has already been deleted,
+// so only the cluster name and optional overrides are available.
+func TestRemovalClusterAppliesDefaults(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := RemovalCluster(RemovalClusterInput{Name: "downstream-1"})
+	if err != nil {
+		t.Fatalf("RemovalCluster returned unexpected error: %v", err)
+	}
+
+	if cluster.SecretName != "cluster-downstream-1" {
+		t.Errorf("SecretName = %q, want cluster-downstream-1", cluster.SecretName)
+	}
+	if cluster.SelfServiceAccountName != defaultSelfServiceAccount {
+		t.Errorf("SelfServiceAccountName = %q, want %q", cluster.SelfServiceAccountName, defaultSelfServiceAccount)
+	}
+	if cluster.ServiceAccount.Name != defaultServiceAccountName {
+		t.Errorf("ServiceAccount.Name = %q, want %q", cluster.ServiceAccount.Name, defaultServiceAccountName)
+	}
+	if cluster.ServiceAccount.Namespace != defaultServiceAccountNS {
+		t.Errorf("ServiceAccount.Namespace = %q, want %q", cluster.ServiceAccount.Namespace, defaultServiceAccountNS)
+	}
+}
+
+// The removal flags exist to override the defaults, so check they still arrive.
+func TestRemovalClusterHonoursItsFlags(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := RemovalCluster(RemovalClusterInput{
+		Name:                    "downstream-1",
+		ServiceAccountName:      "argo",
+		ServiceAccountNamespace: "platform",
+		SelfServiceAccountName:  "sync",
+		SecretName:              "cluster-custom",
+	})
+	if err != nil {
+		t.Fatalf("RemovalCluster returned unexpected error: %v", err)
+	}
+
+	if cluster.SecretName != "cluster-custom" {
+		t.Errorf("SecretName = %q, want cluster-custom", cluster.SecretName)
+	}
+	if cluster.SelfServiceAccountName != "sync" {
+		t.Errorf("SelfServiceAccountName = %q, want sync", cluster.SelfServiceAccountName)
+	}
+	if cluster.ServiceAccount.Name != "argo" || cluster.ServiceAccount.Namespace != "platform" {
+		t.Errorf("ServiceAccount is %+v, want argo/platform", cluster.ServiceAccount)
+	}
+
+	// A partially-specified reference must still default the other half, exactly as
+	// the schema's per-field defaults do.
+	cluster, err = RemovalCluster(RemovalClusterInput{
+		Name:               "downstream-1",
+		ServiceAccountName: "argo",
+	})
+	if err != nil {
+		t.Fatalf("RemovalCluster returned unexpected error: %v", err)
+	}
+	if cluster.ServiceAccount.Namespace != defaultServiceAccountNS {
+		t.Errorf("Namespace is %q, want the default %q", cluster.ServiceAccount.Namespace, defaultServiceAccountNS)
+	}
+}
+
+func TestRemovalClusterRejects(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty name", func(t *testing.T) {
+		t.Parallel()
+		_, err := RemovalCluster(RemovalClusterInput{Name: ""})
+		if err == nil {
+			t.Fatal("RemovalCluster accepted an empty name")
+		}
+		if !strings.Contains(err.Error(), "cluster name must not be empty") {
+			t.Errorf("error = %q, want it to mention cluster name must not be empty", err)
+		}
+	})
+
+	t.Run("name too long for derived secret names", func(t *testing.T) {
+		t.Parallel()
+		_, err := RemovalCluster(RemovalClusterInput{Name: strings.Repeat("a", maxClusterNameLength+1)})
+		if err == nil {
+			t.Fatal("RemovalCluster accepted an over-long name")
+		}
+		if !strings.Contains(err.Error(), "exceeds") {
+			t.Errorf("error = %q, want it to mention exceeds", err)
+		}
+	})
+}
