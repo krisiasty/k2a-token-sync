@@ -16,9 +16,9 @@ verbatim; the other four names are added to that same package rather than to a v
 
 | Event | Type | Reason | Site |
 | --- | --- | --- | --- |
-| credential reissued | Normal | `CredentialReissued` (new) | `internal/reconcile.reconcile`, beside the existing success log |
-| downstream identity restored | Warning | `IdentityRestored` (new) | `internal/reconcile.reconcile`, where `repairs.Any()` already warns |
-| self-credential renewal failed | Warning | `RenewalMintFailed` / `RenewalUnverified` / `RenewalNotStored` | `maintainSelfCredential` |
+| credential reissued | Normal | `CredentialReissued` (new) | `reconcile`, beside the existing success log |
+| downstream identity restored | Warning | `IdentityRestored` (new) | `reconcile`, where `repairs.Any()` warns |
+| renewal failed | Warning | `RenewalMintFailed` / `RenewalUnverified` / `RenewalNotStored` | `maintainSelfCredential` |
 | self-credential renewal recovered | Normal | `RenewalRecovered` (new) | `maintainSelfCredential` |
 | verdict written | Warning | `InvalidSpec` / `SecretNameConflict` | `scheduler.reportRejected` |
 | verdict cleared | Normal | `ReconciliationResumed` (new) | `scheduler.updateSchedule` |
