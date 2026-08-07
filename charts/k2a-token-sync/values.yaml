@@ -21,6 +21,44 @@ argocdNamespace: argocd
 health:
   port: 8080
 
+# Alert rules for the per-cluster series /metrics exposes, as a PrometheusRule.
+#
+# Off by default because enabling it renders a monitoring.coreos.com resource:
+# on a cluster without prometheus-operator's CRDs that install would fail on an
+# object nobody asked for. Turning this on is a statement that they are there.
+#
+# The thresholds are days and minutes rather than durations because PromQL has
+# no scalar duration literal; the template turns each into arithmetic that stays
+# readable in the rendered rule. Each default is set by the lead time its remedy
+# needs — see the README's "Alerting" section for the reasoning behind each one.
+prometheusRule:
+  enabled: false
+
+  # Where to put the PrometheusRule. Defaults to the release namespace; set this
+  # when prometheus-operator only watches a particular one.
+  namespace: ""
+
+  # Labels the operator's ruleSelector matches on. Most installations need at
+  # least one, and which one is entirely site-specific.
+  additionalLabels: {}
+
+  # Recovery needs a person with administrative access to the downstream
+  # cluster, so this wants weeks of notice, not days.
+  selfCredentialExpiryDays: 14
+
+  # ArgoCD's own credential, reissued at half its lifetime. Reaching this point
+  # means reissue has been failing for most of that.
+  tokenExpiryDays: 3
+
+  # Three missed reconciliation passes: long enough to survive a rollout, short
+  # enough to catch a stuck loop while every expiry still looks healthy.
+  staleSyncMinutes: 15
+  notReadyMinutes: 15
+
+  # k2a-token-sync cannot rotate a serving certificate — that needs node access
+  # and a control-plane restart — so this is notice to schedule the work.
+  servingCertExpiryDays: 30
+
 resources:
   requests:
     cpu: 10m

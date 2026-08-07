@@ -732,6 +732,58 @@ addition to make.
 
 Logs are JSON via `log/slog`. Credential material is never logged.
 
+### Alerting
+
+The metrics are only worth exposing if something watches them, and the failure this tool exists to prevent is
+silent by construction: renewal of k2a-token-sync's **own** credential can fail for weeks while ArgoCD keeps
+working perfectly, because the credential in hand goes on minting ArgoCD's tokens until it expires. Past that
+point only a person re-running bootstrap restores access.
+
+The chart ships the rules that catch it, off by default:
+
+```bash
+helm upgrade k2a-token-sync ... \
+  --set prometheusRule.enabled=true \
+  --set prometheusRule.additionalLabels.release=kube-prometheus-stack
+```
+
+Off by default because enabling it renders a `monitoring.coreos.com` resource, and an install on a cluster
+without prometheus-operator's CRDs would fail on an object nobody asked for. `additionalLabels` is what the
+operator's `ruleSelector` matches on, and which label that is depends entirely on the installation.
+
+| Alert | Fires at | What to do |
+| --- | --- | --- |
+| `K2aTokenSyncSelfCredentialExpiring` | 14 days | re-run `bootstrap`; check `SelfCredentialValid` for the reason |
+| `K2aTokenSyncTokenExpiring` | 3 days | check `Ready` and the pod logs; reissue resumes once the cause clears |
+| `K2aTokenSyncNotSyncing` | 15 min | earliest signal, credentials still valid; check the pod logs |
+| `K2aTokenSyncClusterNotReady` | 15 min | `kubectl describe ccon <name>` names the reason |
+| `K2aTokenSyncServingCertExpiring` | 30 days | schedule a control-plane rotation; this tool cannot fix it |
+
+The first two are `critical`, the rest `warning`.
+
+Each threshold is set by the lead time its remedy needs, and those differ sharply:
+
+- **14 days** on the self credential, because the remedy is a person with administrative access to the
+  downstream cluster — possibly another team, and a change window. `selfTokenTTL` defaults to 90 days and is
+  renewed on every successful pass, so reaching 14 means renewal has already been failing for about ten weeks.
+- **3 days** on ArgoCD's credential, because reissue happens at half life — `tokenTTL` defaults to 30 days, so
+  reissue at 15 — and the remedy usually needs no human once the underlying cause clears.
+- **15 minutes** on both liveness conditions: reconciliation is every five minutes, so that is three missed
+  passes. Long enough to survive a rollout, short enough to catch a stuck loop while every expiry timestamp
+  still looks perfectly healthy.
+- **30 days** on the serving certificate, because rotating one needs node access and a control-plane restart,
+  one node at a time. This is the escalation of the 90-day `expiryWarnThreshold`, which only writes a warning
+  to the logs and the object's status.
+
+Every expression is a subtraction against `time()` rather than a threshold on a remaining-seconds gauge, for
+the reason given above — and a cluster that has never published has no series at all, so it fires nothing
+rather than everything. Thresholds render as `14 * 24 * 3600` rather than `1209600` because PromQL has no
+scalar duration literal but does evaluate scalar arithmetic, so the rule stays readable in Alertmanager.
+
+Not running prometheus-operator? The expressions in
+[`templates/prometheusrule.yaml`](charts/k2a-token-sync/templates/prometheusrule.yaml) are plain PromQL and
+work in any Prometheus rule file; the chart is only a delivery mechanism.
+
 ### Events
 
 `kubectl describe ccon <name>` is the first place most people look, so the handful of things that are genuinely *events*

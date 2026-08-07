@@ -1,0 +1,142 @@
+{{/*
+Alert rules for the per-cluster series /metrics exposes.
+
+Off by default, and deliberately so: this renders a monitoring.coreos.com
+resource, and an install on a cluster without prometheus-operator's CRDs would
+fail on an object it never asked for. Enabling it is a statement that those CRDs
+are there.
+
+Every rule is a subtraction against time() rather than a threshold on a
+remaining-seconds gauge, because the metrics are absolute deadlines — correct
+whenever the query runs, rather than only at the instant they were scraped. A
+deadline that is not yet known is absent rather than zero, so a cluster that has
+never published has no series here and fires nothing, instead of reading as 1970
+and firing every expiry rule at once.
+
+Thresholds render as `14 * 24 * 3600` rather than `1209600`: PromQL has no scalar
+duration literal, but it does evaluate scalar arithmetic, so the rule a person
+reads in Alertmanager still says what it means.
+*/}}
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "k2a-token-sync.name" . }}
+  namespace: {{ .Values.prometheusRule.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: k2a-token-sync
+      rules:
+        # The failure this tool exists to prevent, and the one that is silent by
+        # construction: ArgoCD goes on working perfectly while this clock runs
+        # down, because the credential in hand keeps minting ArgoCD's tokens
+        # until it expires. Past that point nothing automatic recovers.
+        #
+        # Fourteen days because the remedy is a person with administrative
+        # access to the downstream cluster, which may mean another team and a
+        # change window. selfTokenTTL defaults to 90 days and is renewed on
+        # every successful pass, so reaching this point means renewal has been
+        # failing for about ten weeks already.
+        - alert: K2aTokenSyncSelfCredentialExpiring
+          expr: |
+            k2a_token_sync_cluster_self_credential_expiration_timestamp_seconds - time()
+              < {{ .Values.prometheusRule.selfCredentialExpiryDays }} * 24 * 3600
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: >-
+              k2a-token-sync's own credential for {{ "{{ $labels.cluster }}" }} expires in under
+              {{ .Values.prometheusRule.selfCredentialExpiryDays }} days
+            description: >-
+              Renewal has been failing long enough that k2a-token-sync is running out of access to
+              {{ "{{ $labels.cluster }}" }}. ArgoCD is still working and will keep working until its own
+              credential expires, which is why this is not visible anywhere else. Check the
+              SelfCredentialValid condition on the ClusterConnection for the reason. If the credential
+              does expire, the only way back is re-running 'k2a-token-sync bootstrap' for this cluster
+              with administrative access to it.
+
+        # ArgoCD's own credential. Reissue happens at half life — tokenTTL
+        # defaults to 30 days, so reissue at 15 — and the remedy usually needs
+        # no human once whatever blocked renewal clears. Three days means
+        # renewal has been failing for roughly twelve.
+        - alert: K2aTokenSyncTokenExpiring
+          expr: |
+            k2a_token_sync_cluster_token_expiration_timestamp_seconds - time()
+              < {{ .Values.prometheusRule.tokenExpiryDays }} * 24 * 3600
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: >-
+              ArgoCD's credential for {{ "{{ $labels.cluster }}" }} expires in under
+              {{ .Values.prometheusRule.tokenExpiryDays }} days
+            description: >-
+              A credential this close to expiry means reissue has been failing since half its lifetime,
+              and ArgoCD loses access to {{ "{{ $labels.cluster }}" }} when it lapses. Check the Ready
+              condition on the ClusterConnection and the pod's logs for the failing pass.
+
+        # Passes failing while every expiry timestamp still looks healthy —
+        # the state in which nothing else here fires yet. Reconciliation is
+        # every five minutes, so fifteen is three missed passes: long enough to
+        # survive a rollout, short enough to catch a stuck loop.
+        - alert: K2aTokenSyncNotSyncing
+          expr: |
+            time() - k2a_token_sync_cluster_last_sync_timestamp_seconds
+              > {{ .Values.prometheusRule.staleSyncMinutes }} * 60
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              No k2a-token-sync pass has succeeded for {{ "{{ $labels.cluster }}" }} in over
+              {{ .Values.prometheusRule.staleSyncMinutes }} minutes
+            description: >-
+              Reconciliation runs every five minutes, so this is at least three consecutive failures.
+              The credentials are still valid — this fires well before any of the expiry alerts — so it
+              is the earliest warning that something is wrong. Check the pod's logs and the
+              ClusterConnection's conditions.
+
+        # Anything else, including a spec the tool refuses to reconcile: an
+        # invalid spec or two connections claiming one Secret both land here and
+        # neither self-heals.
+        - alert: K2aTokenSyncClusterNotReady
+          expr: k2a_token_sync_cluster_ready == 0
+          for: {{ .Values.prometheusRule.notReadyMinutes }}m
+          labels:
+            severity: warning
+          annotations:
+            summary: ArgoCD has no current registration for {{ "{{ $labels.cluster }}" }}
+            description: >-
+              k2a-token-sync reports this cluster as not registered. A spec it refuses to reconcile —
+              an invalid field, or two ClusterConnections claiming the same Secret — will stay this way
+              until a person fixes it. 'kubectl describe ccon {{ "{{ $labels.cluster }}" }}' names the
+              reason in its conditions and events.
+
+        # This tool observes the serving certificate but never rotates one:
+        # that needs node access and restarts control-plane components, so it
+        # belongs to whatever manages the cluster. Thirty days is the escalation
+        # of the tool's own 90-day expiryWarnThreshold, which only writes a
+        # warning to logs and status.
+        - alert: K2aTokenSyncServingCertExpiring
+          expr: |
+            k2a_token_sync_cluster_serving_cert_expiration_timestamp_seconds - time()
+              < {{ .Values.prometheusRule.servingCertExpiryDays }} * 24 * 3600
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: >-
+              The API server certificate at {{ "{{ $labels.cluster }}" }} expires in under
+              {{ .Values.prometheusRule.servingCertExpiryDays }} days
+            description: >-
+              When it lapses ArgoCD's TLS handshake fails no matter how fresh the token is, and
+              k2a-token-sync cannot fix it: reissuing a serving certificate needs node access and a
+              control-plane restart, one node at a time. Schedule that rotation with whatever manages
+              this cluster.
+{{- end }}

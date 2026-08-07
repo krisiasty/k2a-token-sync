@@ -153,6 +153,46 @@ jobs:
             fi
           done
 
+      # The alert rules are off by default, so the step above cannot see them and
+      # a template that was never committed would render fine locally and vanish
+      # here — the same failure that check exists for. Both directions matter:
+      # absent when asked for is a missing feature, present when not asked for
+      # would break every install without prometheus-operator's CRDs.
+      - name: the alert rules render only when asked for
+        run: |
+          set -euo pipefail
+          off=$(helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}")
+          if grep -qx "kind: PrometheusRule" <<<"${off}"; then
+            echo "::error::the chart rendered a PrometheusRule without prometheusRule.enabled"
+            exit 1
+          fi
+          on=$(helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}" \
+            --set prometheusRule.enabled=true)
+          if ! grep -qx "kind: PrometheusRule" <<<"${on}"; then
+            echo "::error::prometheusRule.enabled=true rendered no PrometheusRule"
+            exit 1
+          fi
+          # Every metric the endpoint exposes should be alerted on, and a rule
+          # naming a metric that does not exist would fire never and be noticed
+          # by nobody. This ties the two files together.
+          for metric in \
+            k2a_token_sync_cluster_ready \
+            k2a_token_sync_cluster_token_expiration_timestamp_seconds \
+            k2a_token_sync_cluster_self_credential_expiration_timestamp_seconds \
+            k2a_token_sync_cluster_serving_cert_expiration_timestamp_seconds \
+            k2a_token_sync_cluster_last_sync_timestamp_seconds; do
+            if ! grep -q "${metric}" <<<"${on}"; then
+              echo "::error::no alert rule references ${metric}"
+              exit 1
+            fi
+            if ! grep -rq "\"${metric}\"" cmd/metrics.go; then
+              echo "::error::alert rules reference ${metric}, which cmd/metrics.go does not export"
+              exit 1
+            fi
+          done
+
       - name: helm template
         run: |
           helm template k2a-token-sync charts/k2a-token-sync \
