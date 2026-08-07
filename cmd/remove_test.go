@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -59,6 +63,22 @@ func connectionObject(name, secretName string, annotations map[string]string) *u
 	}}
 }
 
+// unresolvableConnectionObject builds a ClusterConnection whose spec
+// config.FromSpec refuses: an endpoint carrying a URL path, which its
+// normalisation rejects. A tokenTTL the API's OpenAPI schema would reject is
+// out of reach for a fixture built directly as unstructured data (no
+// admission runs against a fake dynamic client), so this is the way to make
+// decode's FromSpec call fail without going through the schema at all.
+func unresolvableConnectionObject(name string) *unstructured.Unstructured {
+	object := connectionObject(name, "", nil)
+	spec, ok := object.Object["spec"].(map[string]any)
+	if !ok {
+		panic("connectionObject did not build a map[string]any spec")
+	}
+	spec["endpoint"] = "10.1.0.10:6443/some/path"
+	return object
+}
+
 // newTestInventory builds an inventory.Client over a fake dynamic client, the
 // same way internal/inventory's own tests do.
 func newTestInventory(objects ...runtime.Object) *inventory.Client {
@@ -79,11 +99,16 @@ func argocdSecret(name string, labels, annotations map[string]string) *corev1.Se
 	}
 }
 
+// credentialSecretName is the name every fixture in this file uses for
+// standalone-1's own credential Secret, matching what
+// config.Cluster.CredentialsSecretName derives for that cluster.
+const credentialSecretName = "standalone-1-credentials" //nolint:gosec // a Secret name, not a credential
+
 // credentialSecret builds this tool's own credential Secret as
 // WriteCredentials leaves it.
-func credentialSecret(name string, labels map[string]string) *corev1.Secret {
+func credentialSecret(labels map[string]string) *corev1.Secret {
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: removeNamespace, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Name: credentialSecretName, Namespace: removeNamespace, Labels: labels},
 		Data:       map[string][]byte{"token": []byte("a-token")},
 	}
 }
@@ -186,6 +211,43 @@ func TestASecondConnectionSharingTheEndpointBlocksTheDownstreamHalf(t *testing.T
 	}
 }
 
+// Two ClusterConnections that share both a downstream endpoint and an
+// explicit secretName are marked InvalidReason by
+// inventory.Client.List's blockContestedSecrets — for the secretName
+// conflict, a problem of its own. That must not make the collision guard
+// blind to the endpoint the two also share: skipping an invalid entry here
+// would let the downstream half be torn down for a connection another,
+// still-endpoint-resolved spec depends on, which is exactly the outcome this
+// guard exists to prevent.
+func TestEndpointCollisionCatchesAContestedSecretPairEvenThoughBothAreInvalid(t *testing.T) {
+	t.Parallel()
+
+	inv := newTestInventory(
+		connectionObject("standalone-1", "shared-secret", nil),
+		connectionObject("standalone-1-duplicate", "shared-secret", nil),
+	)
+
+	// Sanity check: both entries really are marked invalid by the
+	// secretName conflict, so this test is exercising the case it claims to.
+	entries, err := inv.List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+	for _, e := range entries {
+		if e.InvalidReason == "" {
+			t.Fatalf("entry %q was not marked invalid by the shared secretName; fixture does not exercise the contested case", e.Cluster.Name)
+		}
+	}
+
+	other, err := endpointCollision(t.Context(), inv, "standalone-1", testEndpoint)
+	if err != nil {
+		t.Fatalf("endpointCollision returned unexpected error: %v", err)
+	}
+	if other != "standalone-1-duplicate" {
+		t.Fatalf("other = %q, want the colliding connection named even though blockContestedSecrets marked both invalid", other)
+	}
+}
+
 // --dry-run has to run every read and every guard while performing zero
 // writes: a plan that lies about what it would do is worse than none.
 func TestDryRunPerformsNoDeleteActions(t *testing.T) {
@@ -211,7 +273,7 @@ func TestDryRunPerformsNoDeleteActions(t *testing.T) {
 
 	client := fake.NewClientset(
 		argocdSecret("cluster-standalone-1", map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil),
-		credentialSecret("standalone-1-credentials", map[string]string{
+		credentialSecret(map[string]string{
 			argocd.ManagedByLabel:  argocd.ManagedByValue,
 			credentialClusterLabel: "standalone-1",
 		}),
@@ -219,7 +281,11 @@ func TestDryRunPerformsNoDeleteActions(t *testing.T) {
 	if _, err := removeArgoCDSecret(t.Context(), client, "argocd", "cluster-standalone-1", true); err != nil {
 		t.Fatalf("removeArgoCDSecret returned unexpected error: %v", err)
 	}
-	if _, _, err := removeCredentialSecret(t.Context(), client, removeNamespace, "standalone-1-credentials", "standalone-1", true); err != nil {
+	credGuard := inspectCredentialSecretForRemoval(t.Context(), client, removeNamespace, "standalone-1-credentials", "standalone-1")
+	if reason := credGuard.refusalReason(); reason != "" {
+		t.Fatalf("inspectCredentialSecretForRemoval refused an owned credential Secret: %q", reason)
+	}
+	if _, err := removeCredentialSecret(t.Context(), client, removeNamespace, "standalone-1-credentials", true); err != nil {
 		t.Fatalf("removeCredentialSecret returned unexpected error: %v", err)
 	}
 	for _, action := range client.Actions() {
@@ -269,7 +335,7 @@ func TestAMissingClusterConnectionFallsBackToDefaults(t *testing.T) {
 
 	inv := newTestInventory()
 
-	cluster, usedFallback, err := resolveRemovalCluster(t.Context(), inv, "standalone-1", config.RemovalClusterInput{
+	cluster, usedFallback, fallbackReason, err := resolveRemovalCluster(t.Context(), inv, "standalone-1", config.RemovalClusterInput{
 		Name: "standalone-1",
 	})
 	if err != nil {
@@ -278,6 +344,9 @@ func TestAMissingClusterConnectionFallsBackToDefaults(t *testing.T) {
 	if !usedFallback {
 		t.Fatal("usedFallback = false for a ClusterConnection that does not exist")
 	}
+	if fallbackReason != "" {
+		t.Errorf("fallbackReason = %q, want empty for a simply-absent ClusterConnection", fallbackReason)
+	}
 
 	want, err := config.RemovalCluster(config.RemovalClusterInput{Name: "standalone-1"})
 	if err != nil {
@@ -285,6 +354,40 @@ func TestAMissingClusterConnectionFallsBackToDefaults(t *testing.T) {
 	}
 	if !reflect.DeepEqual(cluster, want) {
 		t.Errorf("cluster = %+v, want the same defaults config.RemovalCluster produces: %+v", cluster, want)
+	}
+}
+
+// An unresolvable ClusterConnection — a malformed tokenTTL, an endpoint with
+// a path, a name over the length limit — must fall back the same way an
+// absent one does, rather than being acted on with every name zeroed. This
+// is a different inventory.Client error path than the missing-object case
+// above: the object exists, but decode's FromSpec call inside it fails, so
+// Get returns an Entry with InvalidReason set rather than apierrors.NotFound.
+func TestAnUnresolvableClusterConnectionFallsBackToDefaults(t *testing.T) {
+	t.Parallel()
+
+	inv := newTestInventory(unresolvableConnectionObject("standalone-1"))
+
+	cluster, usedFallback, fallbackReason, err := resolveRemovalCluster(t.Context(), inv, "standalone-1", config.RemovalClusterInput{
+		Name: "standalone-1",
+	})
+	if err != nil {
+		t.Fatalf("resolveRemovalCluster returned unexpected error: %v", err)
+	}
+	if !usedFallback {
+		t.Fatal("usedFallback = false for a ClusterConnection whose spec could not be resolved")
+	}
+	if fallbackReason == "" {
+		t.Fatal("fallbackReason = \"\", want the InvalidReason explaining why the spec could not be resolved")
+	}
+
+	want, err := config.RemovalCluster(config.RemovalClusterInput{Name: "standalone-1"})
+	if err != nil {
+		t.Fatalf("config.RemovalCluster returned unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(cluster, want) {
+		t.Errorf("cluster = %+v, want the same defaults config.RemovalCluster produces "+
+			"rather than a Cluster built from a partially-resolved spec: %+v", cluster, want)
 	}
 }
 
@@ -301,12 +404,15 @@ func TestAnAdoptedConnectionWarnsButStillDeletesTheSecret(t *testing.T) {
 		map[string]string{v1alpha1.AnnotationAdopted: "true"})
 	inv := newTestInventory(object)
 
-	cluster, usedFallback, err := resolveRemovalCluster(t.Context(), inv, "standalone-1", config.RemovalClusterInput{})
+	cluster, usedFallback, fallbackReason, err := resolveRemovalCluster(t.Context(), inv, "standalone-1", config.RemovalClusterInput{})
 	if err != nil {
 		t.Fatalf("resolveRemovalCluster returned unexpected error: %v", err)
 	}
 	if usedFallback {
 		t.Fatal("usedFallback = true although the ClusterConnection exists")
+	}
+	if fallbackReason != "" {
+		t.Errorf("fallbackReason = %q, want empty when the ClusterConnection resolved cleanly", fallbackReason)
 	}
 	if !cluster.AdoptedRegistration {
 		t.Fatal("AdoptedRegistration was not carried over from the object's annotation")
@@ -357,5 +463,367 @@ func TestAForbiddenSecretSurfacesAsAnError(t *testing.T) {
 	_, err := removeArgoCDSecret(t.Context(), client, "argocd", "cluster-standalone-1", false)
 	if err == nil {
 		t.Fatal("a Forbidden Get was not surfaced as an error")
+	}
+}
+
+// actionRecorder records a label for each action a reactor observes, in the
+// order the fake clientsets invoked them, so a test can assert on the actual
+// sequence of Get/Delete calls across three separate fake clients rather than
+// only on what each step decided in isolation.
+type actionRecorder struct {
+	mu  sync.Mutex
+	log []string
+}
+
+func (r *actionRecorder) add(label string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.log = append(r.log, label)
+}
+
+func (r *actionRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.log))
+	copy(out, r.log)
+	return out
+}
+
+// deletesOnly returns the phase name (the part before ":") of every recorded
+// delete action, in order — the sequence the five-step order promises.
+func (r *actionRecorder) deletesOnly() []string {
+	var out []string
+	for _, entry := range r.snapshot() {
+		phase, verb, ok := strings.Cut(entry, ":")
+		if ok && verb == "delete" {
+			out = append(out, phase)
+		}
+	}
+	return out
+}
+
+// lastIndex returns the last position of an exact "phase:verb" label, or -1.
+func (r *actionRecorder) lastIndex(label string) int {
+	log := r.snapshot()
+	for i := len(log) - 1; i >= 0; i-- {
+		if log[i] == label {
+			return i
+		}
+	}
+	return -1
+}
+
+// lastIndexWithPrefix returns the last position of any label starting with
+// prefix, or -1.
+func (r *actionRecorder) lastIndexWithPrefix(prefix string) int {
+	log := r.snapshot()
+	for i := len(log) - 1; i >= 0; i-- {
+		if strings.HasPrefix(log[i], prefix+":") {
+			return i
+		}
+	}
+	return -1
+}
+
+// named is the common surface of k8stesting's GetAction and DeleteAction:
+// both carry the object's name, which is what tells one Secret apart from
+// another on the same fake clientset.
+type named interface {
+	GetName() string
+}
+
+// byName returns a reactor that records "<names[action's name]>:<verb>" for
+// any action whose name is a key in names, and otherwise records nothing. It
+// never claims to have handled the action, so the fake clientset's normal
+// object-tracker behaviour still runs.
+func (r *actionRecorder) byName(names map[string]string) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if n, ok := action.(named); ok {
+			if phase, ok := names[n.GetName()]; ok {
+				r.add(phase + ":" + action.GetVerb())
+			}
+		}
+		return false, nil, nil
+	}
+}
+
+// byPhase returns a reactor that records "<phase>:<verb>" for every action it
+// sees, regardless of name — used for the downstream clientset, where every
+// object in play belongs to the same "downstream" phase of the teardown.
+func (r *actionRecorder) byPhase(phase string) k8stesting.ReactionFunc {
+	return func(action k8stesting.Action) (bool, runtime.Object, error) {
+		r.add(phase + ":" + action.GetVerb())
+		return false, nil, nil
+	}
+}
+
+// downstreamFixture builds the five objects a clean teardown expects to find
+// on the downstream cluster, all carrying downstream.ManagedByLabel: the two
+// ServiceAccounts (ArgoCD's and k2a-token-sync's own), their ClusterRoleBindings,
+// and k2a-token-sync's own ClusterRole.
+func downstreamFixture() []runtime.Object {
+	return []runtime.Object{
+		&corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager", Namespace: "kube-system", Labels: downstream.ManagedByLabel},
+		},
+		&corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "k2a-token-sync", Namespace: "kube-system", Labels: downstream.ManagedByLabel},
+		},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager-role-binding", Labels: downstream.ManagedByLabel},
+		},
+		&rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{Name: "k2a-token-sync", Labels: downstream.ManagedByLabel},
+		},
+		&rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{Name: "k2a-token-sync", Labels: downstream.ManagedByLabel},
+		},
+	}
+}
+
+// executeRemoval is what runRemove delegates the guarded, ordered teardown to
+// once its clients are built — see runRemove's own doc comment. Testing it
+// directly, against three independent fake clientsets, is what lets these
+// tests drive the ordering and exit-signal contract that talking to runRemove
+// only through flags never could.
+//
+// This is the plan-mandated split the task-4 brief pointed at: bootstrap's
+// own tests (cmd/bootstrap_test.go) only reach runBootstrap's helpers, for
+// the same reason runRemove's flag-parsing wrapper is not tested here either
+// — there is nothing left in it to test once executeRemoval is.
+
+// The five-step order the design promises — the ClusterConnection first,
+// then the ArgoCD Secret, then the credential, then downstream, and a final
+// ArgoCD Secret recheck last — has to actually happen in that sequence
+// against real clients, not merely be asserted by runRemove's doc comment.
+// This drives executeRemoval end to end and inspects the order the three
+// fake clientsets recorded their actions in, rather than only checking what
+// each guard decided.
+func TestExecuteRemovalRunsTheFiveStepsInOrder(t *testing.T) {
+	t.Parallel()
+
+	rec := &actionRecorder{}
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		connectionObject("standalone-1", "", nil),
+	)
+	dyn.PrependReactor("*", "clusterconnections", rec.byPhase("connection"))
+
+	localClient := fake.NewClientset(
+		argocdSecret("cluster-standalone-1", map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil),
+		credentialSecret(map[string]string{
+			argocd.ManagedByLabel:  argocd.ManagedByValue,
+			credentialClusterLabel: "standalone-1",
+		}),
+	)
+	localClient.PrependReactor("*", "secrets", rec.byName(map[string]string{
+		"cluster-standalone-1":     "registration",
+		"standalone-1-credentials": "credential",
+	}))
+
+	downstreamClient := fake.NewClientset(downstreamFixture()...)
+	downstreamClient.PrependReactor("delete", "*", rec.byPhase("downstream"))
+
+	out := &steps{w: io.Discard}
+	remaining, err := executeRemoval(t.Context(), out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining = %+v, want none: every object here is owned and resolvable", remaining)
+	}
+
+	deletes := rec.deletesOnly()
+	want := []string{"connection", "registration", "credential", "downstream", "downstream", "downstream", "downstream", "downstream"}
+	if !reflect.DeepEqual(deletes, want) {
+		t.Fatalf("delete order = %v, want %v", deletes, want)
+	}
+
+	// Step 5 re-checks the ArgoCD Secret after the downstream teardown, not
+	// before it or interleaved with it.
+	lastRegGet := rec.lastIndex("registration:get")
+	lastDownstream := rec.lastIndexWithPrefix("downstream")
+	if lastRegGet < lastDownstream {
+		t.Errorf("the ArgoCD Secret recheck (registration:get at index %d) did not run after the downstream "+
+			"teardown (last downstream action at index %d): %v", lastRegGet, lastDownstream, rec.snapshot())
+	}
+}
+
+// A detected endpoint collision has to skip the downstream half entirely —
+// not merely report a name while still touching the downstream cluster. This
+// asserts that directly: the downstream fake clientset fails the test if it
+// receives any call at all once a collision is found, which a test that only
+// checked endpointCollision's return value could never catch.
+func TestExecuteRemovalSkipsTheDownstreamHalfEntirelyOnCollision(t *testing.T) {
+	t.Parallel()
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		connectionObject("standalone-1", "", nil),
+		connectionObject("standalone-1-duplicate", "", nil),
+	)
+	localClient := fake.NewClientset(
+		argocdSecret("cluster-standalone-1", map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil),
+		credentialSecret(map[string]string{
+			argocd.ManagedByLabel:  argocd.ManagedByValue,
+			credentialClusterLabel: "standalone-1",
+		}),
+	)
+
+	downstreamClient := fake.NewClientset()
+	downstreamClient.PrependReactor("*", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		t.Errorf("downstream client was called (%s %s) despite a detected endpoint collision",
+			action.GetVerb(), action.GetResource().Resource)
+		return false, nil, nil
+	})
+
+	out := &steps{w: io.Discard}
+	remaining, err := executeRemoval(t.Context(), out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+
+	var found bool
+	for _, item := range remaining {
+		if strings.Contains(item.what, "downstream identities and RBAC") {
+			found = true
+			if !strings.Contains(item.why, "standalone-1-duplicate") {
+				t.Errorf("remaining item's why = %q, does not name the colliding connection", item.why)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no remaining item recorded the skipped downstream half: %+v", remaining)
+	}
+}
+
+// The exit-signal contract has two halves, and both have to actually hold
+// against executeRemoval itself rather than against the smaller guard
+// functions it calls: a run that leaves something behind reports it in
+// remaining, and a clean run reports none. TestExecuteRemovalRunsTheFiveStepsInOrder
+// above already covers the clean half; this covers the other one.
+func TestExecuteRemovalSignalsRemainingItemsForAForeignSecret(t *testing.T) {
+	t.Parallel()
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		connectionObject("standalone-1", "", nil),
+	)
+	// The ArgoCD Secret carries no managed-by label: not this tool's, so it
+	// must be left alone and reported, and the run must still signal non-zero
+	// even though --skip-downstream leaves nothing else to fail.
+	localClient := fake.NewClientset(
+		argocdSecret("cluster-standalone-1", nil, nil),
+		credentialSecret(map[string]string{
+			argocd.ManagedByLabel:  argocd.ManagedByValue,
+			credentialClusterLabel: "standalone-1",
+		}),
+	)
+
+	out := &steps{w: io.Discard}
+	remaining, err := executeRemoval(t.Context(), out, localClient, dyn, nil, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+		skipDownstream:  true,
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+	if len(remaining) == 0 {
+		t.Fatal("remaining is empty for a foreign ArgoCD Secret; the caller would exit 0 having left it in place")
+	}
+}
+
+// Finding 2's fix: when resolveRemovalCluster falls back — for either reason,
+// here because the ClusterConnection is simply gone — the output has to say
+// the endpoint-collision guard could not run, not just that the
+// ClusterConnection itself is missing. Silence here means the downstream half
+// is torn down with that protection off and nothing in the output says so.
+func TestExecuteRemovalExplainsTheSkippedCollisionGuardOnFallback(t *testing.T) {
+	t.Parallel()
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+	)
+	localClient := fake.NewClientset()
+	downstreamClient := fake.NewClientset()
+
+	var buf bytes.Buffer
+	out := &steps{w: &buf}
+	_, err := executeRemoval(t.Context(), out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "endpoint-collision guard") {
+		t.Errorf("output does not explain that the endpoint-collision guard could not run:\n%s", buf.String())
+	}
+}
+
+// Finding 1's fix: a ClusterConnection whose spec cannot be resolved must be
+// treated as a fallback case, the same as an absent one, and the output has
+// to name the reason rather than silently acting with every name zeroed.
+func TestExecuteRemovalFallsBackAndExplainsAnUnresolvableConnection(t *testing.T) {
+	t.Parallel()
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		unresolvableConnectionObject("standalone-1"),
+	)
+	localClient := fake.NewClientset()
+	downstreamClient := fake.NewClientset()
+
+	var buf bytes.Buffer
+	out := &steps{w: &buf}
+	remaining, err := executeRemoval(t.Context(), out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+	// The fallback recovers the conventional names, so the ClusterConnection
+	// delete below and the (absent) Secrets are all still handled cleanly —
+	// nothing here should be left as a remaining item on account of the
+	// fallback itself.
+	for _, item := range remaining {
+		if strings.Contains(item.why, "could not be resolved") {
+			t.Errorf("the resolution fallback itself was reported as a remaining item: %+v", item)
+		}
+	}
+
+	got := buf.String()
+	if !strings.Contains(got, "could not be resolved") {
+		t.Errorf("output does not say the ClusterConnection could not be resolved:\n%s", got)
+	}
+	if !strings.Contains(got, "URL path") {
+		t.Errorf("output does not name the reason (the endpoint's URL path) the spec could not be resolved:\n%s", got)
+	}
+	if !strings.Contains(got, "endpoint-collision guard") {
+		t.Errorf("output does not also explain that the endpoint-collision guard could not run:\n%s", got)
 	}
 }

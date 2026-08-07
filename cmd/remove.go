@@ -44,6 +44,11 @@ const credentialClusterLabel = "k2a-token-sync.io/cluster" //nolint:gosec // a l
 // something says so before it has half-torn-down anything. Guards on
 // individual objects still let the rest of the teardown run — only the
 // flag-validation checks below stop everything before it starts.
+//
+// runRemove itself only parses and validates flags and builds the two
+// clients; executeRemoval does everything from there, so a test can drive
+// the ordering, the guards and the exit-signal contract with fake clientsets
+// instead of real ones.
 func runRemove(args []string) error {
 	fs := flag.NewFlagSet("remove", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -159,94 +164,211 @@ Flags:
 		downstreamHost = cfg.Host
 	}
 
-	inv := inventory.NewClient(dyn, *namespace)
+	remaining, err := executeRemoval(ctx, out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     *clusterName,
+		namespace:       *namespace,
+		argocdNamespace: *argocdNamespace,
+		fallback: config.RemovalClusterInput{
+			Name:                    *clusterName,
+			ServiceAccountName:      *saName,
+			ServiceAccountNamespace: *saNamespace,
+			SelfServiceAccountName:  *selfSAName,
+			SecretName:              *secretName,
+		},
+		kubeContext:    *kubeContext,
+		localHost:      localCfg.Host,
+		downstreamHost: downstreamHost,
+		skipDownstream: *skipDownstream,
+		dryRun:         *dryRun,
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) > 0 {
+		out.blank()
+		out.notef("The following could not be removed. Nothing else was affected by these:")
+		for _, item := range remaining {
+			out.blank()
+			out.notef("  %s", item.what)
+			out.notef("    %s", item.why)
+			out.notef("    %s", item.kubectl)
+		}
+		return fmt.Errorf("%d object(s) could not be removed; see above for how to remove them by hand", len(remaining))
+	}
+
+	if *dryRun {
+		out.notef("Nothing was changed. This is what removing %s would do.", *clusterName)
+		return nil
+	}
+	out.notef("Done. ArgoCD no longer holds a registration for %s.", *clusterName)
+	return nil
+}
+
+// removeParams bundles the flag-derived settings executeRemoval needs, once
+// runRemove has parsed and validated the flags and built the two clients from
+// them. Kept as one struct rather than a growing positional argument list,
+// and so a test can construct one directly instead of parsing flags at all.
+type removeParams struct {
+	clusterName     string
+	namespace       string
+	argocdNamespace string
+
+	// fallback is what resolveRemovalCluster falls back to when the
+	// ClusterConnection is gone or unresolvable; see resolveRemovalCluster.
+	fallback config.RemovalClusterInput
+
+	// kubeContext and localHost are display-only, for describeCluster's
+	// "Cluster running ArgoCD — ..." heading.
+	kubeContext string
+	localHost   string
+
+	// downstreamHost is display-only too; empty when skipDownstream is true,
+	// since nothing then talks to a downstream cluster at all.
+	downstreamHost string
+
+	skipDownstream bool
+	dryRun         bool
+}
+
+// executeRemoval runs the five-step teardown against already-built clients:
+// resolve the ClusterConnection, run every guard, then delete in order. It is
+// everything runRemove does once flag-parsing and client construction are out
+// of the way, split out so a test can drive the ordering, the collision
+// guard and the exit-signal contract with fake clientsets — runBootstrap has
+// no equivalent split because its tests only reach its helpers; this task's
+// brief required more than that.
+//
+// A non-nil error means a read that has to succeed before anything else can
+// be attempted (reading or listing ClusterConnections) failed; the caller
+// aborts without deleting anything. A non-empty remaining, error-free
+// otherwise, means the guarded, step-by-step teardown ran to completion but
+// left one or more objects behind — the caller turns that into a non-zero
+// exit. Both are empty and nil only once every object was deleted, already
+// absent, or (in a dry run) would have been.
+func executeRemoval(
+	ctx context.Context,
+	out *steps,
+	localClient kubernetes.Interface,
+	dyn dynamic.Interface,
+	downstreamClient kubernetes.Interface,
+	params removeParams,
+) ([]remainingItem, error) {
+	inv := inventory.NewClient(dyn, params.namespace)
 
 	// Every guard below is a read, run before this touches anything. The
 	// ClusterConnection is read here rather than re-derived, so a non-default
 	// spec.secretName or serviceAccount is never missed.
-	cluster, usedFallback, err := resolveRemovalCluster(ctx, inv, *clusterName, config.RemovalClusterInput{
-		Name:                    *clusterName,
-		ServiceAccountName:      *saName,
-		ServiceAccountNamespace: *saNamespace,
-		SelfServiceAccountName:  *selfSAName,
-		SecretName:              *secretName,
-	})
+	cluster, usedFallback, fallbackReason, err := resolveRemovalCluster(ctx, inv, params.clusterName, params.fallback)
 	if err != nil {
-		return fmt.Errorf("reading the ClusterConnection: %w", err)
+		return nil, fmt.Errorf("reading the ClusterConnection: %w", err)
 	}
 
+	// The collision guard can only compare against a real, resolved endpoint,
+	// which a fallback cluster never has — whether the fallback happened
+	// because the object is gone or because its spec could not be resolved.
+	// Skipping it here, rather than only failing to find a match, means the
+	// downstream half is torn down with that protection silently off; the
+	// output below says so.
 	var collidesWith string
-	if !usedFallback && !*skipDownstream {
+	skippedCollisionGuard := usedFallback && !params.skipDownstream
+	if !usedFallback && !params.skipDownstream {
 		collidesWith, err = endpointCollision(ctx, inv, cluster.Name, cluster.Endpoint)
 		if err != nil {
-			return fmt.Errorf("listing ClusterConnections: %w", err)
+			return nil, fmt.Errorf("listing ClusterConnections: %w", err)
 		}
 	}
 
-	secretGuard := inspectArgoCDSecretForRemoval(ctx, localClient, *argocdNamespace, cluster.SecretName, cluster.Name)
+	secretGuard := inspectArgoCDSecretForRemoval(ctx, localClient, params.argocdNamespace, cluster.SecretName, cluster.Name)
+	credName := cluster.CredentialsSecretName()
+	credGuard := inspectCredentialSecretForRemoval(ctx, localClient, params.namespace, credName, cluster.Name)
 
 	out.headingf("Removing %s", cluster.Name)
 	out.blank()
 	if usedFallback {
-		out.notef("The ClusterConnection %s/%s no longer exists; using default names and the override flags below.",
-			*namespace, *clusterName)
+		if fallbackReason != "" {
+			out.notef("The ClusterConnection %s/%s could not be resolved (%s); using default names and the "+
+				"override flags below.", params.namespace, params.clusterName, fallbackReason)
+		} else {
+			out.notef("The ClusterConnection %s/%s no longer exists; using default names and the override flags below.",
+				params.namespace, params.clusterName)
+		}
+		out.blank()
+	}
+	if skippedCollisionGuard {
+		out.notef("Skipping the endpoint-collision guard: there is no resolved endpoint for %s to compare "+
+			"against, so another ClusterConnection sharing its downstream cluster cannot be detected.", params.clusterName)
 		out.blank()
 	}
 
 	var remaining []remainingItem
 
 	// --- Cluster running ArgoCD and k2a-token-sync ---
-	out.headingf("Cluster running ArgoCD — %s", describeCluster(*kubeContext, localCfg.Host))
+	out.headingf("Cluster running ArgoCD — %s", describeCluster(params.kubeContext, params.localHost))
 
 	// Step 1: the ClusterConnection, first, so the daemon stops republishing
 	// the registration while the rest of this is torn down.
-	ccOutcome, ccErr := removeClusterConnection(ctx, dyn, *namespace, cluster.Name, *dryRun)
-	out.stepf("connection", "%s", describeOutcome(*namespace+"/"+cluster.Name, ccOutcome, "", ccErr, *dryRun))
-	if item := remainingFromOutcome(*namespace+"/"+cluster.Name, ccOutcome, "", ccErr,
-		fmt.Sprintf("kubectl -n %s delete clusterconnection %s", *namespace, cluster.Name)); item != nil {
+	ccOutcome, ccErr := removeClusterConnection(ctx, dyn, params.namespace, cluster.Name, params.dryRun)
+	out.stepf("connection", "%s", describeOutcome(params.namespace+"/"+cluster.Name, ccOutcome, "", ccErr, params.dryRun))
+	if item := remainingFromOutcome(params.namespace+"/"+cluster.Name, ccOutcome, ccErr,
+		fmt.Sprintf("kubectl -n %s delete clusterconnection %s", params.namespace, cluster.Name)); item != nil {
 		remaining = append(remaining, *item)
 	}
 
 	// Step 2: the ArgoCD cluster Secret — the live credential. The guard was
 	// evaluated above, before any delete ran.
-	if adopted := adoptionWarning(cluster, *argocdNamespace); adopted != "" {
+	if adopted := adoptionWarning(cluster, params.argocdNamespace); adopted != "" {
 		out.warnf("%s", adopted)
 	}
 	if reason := secretGuard.refusalReason(); reason != "" {
 		verb := "left alone"
-		if *dryRun {
+		if params.dryRun {
 			verb = "would leave alone"
 		}
-		out.stepf("registration", "%s: %s/%s (%s)", verb, *argocdNamespace, cluster.SecretName, reason)
+		out.stepf("registration", "%s: %s/%s (%s)", verb, params.argocdNamespace, cluster.SecretName, reason)
 		remaining = append(remaining, remainingItem{
-			what:    *argocdNamespace + "/" + cluster.SecretName,
+			what:    params.argocdNamespace + "/" + cluster.SecretName,
 			why:     reason,
-			kubectl: fmt.Sprintf("kubectl -n %s delete secret %s", *argocdNamespace, cluster.SecretName),
+			kubectl: fmt.Sprintf("kubectl -n %s delete secret %s", params.argocdNamespace, cluster.SecretName),
 		})
 	} else {
-		regOutcome, regErr := removeArgoCDSecret(ctx, localClient, *argocdNamespace, cluster.SecretName, *dryRun)
-		out.stepf("registration", "%s", describeOutcome(*argocdNamespace+"/"+cluster.SecretName, regOutcome, "", regErr, *dryRun))
-		if item := remainingFromOutcome(*argocdNamespace+"/"+cluster.SecretName, regOutcome, "", regErr,
-			fmt.Sprintf("kubectl -n %s delete secret %s", *argocdNamespace, cluster.SecretName)); item != nil {
+		regOutcome, regErr := removeArgoCDSecret(ctx, localClient, params.argocdNamespace, cluster.SecretName, params.dryRun)
+		out.stepf("registration", "%s",
+			describeOutcome(params.argocdNamespace+"/"+cluster.SecretName, regOutcome, "", regErr, params.dryRun))
+		if item := remainingFromOutcome(params.argocdNamespace+"/"+cluster.SecretName, regOutcome, regErr,
+			fmt.Sprintf("kubectl -n %s delete secret %s", params.argocdNamespace, cluster.SecretName)); item != nil {
 			remaining = append(remaining, *item)
 		}
 	}
 
-	// Step 3: this tool's own credential for the cluster.
-	credName := cluster.CredentialsSecretName()
-	credOutcome, credReason, credErr := removeCredentialSecret(ctx, localClient, *namespace, credName, cluster.Name, *dryRun)
-	out.stepf("credential", "%s", describeOutcome(*namespace+"/"+credName, credOutcome, credReason, credErr, *dryRun))
-	if item := remainingFromOutcome(*namespace+"/"+credName, credOutcome, credReason, credErr,
-		fmt.Sprintf("kubectl -n %s delete secret %s", *namespace, credName)); item != nil {
-		remaining = append(remaining, *item)
+	// Step 3: this tool's own credential for the cluster. The guard was
+	// evaluated above too, alongside the ArgoCD Secret's, before any delete ran.
+	if reason := credGuard.refusalReason(); reason != "" {
+		verb := "left alone"
+		if params.dryRun {
+			verb = "would leave alone"
+		}
+		out.stepf("credential", "%s: %s/%s (%s)", verb, params.namespace, credName, reason)
+		remaining = append(remaining, remainingItem{
+			what:    params.namespace + "/" + credName,
+			why:     reason,
+			kubectl: fmt.Sprintf("kubectl -n %s delete secret %s", params.namespace, credName),
+		})
+	} else {
+		credOutcome, credErr := removeCredentialSecret(ctx, localClient, params.namespace, credName, params.dryRun)
+		out.stepf("credential", "%s", describeOutcome(params.namespace+"/"+credName, credOutcome, "", credErr, params.dryRun))
+		if item := remainingFromOutcome(params.namespace+"/"+credName, credOutcome, credErr,
+			fmt.Sprintf("kubectl -n %s delete secret %s", params.namespace, credName)); item != nil {
+			remaining = append(remaining, *item)
+		}
 	}
 	out.blank()
 
 	// Step 4: downstream, unless asked to leave it. Bindings before their
 	// subjects, so privilege is dropped before the identity is.
-	if !*skipDownstream {
+	if !params.skipDownstream {
 		out.headingf("Downstream cluster — %s", cluster.Name)
-		out.stepf("reached via", "%s", downstreamHost)
+		out.stepf("reached via", "%s", params.downstreamHost)
 
 		if collidesWith != "" {
 			out.warnf("%s also resolves to %s; leaving the downstream identities and RBAC in place "+
@@ -261,13 +383,13 @@ Flags:
 		} else {
 			saRoleBinding := cluster.ServiceAccount.Name + "-role-binding"
 
-			crbA, errA := downstream.RemoveClusterRoleBinding(ctx, downstreamClient, saRoleBinding, *dryRun)
+			crbA, errA := downstream.RemoveClusterRoleBinding(ctx, downstreamClient, saRoleBinding, params.dryRun)
 			saB, errB := downstream.RemoveServiceAccount(ctx, downstreamClient,
-				cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name, *dryRun)
-			crbC, errC := downstream.RemoveClusterRoleBinding(ctx, downstreamClient, cluster.SelfServiceAccountName, *dryRun)
-			roleD, errD := downstream.RemoveClusterRole(ctx, downstreamClient, cluster.SelfServiceAccountName, *dryRun)
+				cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name, params.dryRun)
+			crbC, errC := downstream.RemoveClusterRoleBinding(ctx, downstreamClient, cluster.SelfServiceAccountName, params.dryRun)
+			roleD, errD := downstream.RemoveClusterRole(ctx, downstreamClient, cluster.SelfServiceAccountName, params.dryRun)
 			saE, errE := downstream.RemoveServiceAccount(ctx, downstreamClient,
-				cluster.ServiceAccount.Namespace, cluster.SelfServiceAccountName, *dryRun)
+				cluster.ServiceAccount.Namespace, cluster.SelfServiceAccountName, params.dryRun)
 
 			bindings := []namedOutcome{
 				{name: saRoleBinding, outcome: crbA, err: errA,
@@ -286,9 +408,9 @@ Flags:
 			clusterrole := namedOutcome{name: cluster.SelfServiceAccountName, outcome: roleD, err: errD,
 				kubectl: "kubectl delete clusterrole " + cluster.SelfServiceAccountName}
 
-			out.stepf("bindings", "%s", summarise(bindings, *dryRun))
-			out.stepf("identities", "%s", summarise(identities, *dryRun))
-			out.stepf("clusterrole", "%s", summarise([]namedOutcome{clusterrole}, *dryRun))
+			out.stepf("bindings", "%s", summarise(bindings, params.dryRun))
+			out.stepf("identities", "%s", summarise(identities, params.dryRun))
+			out.stepf("clusterrole", "%s", summarise([]namedOutcome{clusterrole}, params.dryRun))
 
 			all := make([]namedOutcome, 0, len(bindings)+len(identities)+1)
 			all = append(all, bindings...)
@@ -308,40 +430,23 @@ Flags:
 	// token, mint and publish a fresh credential. This runs last on purpose:
 	// by now the downstream identity is gone, so anything republished here is
 	// already dead. Skipped in a dry run, since nothing was deleted to recheck.
-	if !*dryRun && secretGuard.refusalReason() == "" {
-		recheckOutcome, recheckErr := removeArgoCDSecret(ctx, localClient, *argocdNamespace, cluster.SecretName, false)
+	if !params.dryRun && secretGuard.refusalReason() == "" {
+		recheckOutcome, recheckErr := removeArgoCDSecret(ctx, localClient, params.argocdNamespace, cluster.SecretName, false)
 		switch {
 		case recheckErr != nil:
-			out.warnf("re-checking %s/%s after teardown: %v", *argocdNamespace, cluster.SecretName, recheckErr)
+			out.warnf("re-checking %s/%s after teardown: %v", params.argocdNamespace, cluster.SecretName, recheckErr)
 			remaining = append(remaining, remainingItem{
-				what:    *argocdNamespace + "/" + cluster.SecretName,
+				what:    params.argocdNamespace + "/" + cluster.SecretName,
 				why:     recheckErr.Error(),
-				kubectl: fmt.Sprintf("kubectl -n %s delete secret %s", *argocdNamespace, cluster.SecretName),
+				kubectl: fmt.Sprintf("kubectl -n %s delete secret %s", params.argocdNamespace, cluster.SecretName),
 			})
 		case recheckOutcome == downstream.RemovedOutcome:
 			out.warnf("%s/%s reappeared after teardown began — a daemon pass republished it — and was deleted again",
-				*argocdNamespace, cluster.SecretName)
+				params.argocdNamespace, cluster.SecretName)
 		}
 	}
 
-	if len(remaining) > 0 {
-		out.blank()
-		out.notef("The following could not be removed. Nothing else was affected by these:")
-		for _, item := range remaining {
-			out.blank()
-			out.notef("  %s", item.what)
-			out.notef("    %s", item.why)
-			out.notef("    %s", item.kubectl)
-		}
-		return fmt.Errorf("%d object(s) could not be removed; see above for how to remove them by hand", len(remaining))
-	}
-
-	if *dryRun {
-		out.notef("Nothing was changed. This is what removing %s would do.", cluster.Name)
-		return nil
-	}
-	out.notef("Done. ArgoCD no longer holds a registration for %s.", cluster.Name)
-	return nil
+	return remaining, nil
 }
 
 // validateRemoveFlags checks the combinations runRemove refuses before
@@ -372,24 +477,36 @@ func validateRemoveFlags(clusterName, fromKubeconfig, fromContext string, skipDo
 // selfServiceAccountName and the adoption annotation — exactly as the daemon
 // would, rather than re-deriving defaults that a non-default spec would miss.
 //
-// When the object is already gone, likely since deleting it has been the only
-// documented step until now, it falls back to config.RemovalCluster with the
-// override flags, and usedFallback says so.
+// It falls back to config.RemovalCluster with the override flags, and
+// usedFallback says so, in two situations: the object is already gone
+// (likely, since deleting it has been the only documented step until now),
+// or it exists but its spec cannot be resolved — a malformed tokenTTL, an
+// endpoint with a path, an over-length name — the same condition
+// inventory.Client.List reports via Entry.InvalidReason. Acting on such an
+// entry's Cluster directly would mean acting with every name zeroed, since
+// decode never partially resolves a spec; falling back the same way as for
+// an absent object at least recovers the conventional names. fallbackReason
+// is empty for the absent case and holds inv's InvalidReason for the other,
+// so the caller can say in its output which one happened.
 func resolveRemovalCluster(
 	ctx context.Context,
 	inv *inventory.Client,
 	name string,
 	fallback config.RemovalClusterInput,
-) (cluster config.Cluster, usedFallback bool, err error) {
+) (cluster config.Cluster, usedFallback bool, fallbackReason string, err error) {
 	entry, err := inv.Get(ctx, name)
 	switch {
 	case apierrors.IsNotFound(err):
 		cluster, err = config.RemovalCluster(fallback)
-		return cluster, true, err
+		return cluster, true, "", err
 	case err != nil:
-		return config.Cluster{}, false, err
+		return config.Cluster{}, false, "", err
 	}
-	return entry.Cluster, false, nil
+	if entry.InvalidReason != "" {
+		cluster, err = config.RemovalCluster(fallback)
+		return cluster, true, entry.InvalidReason, err
+	}
+	return entry.Cluster, false, "", nil
 }
 
 // endpointCollision reports the name of another ClusterConnection in the
@@ -399,14 +516,23 @@ func resolveRemovalCluster(
 // every connection, so removing them for one cluster registered twice would
 // break the other. This can only compare against a ClusterConnection that was
 // actually read: a fallback cluster has no recorded endpoint, so callers skip
-// this guard when resolveRemovalCluster fell back to defaults.
+// this guard entirely when resolveRemovalCluster fell back to defaults.
+//
+// Entries are filtered on an empty Cluster.Endpoint here, not on
+// InvalidReason: inventory.Client.List's blockContestedSecrets marks both
+// halves of a secretName conflict invalid, including a pair that also shares
+// an endpoint — exactly the collision this guard exists to catch. Dropping
+// those on InvalidReason instead of on a missing endpoint would let the
+// downstream half be torn down for a connection that another, still-valid
+// spec depends on. A FromSpec failure zeroes Cluster entirely, so filtering
+// on the endpoint alone still excludes it without needing InvalidReason too.
 func endpointCollision(ctx context.Context, inv *inventory.Client, clusterName, endpoint string) (string, error) {
 	entries, err := inv.List(ctx)
 	if err != nil {
 		return "", err
 	}
 	for _, e := range entries {
-		if e.InvalidReason != "" || e.Cluster.Name == clusterName {
+		if e.Cluster.Endpoint == "" || e.Cluster.Name == clusterName {
 			continue
 		}
 		if e.Cluster.Endpoint == endpoint {
@@ -543,42 +669,86 @@ func removeArgoCDSecret(
 	return downstream.RemovedOutcome, nil
 }
 
-// removeCredentialSecret deletes this tool's own credential Secret, refusing
-// unless it carries both the managed-by label and the cluster label naming
-// this cluster. The cluster label is the asymmetric half of the "belongs to a
-// different connection" guard: an annotation on the ArgoCD Secret, a label
-// here, both written by the same WriteCredentials call.
-func removeCredentialSecret(
+// credentialSecretRemovalGuard is what inspecting this tool's own credential
+// Secret found, for deciding whether remove may delete it. Mirrors
+// argocdSecretRemovalGuard's role for the ArgoCD Secret: gathered by a read
+// up front, before any delete runs, so removeCredentialSecret only ever acts
+// on a verdict already reached.
+type credentialSecretRemovalGuard struct {
+	// reason is set when the Secret exists but fails one of its two ownership
+	// checks — missing the managed-by label, or its cluster label naming a
+	// different cluster than the one being removed. Left "" both when the
+	// Secret is clear to delete and when it could not be read at all;
+	// removeCredentialSecret discovers and reports absence or a read error on
+	// its own, and no ownership guard applies to something that was never seen.
+	reason string
+}
+
+// inspectCredentialSecretForRemoval checks this tool's own credential Secret
+// for the two ownership guards removeCredentialSecret used to run inline,
+// interleaved with its own delete: the managed-by label, and the cluster
+// label naming this cluster. The cluster label is the asymmetric half of the
+// "belongs to a different connection" guard: an annotation on the ArgoCD
+// Secret, a label here, both written by the same WriteCredentials call.
+func inspectCredentialSecretForRemoval(
 	ctx context.Context,
 	client kubernetes.Interface,
 	namespace, name, clusterName string,
-	dryRun bool,
-) (outcome downstream.RemovalOutcome, reason string, err error) {
-	secret, getErr := client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
-	if apierrors.IsNotFound(getErr) {
-		return downstream.AbsentOutcome, "", nil
-	}
-	if getErr != nil {
-		return downstream.AbsentOutcome, "", fmt.Errorf("getting secret %s/%s: %w", namespace, name, getErr)
+) credentialSecretRemovalGuard {
+	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		// Absence and read errors are not this guard's concern: removeCredentialSecret
+		// re-reads and reports them on its own, the same way inspectArgoCDSecretForRemoval
+		// leaves them to removeArgoCDSecret.
+		return credentialSecretRemovalGuard{}
 	}
 
 	switch {
 	case secret.Labels[argocd.ManagedByLabel] != argocd.ManagedByValue:
-		return downstream.NotOwnedOutcome, "not managed by k2a-token-sync", nil
+		return credentialSecretRemovalGuard{reason: "not managed by k2a-token-sync"}
 	case secret.Labels[credentialClusterLabel] != "" && secret.Labels[credentialClusterLabel] != clusterName:
-		return downstream.NotOwnedOutcome, fmt.Sprintf("belongs to cluster %q, not this one", secret.Labels[credentialClusterLabel]), nil
+		return credentialSecretRemovalGuard{
+			reason: fmt.Sprintf("belongs to cluster %q, not this one", secret.Labels[credentialClusterLabel]),
+		}
+	default:
+		return credentialSecretRemovalGuard{}
 	}
+}
 
+// refusalReason names why remove must leave the credential Secret alone, or
+// "" when it is clear to act.
+func (g credentialSecretRemovalGuard) refusalReason() string {
+	return g.reason
+}
+
+// removeCredentialSecret deletes this tool's own credential Secret. Ownership
+// is not checked here: the caller evaluates that guard up front, before the
+// first delete, via inspectCredentialSecretForRemoval, and only calls this
+// once it has decided to act. This still Gets before deleting, so a Secret
+// gone by the time this runs is reported as already gone rather than as an
+// error — the same Get-before-Delete pattern removeArgoCDSecret uses.
+func removeCredentialSecret(
+	ctx context.Context,
+	client kubernetes.Interface,
+	namespace, name string,
+	dryRun bool,
+) (downstream.RemovalOutcome, error) {
+	if _, err := client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return downstream.AbsentOutcome, nil
+		}
+		return downstream.AbsentOutcome, fmt.Errorf("getting secret %s/%s: %w", namespace, name, err)
+	}
 	if dryRun {
-		return downstream.RemovedOutcome, "", nil
+		return downstream.RemovedOutcome, nil
 	}
 	if err := client.CoreV1().Secrets(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
 		if apierrors.IsNotFound(err) {
-			return downstream.AbsentOutcome, "", nil
+			return downstream.AbsentOutcome, nil
 		}
-		return downstream.AbsentOutcome, "", fmt.Errorf("deleting secret %s/%s: %w", namespace, name, err)
+		return downstream.AbsentOutcome, fmt.Errorf("deleting secret %s/%s: %w", namespace, name, err)
 	}
-	return downstream.RemovedOutcome, "", nil
+	return downstream.RemovedOutcome, nil
 }
 
 // namedOutcome pairs one downstream object's display name with what happened
@@ -672,15 +842,18 @@ type remainingItem struct {
 // when it was not fully handled — skipped or failed — or nil when nothing
 // remains to report about it. Absent counts as handled: it is the goal state,
 // not a failure.
-func remainingFromOutcome(name string, outcome downstream.RemovalOutcome, reason string, err error, kubectl string) *remainingItem {
+//
+// Every one of this package's guards now runs and reports its own reason
+// before the first delete (see runRemove's doc comment), so by the time an
+// outcome reaches here a NotOwnedOutcome has only one possible explanation —
+// the caller never even had a specific reason to pass, unlike when this
+// still took one.
+func remainingFromOutcome(name string, outcome downstream.RemovalOutcome, err error, kubectl string) *remainingItem {
 	switch {
 	case err != nil:
 		return &remainingItem{what: name, why: err.Error(), kubectl: kubectl}
 	case outcome == downstream.NotOwnedOutcome:
-		if reason == "" {
-			reason = "not managed by k2a-token-sync"
-		}
-		return &remainingItem{what: name, why: reason, kubectl: kubectl}
+		return &remainingItem{what: name, why: "not managed by k2a-token-sync", kubectl: kubectl}
 	default:
 		return nil
 	}
@@ -689,5 +862,5 @@ func remainingFromOutcome(name string, outcome downstream.RemovalOutcome, reason
 // remainingFromNamed is remainingFromOutcome for a namedOutcome, which
 // already carries its own kubectl invocation.
 func remainingFromNamed(it namedOutcome) *remainingItem {
-	return remainingFromOutcome(it.name, it.outcome, "", it.err, it.kubectl)
+	return remainingFromOutcome(it.name, it.outcome, it.err, it.kubectl)
 }
