@@ -656,6 +656,106 @@ func TestExecuteRemovalRunsTheFiveStepsInOrder(t *testing.T) {
 	}
 }
 
+// Finding 2's fix: --dry-run being safe in each of the three local delete
+// helpers individually (TestDryRunPerformsNoDeleteActions) does not prove
+// executeRemoval's own wiring passes dryRun through correctly — a mistake
+// made only in the orchestrating function itself, such as dropping the flag
+// on one call, would slip past that test entirely. This clones
+// TestExecuteRemovalRunsTheFiveStepsInOrder's fixture with dryRun: true and
+// checks both halves of the promise directly against executeRemoval: not one
+// delete action reaches any of the three fake clientsets, and the output
+// still reports the same five-step plan a real run would have executed, just
+// phrased as "would delete".
+func TestExecuteRemovalDryRunRecordsNoDeletesButReportsTheFullPlan(t *testing.T) {
+	t.Parallel()
+
+	rec := &actionRecorder{}
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		connectionObject("standalone-1", "", nil),
+	)
+	dyn.PrependReactor("*", "clusterconnections", rec.byPhase("connection"))
+
+	localClient := fake.NewClientset(
+		argocdSecret("cluster-standalone-1", map[string]string{argocd.ManagedByLabel: argocd.ManagedByValue}, nil),
+		credentialSecret(map[string]string{
+			argocd.ManagedByLabel:  argocd.ManagedByValue,
+			credentialClusterLabel: "standalone-1",
+		}),
+	)
+	localClient.PrependReactor("*", "secrets", rec.byName(map[string]string{
+		"cluster-standalone-1":     "registration",
+		"standalone-1-credentials": "credential",
+	}))
+
+	downstreamClient := fake.NewClientset(downstreamFixture()...)
+	downstreamClient.PrependReactor("*", "*", rec.byPhase("downstream"))
+
+	var buf bytes.Buffer
+	out := &steps{w: &buf}
+	remaining, err := executeRemoval(t.Context(), out, localClient, dyn, downstreamClient, removeParams{
+		clusterName:     "standalone-1",
+		namespace:       removeNamespace,
+		argocdNamespace: "argocd",
+		fallback:        config.RemovalClusterInput{Name: "standalone-1"},
+		dryRun:          true,
+	})
+	if err != nil {
+		t.Fatalf("executeRemoval returned unexpected error: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("remaining = %+v, want none: every object here is owned and resolvable", remaining)
+	}
+
+	// Not one delete action reached any of the three fake clientsets.
+	for _, action := range dyn.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Errorf("--dry-run issued a delete action against the dynamic client: %+v", action)
+		}
+	}
+	for _, action := range localClient.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Errorf("--dry-run issued a delete action against the local kubernetes client: %+v", action)
+		}
+	}
+	for _, action := range downstreamClient.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Errorf("--dry-run issued a delete action against the downstream kubernetes client: %+v", action)
+		}
+	}
+	if deletes := rec.deletesOnly(); len(deletes) != 0 {
+		t.Errorf("delete-verb actions recorded despite --dry-run: %v", deletes)
+	}
+
+	// Every read still ran: the guards and the plan are still built from real
+	// data, only the writes are suppressed.
+	var reads int
+	for _, entry := range rec.snapshot() {
+		if strings.HasSuffix(entry, ":get") || strings.HasSuffix(entry, ":list") {
+			reads++
+		}
+	}
+	if reads == 0 {
+		t.Fatal("no read actions were recorded; the guards did not run under --dry-run")
+	}
+
+	// The full five-step plan is still reported, just phrased as "would
+	// delete" rather than "deleted".
+	got := buf.String()
+	for _, want := range []string{
+		"would delete " + removeNamespace + "/standalone-1",
+		"would delete argocd/cluster-standalone-1",
+		"would delete " + removeNamespace + "/standalone-1-credentials",
+		"would delete argocd-manager-role-binding",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not report the plan for %q:\n%s", want, got)
+		}
+	}
+}
+
 // A detected endpoint collision has to skip the downstream half entirely —
 // not merely report a name while still touching the downstream cluster. This
 // asserts that directly: the downstream fake clientset fails the test if it
