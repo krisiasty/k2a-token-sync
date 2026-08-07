@@ -13,6 +13,11 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
+// RemoveClusterRoleBinding is the first delete in the removal path, and the
+// riskiest: a wrong guard here either leaves ArgoCD bound to a ServiceAccount
+// this tool no longer manages, or deletes a binding it never created. Every
+// outcome the function can report — removed, already gone, not ours, or a
+// preview of removal — is exercised here.
 func TestRemoveClusterRoleBinding(t *testing.T) {
 	t.Parallel()
 
@@ -75,6 +80,10 @@ func TestRemoveClusterRoleBinding(t *testing.T) {
 	t.Run("dry-run reports removal without deleting", func(t *testing.T) {
 		t.Parallel()
 
+		// A dry-run has to report the same RemovedOutcome a real run would, so a
+		// preview and an actual removal read identically to the caller — the
+		// only difference is that no delete action reaches the API, which is
+		// what this asserts via the fake clientset's recorded actions.
 		client := fake.NewClientset(&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager-role-binding", Labels: ManagedByLabel},
 		})
@@ -98,6 +107,10 @@ func TestRemoveClusterRoleBinding(t *testing.T) {
 	})
 }
 
+// RemoveServiceAccount removes the identity ArgoCD authenticates as. The same
+// guard and outcome set as the binding case applies, and matters just as much
+// here: this is the object whose token grants cluster-admin, so deleting one
+// this tool doesn't own would silently break something it never provisioned.
 func TestRemoveServiceAccount(t *testing.T) {
 	t.Parallel()
 
@@ -138,6 +151,9 @@ func TestRemoveServiceAccount(t *testing.T) {
 	t.Run("leaves an unlabelled serviceaccount untouched", func(t *testing.T) {
 		t.Parallel()
 
+		// A serviceaccount that lacks ManagedByLabel was not created by this
+		// tool, so removing it would delete something an operator or another
+		// tool owns.
 		client := fake.NewClientset(&corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager", Namespace: "kube-system"},
 		})
@@ -158,6 +174,10 @@ func TestRemoveServiceAccount(t *testing.T) {
 	t.Run("dry-run reports removal without deleting", func(t *testing.T) {
 		t.Parallel()
 
+		// A dry-run has to report the same RemovedOutcome a real run would, so a
+		// preview and an actual removal read identically to the caller — the
+		// only difference is that no delete action reaches the API, which is
+		// what this asserts via the fake clientset's recorded actions.
 		client := fake.NewClientset(&corev1.ServiceAccount{
 			ObjectMeta: metav1.ObjectMeta{Name: "argocd-manager", Namespace: "kube-system", Labels: ManagedByLabel},
 		})
@@ -181,6 +201,10 @@ func TestRemoveServiceAccount(t *testing.T) {
 	})
 }
 
+// RemoveClusterRole removes the permission grant itself. Cluster-scoped
+// objects with a shared, predictable name are the ones most likely to collide
+// with something outside this tool's ownership, so the not-owned guard
+// matters here as much as it does for the binding and the identity it binds.
 func TestRemoveClusterRole(t *testing.T) {
 	t.Parallel()
 
@@ -221,6 +245,9 @@ func TestRemoveClusterRole(t *testing.T) {
 	t.Run("leaves an unlabelled clusterrole untouched", func(t *testing.T) {
 		t.Parallel()
 
+		// A clusterrole that lacks ManagedByLabel was not created by this tool,
+		// so removing it would delete something an operator or another tool
+		// owns.
 		client := fake.NewClientset(&rbacv1.ClusterRole{
 			ObjectMeta: metav1.ObjectMeta{Name: "k2a-token-sync"},
 		})
@@ -241,6 +268,10 @@ func TestRemoveClusterRole(t *testing.T) {
 	t.Run("dry-run reports removal without deleting", func(t *testing.T) {
 		t.Parallel()
 
+		// A dry-run has to report the same RemovedOutcome a real run would, so a
+		// preview and an actual removal read identically to the caller — the
+		// only difference is that no delete action reaches the API, which is
+		// what this asserts via the fake clientset's recorded actions.
 		client := fake.NewClientset(&rbacv1.ClusterRole{
 			ObjectMeta: metav1.ObjectMeta{Name: "k2a-token-sync", Labels: ManagedByLabel},
 		})
