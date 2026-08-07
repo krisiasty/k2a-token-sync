@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -253,9 +254,12 @@ func (r *Reconciler) reconcile(
 	// authenticate to.
 	var published string
 	if !first {
-		if published, err = argocd.ApplyRegistration(ctx, r.local, desired); err != nil {
+		registration, err := argocd.ApplyRegistration(ctx, r.local, desired)
+		if err != nil {
 			return r.argocdSecretError(cluster, err)
 		}
+		published = registration.CredentialHash
+		r.reportSecretOwnership(ctx, cluster, status, registration.ForeignManagers, logger)
 	}
 
 	reason := argocd.NeedsRefresh(applied, published, desired, cluster.TokenTTL, now)
@@ -328,6 +332,11 @@ func (r *Reconciler) reconcile(
 	if err != nil {
 		return r.argocdSecretError(cluster, err)
 	}
+	// Reported from here as well as above, because a cluster's first pass skips the
+	// registration apply entirely — so this is the only apply that happens, and the
+	// only chance to notice a Secret that was taken over rather than created. Which
+	// is precisely the pass on which it matters most.
+	r.reportSecretOwnership(ctx, cluster, status, observed.ForeignManagers, logger)
 
 	// What gets recorded is what was written, never what came back. The two applies
 	// are separate calls, so a writer landing between them would have its
@@ -346,7 +355,7 @@ func (r *Reconciler) reconcile(
 	// report, so the pass fails: the condition names the cause, and backoff paces
 	// the retries rather than minting a fresh token against a contested Secret
 	// every five minutes.
-	if observed != written {
+	if observed.CredentialHash != written {
 		return fmt.Errorf("%w: the credential published to %s/%s was overwritten before this pass finished; "+
 			"something else is writing that Secret, which must not be provisioned declaratively",
 			errCredentialReplaced, desired.Namespace, desired.Name)
@@ -367,6 +376,73 @@ func (r *Reconciler) reconcile(
 		fmt.Sprintf("reissued ArgoCD's credential: %s; the new one expires %s",
 			reason, token.ExpiresAt.UTC().Format(time.RFC3339)))
 	return nil
+}
+
+// reportSecretOwnership records whether anything besides k2a-token-sync manages the
+// cluster Secret.
+//
+// This can only ever report, never prevent. Holding no read permission on those
+// Secrets is deliberate, so the earliest a co-owner can be noticed is in the
+// managedFields an apply hands back — after the write. What that buys is that a
+// takeover stops being invisible: 'argocd cluster add' produces a Secret with the
+// same cluster- prefix and the same default name, so a mistyped cluster name
+// repoints a registration other Applications depend on and looks exactly like the
+// documented migration.
+//
+// A condition rather than a log line or an Event per pass, because co-ownership is
+// a state and it persists: Force takes the fields this tool manages but does not
+// evict the previous manager, so the residue stays for as long as the Secret does.
+// The Event is for the transition alone.
+func (r *Reconciler) reportSecretOwnership(
+	ctx context.Context,
+	cluster config.Cluster,
+	status *v1alpha1.ClusterConnectionStatus,
+	foreign []string,
+	logger *slog.Logger,
+) {
+	if len(foreign) == 0 {
+		setCondition(status, v1alpha1.ConditionSecretExclusivelyOwned, metav1.ConditionTrue, v1alpha1.ReasonReady,
+			"k2a-token-sync is the only manager of this cluster Secret", status.ObservedGeneration)
+		return
+	}
+
+	managers := strings.Join(foreign, ", ")
+	secret := r.cfg.ArgoCDNamespace + "/" + cluster.SecretName
+
+	// Adoption asked for on purpose is still worth stating — it is the difference
+	// between a Secret this tool created and one it inherited, which nothing else
+	// records — but it is not a warning. Reporting a deliberate migration
+	// identically to an accident, on every pass forever, is how a warning becomes
+	// something people scroll past.
+	if cluster.AdoptedRegistration {
+		setCondition(status, v1alpha1.ConditionSecretExclusivelyOwned, metav1.ConditionTrue,
+			v1alpha1.ReasonAdoptedRegistration,
+			fmt.Sprintf("%s was adopted rather than created; %s also holds fields on it", secret, managers),
+			status.ObservedGeneration)
+		return
+	}
+
+	was := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSecretExclusivelyOwned)
+	firstNotice := was == nil || was.Reason != v1alpha1.ReasonForeignFieldManager
+
+	message := fmt.Sprintf("%s is also managed by %s, and this connection does not record an adoption; "+
+		"either it was taken over from 'argocd cluster add' without %s, or this cluster's name collided with "+
+		"an existing registration — in which case ArgoCD is now pointed at the wrong cluster",
+		secret, managers, v1alpha1.AnnotationAdopted)
+	setCondition(status, v1alpha1.ConditionSecretExclusivelyOwned, metav1.ConditionFalse,
+		v1alpha1.ReasonForeignFieldManager, message, status.ObservedGeneration)
+
+	if !firstNotice {
+		return
+	}
+	logger.Warn("this cluster Secret is managed by something else as well",
+		"secret", secret,
+		"managers", managers,
+		"hint", "if the takeover was intended, annotate the ClusterConnection with "+
+			v1alpha1.AnnotationAdopted+"=true; if it was not, the previous registration has been overwritten "+
+			"and must be restored with 'argocd cluster add'",
+	)
+	r.events.Warning(ctx, cluster.Name, v1alpha1.ReasonForeignFieldManager, message)
 }
 
 // identityRestoredMessage says which half of ArgoCD's downstream identity was put

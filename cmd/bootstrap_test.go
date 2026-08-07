@@ -26,7 +26,7 @@ func TestRenderedConnectionIsMinimalAndComplete(t *testing.T) {
 		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
 	}
 
-	raw, err := renderConnection(cluster, "k2a-token-sync")
+	raw, err := renderConnection(cluster, "k2a-token-sync", false)
 	if err != nil {
 		t.Fatalf("renderConnection returned unexpected error: %v", err)
 	}
@@ -72,9 +72,9 @@ func TestPrintedManifestMatchesWhatWouldBeApplied(t *testing.T) {
 		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
 	}
 
-	applied := connectionFor(cluster, "k2a-token-sync")
+	applied := connectionFor(cluster, "k2a-token-sync", false)
 
-	raw, err := renderConnection(cluster, "k2a-token-sync")
+	raw, err := renderConnection(cluster, "k2a-token-sync", false)
 	if err != nil {
 		t.Fatalf("renderConnection returned unexpected error: %v", err)
 	}

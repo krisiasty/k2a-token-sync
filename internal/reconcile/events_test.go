@@ -21,6 +21,7 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -493,4 +494,121 @@ func testEndpoint(t *testing.T) (endpoint string, caPEM []byte) {
 	}()
 
 	return listener.Addr().String(), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+}
+
+// The reconciler can only ever report this, never prevent it: no read permission
+// on those Secrets means the earliest a co-owner can be noticed is the
+// managedFields an apply hands back, after the write. What the condition buys is
+// that the takeover stops being invisible.
+func TestAForeignFieldManagerIsReportedOnTheObject(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	cluster := testCluster()
+
+	r := newReconciler(fake.NewClientset(), func() (kubernetes.Interface, error) {
+		return fake.NewClientset(), nil
+	})
+	r.cfg.ArgoCDNamespace = "argocd"
+	recorder := recorderFor(t, r)
+
+	var status v1alpha1.ClusterConnectionStatus
+	r.reportSecretOwnership(ctx, cluster, &status, []string{"argocd"}, r.logger)
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSecretExclusivelyOwned)
+	if cond == nil {
+		t.Fatal("nothing was written about who owns the cluster Secret")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("%s is %s, want False", v1alpha1.ConditionSecretExclusivelyOwned, cond.Status)
+	}
+	if cond.Reason != v1alpha1.ReasonForeignFieldManager {
+		t.Errorf("reason is %q, want %q", cond.Reason, v1alpha1.ReasonForeignFieldManager)
+	}
+	// The message has to cover both readings, because they are wildly different in
+	// consequence and only a person can say which happened.
+	for _, want := range []string{"argocd/cluster-standalone-1", "argocd", v1alpha1.AnnotationAdopted, "collided"} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("the message does not mention %q: %q", want, cond.Message)
+		}
+	}
+
+	warned := only(t, recorder.recorded())
+	if warned.Type != corev1.EventTypeWarning || warned.Reason != v1alpha1.ReasonForeignFieldManager {
+		t.Errorf("recorded %s/%s, want a Warning with reason %s",
+			warned.Type, warned.Reason, v1alpha1.ReasonForeignFieldManager)
+	}
+
+	// Co-ownership persists — Force does not evict the previous manager — so the
+	// condition stays and the Event must not repeat. One per pass would be one per
+	// five minutes, forever.
+	r.reportSecretOwnership(ctx, cluster, &status, []string{"argocd"}, r.logger)
+	if events := recorder.recorded(); len(events) != 1 {
+		t.Errorf("%d events were recorded across two passes, want 1: %+v", len(events), events)
+	}
+}
+
+// A migration reported identically to an accident, on every pass forever, is how a
+// warning becomes something people scroll past. The annotation is what tells them
+// apart, and it is the only record that a Secret was inherited rather than created.
+func TestAnAdoptedRegistrationIsReportedWithoutWarning(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	cluster := testCluster()
+	cluster.AdoptedRegistration = true
+
+	r := newReconciler(fake.NewClientset(), func() (kubernetes.Interface, error) {
+		return fake.NewClientset(), nil
+	})
+	r.cfg.ArgoCDNamespace = "argocd"
+	recorder := recorderFor(t, r)
+
+	var status v1alpha1.ClusterConnectionStatus
+	r.reportSecretOwnership(ctx, cluster, &status, []string{"argocd"}, r.logger)
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSecretExclusivelyOwned)
+	if cond == nil {
+		t.Fatal("nothing was written about who owns the cluster Secret")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("%s is %s, want True — adoption was requested", v1alpha1.ConditionSecretExclusivelyOwned, cond.Status)
+	}
+	if cond.Reason != v1alpha1.ReasonAdoptedRegistration {
+		t.Errorf("reason is %q, want %q", cond.Reason, v1alpha1.ReasonAdoptedRegistration)
+	}
+	// Still stated: it is the difference between a Secret this tool created and one
+	// it inherited, and nothing else records that.
+	if !strings.Contains(cond.Message, "adopted") || !strings.Contains(cond.Message, "argocd") {
+		t.Errorf("the message does not say the registration was adopted and by whom it is shared: %q", cond.Message)
+	}
+	if events := recorder.recorded(); len(events) != 0 {
+		t.Errorf("a deliberate adoption recorded %d events, want none: %+v", len(events), events)
+	}
+}
+
+// The ordinary case. A Secret this tool created has only its own two managers, and
+// the condition has to say so rather than being absent — an absent condition reads
+// as "not checked", which is what it meant before this existed.
+func TestASecretThisToolAloneManagesReportsTrue(t *testing.T) {
+	t.Parallel()
+
+	r := newReconciler(fake.NewClientset(), func() (kubernetes.Interface, error) {
+		return fake.NewClientset(), nil
+	})
+	r.cfg.ArgoCDNamespace = "argocd"
+
+	var status v1alpha1.ClusterConnectionStatus
+	r.reportSecretOwnership(t.Context(), testCluster(), &status, nil, r.logger)
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSecretExclusivelyOwned)
+	if cond == nil {
+		t.Fatal("nothing was written about who owns the cluster Secret")
+	}
+	if cond.Status != metav1.ConditionTrue || cond.Reason != v1alpha1.ReasonReady {
+		t.Errorf("condition is %s/%s, want True/%s", cond.Status, cond.Reason, v1alpha1.ReasonReady)
+	}
+	if events := recorderFor(t, r).recorded(); len(events) != 0 {
+		t.Errorf("a Secret this tool alone manages recorded %d events, want none: %+v", len(events), events)
+	}
 }

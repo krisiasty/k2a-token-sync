@@ -237,6 +237,11 @@ func decode(obj *unstructured.Unstructured) Entry {
 		entry.InvalidCause = v1alpha1.ReasonInvalidSpec
 		return entry
 	}
+	// Not part of the spec, so FromSpec cannot reach it: adoption is recorded as an
+	// annotation by 'bootstrap --adopt'. Only an explicit "true" counts, so that a
+	// half-written or misspelt value reads as no adoption — which is the direction
+	// that reports a takeover rather than excusing one.
+	cluster.AdoptedRegistration = obj.GetAnnotations()[v1alpha1.AnnotationAdopted] == "true"
 	entry.Cluster = cluster
 	return entry
 }
