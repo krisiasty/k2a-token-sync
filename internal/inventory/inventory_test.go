@@ -153,6 +153,143 @@ func TestTheVerdictDoesNotDependOnOrder(t *testing.T) {
 	}
 }
 
+// Two connections naming one downstream cluster are a duplicate, not two
+// configurations, and both must stand down.
+//
+// They contend over everything downstream: one ServiceAccount, one
+// ClusterRoleBinding whose roleRef cannot be changed, and — since ArgoCD keys a
+// cluster by its server URL — two registrations it cannot tell apart. Letting
+// both run means each undoes the other on a schedule, and neither object says so.
+func TestBothClaimantsAreBlockedWhenTwoConnectionsNameOneCluster(t *testing.T) {
+	t.Parallel()
+
+	entries, err := newTestClient(
+		connection("prod", "10.1.0.10:6443", "cluster-prod"),
+		connection("prod-copy", "10.1.0.10:6443", "cluster-prod-copy"),
+	).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+
+	got := byName(t, entries)
+	for _, name := range []string{"prod", "prod-copy"} {
+		if got[name].InvalidReason == "" {
+			t.Errorf("%s was left free to reconcile a cluster another connection also claims", name)
+		}
+		if got[name].InvalidCause != v1alpha1.ReasonEndpointConflict {
+			t.Errorf("%s was blocked with cause %q, want %q",
+				name, got[name].InvalidCause, v1alpha1.ReasonEndpointConflict)
+		}
+	}
+
+	// Each has to name the other, or the operator holds one half of a conflict with
+	// nothing to search for.
+	if !strings.Contains(got["prod"].InvalidReason, `"prod-copy"`) {
+		t.Errorf("prod is not told which connection duplicates it: %q", got["prod"].InvalidReason)
+	}
+	if !strings.Contains(got["prod-copy"].InvalidReason, `"prod"`) {
+		t.Errorf("prod-copy is not told which connection duplicates it: %q", got["prod-copy"].InvalidReason)
+	}
+}
+
+// The variant that a check on the written value would miss entirely. These three
+// spellings are one API server, and a duplicate is far more likely to be written
+// differently than identically — it is usually a second person adding a cluster
+// they did not know was there.
+func TestEndpointsThatDifferOnlyInSpellingAreOneCluster(t *testing.T) {
+	t.Parallel()
+
+	entries, err := newTestClient(
+		connection("bare", "10.1.0.10", ""),
+		connection("ported", "10.1.0.10:6443", ""),
+		connection("url", "https://10.1.0.10:6443/", ""),
+	).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.InvalidCause != v1alpha1.ReasonEndpointConflict {
+			t.Errorf("%s (endpoint %q) was not recognised as the same cluster as the others",
+				entry.Cluster.Name, entry.Cluster.Endpoint)
+		}
+	}
+}
+
+// A duplicate collides on both rules at once, since two connections for one
+// cluster usually also want one Secret. The endpoint is the one to report: told
+// about the Secret, an operator renames one of two objects that should never both
+// have existed, and ends up with two registrations for one cluster — which is the
+// bug, spelled differently.
+func TestADuplicateIsReportedAsTheDuplicateItIs(t *testing.T) {
+	t.Parallel()
+
+	entries, err := newTestClient(
+		connection("prod", "10.1.0.10:6443", "cluster-prod"),
+		connection("prod-again", "10.1.0.10:6443", "cluster-prod"),
+	).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.InvalidCause != v1alpha1.ReasonEndpointConflict {
+			t.Errorf("%s was reported as %q, want %q — the Secret collision is a symptom of the duplicate",
+				entry.Cluster.Name, entry.InvalidCause, v1alpha1.ReasonEndpointConflict)
+		}
+	}
+}
+
+// Order must not decide anything here either, and this rule has an ordering trap
+// the Secret rule does not: it runs first, and an entry it blocks is then invisible
+// to the Secret rule. Both directions must reach the same verdict.
+func TestTheEndpointVerdictDoesNotDependOnOrder(t *testing.T) {
+	t.Parallel()
+
+	claim := func(name string) Entry {
+		return Entry{Cluster: config.Cluster{Name: name, Endpoint: "10.1.0.10:6443"}}
+	}
+
+	forwards := []Entry{claim("alpha"), claim("omega")}
+	backwards := []Entry{claim("omega"), claim("alpha")}
+	blockContestedEndpoints(forwards)
+	blockContestedEndpoints(backwards)
+
+	a, b := byName(t, forwards), byName(t, backwards)
+	for _, name := range []string{"alpha", "omega"} {
+		if a[name].InvalidReason == "" {
+			t.Errorf("%s was not blocked", name)
+		}
+		if a[name].InvalidReason != b[name].InvalidReason {
+			t.Errorf("%s got a different verdict depending on order:\n  %q\n  %q",
+				name, a[name].InvalidReason, b[name].InvalidReason)
+		}
+	}
+}
+
+// The ordinary inventory, which this rule must leave completely alone: every
+// connection names its own cluster, and several of them accept the same defaults
+// for everything else.
+func TestDistinctClustersAreNotTreatedAsDuplicates(t *testing.T) {
+	t.Parallel()
+
+	entries, err := newTestClient(
+		connection("one", "10.1.0.10:6443", ""),
+		connection("two", "10.1.0.11:6443", ""),
+		connection("three", "10.1.0.12", ""),
+	).List(t.Context())
+	if err != nil {
+		t.Fatalf("List returned unexpected error: %v", err)
+	}
+
+	for _, entry := range entries {
+		if entry.InvalidReason != "" {
+			t.Errorf("%s was blocked in an inventory with no duplicates: %q",
+				entry.Cluster.Name, entry.InvalidReason)
+		}
+	}
+}
+
 // A conflict between two clusters must not sideline a third that shares nothing
 // with them.
 func TestAnUncontestedConnectionIsUnaffectedByOthersFighting(t *testing.T) {

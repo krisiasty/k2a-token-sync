@@ -578,13 +578,14 @@ func resolveRemovalCluster(
 // this guard entirely when resolveRemovalCluster fell back to defaults.
 //
 // Entries are filtered on an empty Cluster.Endpoint here, not on
-// InvalidReason: inventory.Client.List's blockContestedSecrets marks both
-// halves of a secretName conflict invalid, including a pair that also shares
-// an endpoint — exactly the collision this guard exists to catch. Dropping
-// those on InvalidReason instead of on a missing endpoint would let the
-// downstream half be torn down for a connection that another, still-valid
-// spec depends on. A FromSpec failure zeroes Cluster entirely, so filtering
-// on the endpoint alone still excludes it without needing InvalidReason too.
+// InvalidReason, and that distinction now carries the whole guard.
+// inventory.Client.List blocks both halves of a shared endpoint outright, so
+// every collision this exists to catch arrives marked invalid. Dropping those
+// on InvalidReason would leave the guard permanently blind, and tear the
+// downstream half down for a connection another spec still depends on —
+// which is exactly the case removing one of two duplicates is meant to fix.
+// A FromSpec failure zeroes Cluster entirely, so filtering on the endpoint
+// alone still excludes it without needing InvalidReason too.
 func endpointCollision(ctx context.Context, inv *inventory.Client, clusterName, endpoint string) (string, error) {
 	entries, err := inv.List(ctx)
 	if err != nil {

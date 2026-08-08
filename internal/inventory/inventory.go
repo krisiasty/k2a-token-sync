@@ -52,7 +52,8 @@ type Entry struct {
 	Status v1alpha1.ClusterConnectionStatus
 
 	// InvalidReason is set when the entry cannot be reconciled: its spec does not
-	// resolve, or another connection claims the same Secret. Such an entry is
+	// resolve, or another connection claims the same Secret or the same
+	// downstream cluster. Such an entry is
 	// reported on the object rather than dropped silently, since a cluster
 	// vanishing from the inventory because of a typo is the worst of both outcomes.
 	InvalidReason string
@@ -114,12 +115,55 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 		entries = append(entries, decode(&list.Items[i]))
 	}
 
+	// Endpoint first. Two connections naming one cluster are duplicates, and a
+	// pair of duplicates collides on both rules at once — reporting the Secret
+	// would send whoever reads it to rename one of two objects that should never
+	// both have existed.
+	blockContestedEndpoints(entries)
 	blockContestedSecrets(entries)
+
 	return entries, nil
 }
 
-// blockContestedSecrets holds back every claimant when two or more connections
-// resolve to the same Secret.
+// blockContestedEndpoints holds back every connection that names a downstream
+// cluster another connection also names.
+//
+// The endpoint is the cluster's identity, so two connections claiming one are not
+// two configurations of one cluster but a duplicate. They contend over everything
+// downstream: one ServiceAccount, one ClusterRoleBinding whose roleRef is
+// immutable, and — because ArgoCD keys a cluster by its server URL — two
+// registrations ArgoCD cannot tell apart. Nothing about that is expressible as a
+// preference, so it is refused rather than resolved.
+//
+// The comparison is on the resolved endpoint, not the written one: FromSpec has
+// already turned "10.1.0.10", "10.1.0.10:6443" and "https://10.1.0.10:6443/" into
+// one value, so two spellings of one cluster are caught along with two copies of
+// one spelling.
+func blockContestedEndpoints(entries []Entry) {
+	blockContested(entries, v1alpha1.ReasonEndpointConflict,
+		func(e Entry) string { return e.Cluster.Endpoint },
+		func(endpoint string, others []string) string {
+			return fmt.Sprintf(
+				"endpoint %q is the same downstream cluster as %s; one cluster takes one ClusterConnection, "+
+					"and none of them will be reconciled until one remains",
+				endpoint, strings.Join(quoted(others), ", "))
+		})
+}
+
+// blockContestedSecrets holds back every connection claiming an ArgoCD cluster
+// Secret another connection also claims.
+func blockContestedSecrets(entries []Entry) {
+	blockContested(entries, v1alpha1.ReasonSecretNameConflict,
+		func(e Entry) string { return e.Cluster.SecretName },
+		func(secretName string, others []string) string {
+			return fmt.Sprintf(
+				"secretName %q is also claimed by %s; none of them will be reconciled until one claim remains",
+				secretName, strings.Join(quoted(others), ", "))
+		})
+}
+
+// blockContested holds back every claimant when two or more connections resolve
+// to the same value of something only one of them may own.
 //
 // The obvious alternative — let the first one seen keep it — reads as though it
 // protects the incumbent, and does the opposite. List order is not an ownership
@@ -133,18 +177,28 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 // There is no answer to "which of these should win" that this tool can safely
 // invent, so it declines to choose. Nothing is written until a person removes the
 // ambiguity, which costs a stalled cluster and saves a misdirected one.
-func blockContestedSecrets(entries []Entry) {
+//
+// An entry already held back for another reason claims nothing, so it is neither
+// blocked twice nor counted as a contender. That is deliberate: a connection this
+// tool is not reconciling is not competing for anything, and naming it as a rival
+// would have an operator hunting a conflict that resolves itself the moment the
+// first verdict is cleared.
+func blockContested(entries []Entry, cause string, claim func(Entry) string, describe func(string, []string) string) {
 	claimants := make(map[string][]string, len(entries))
 	for _, entry := range entries {
-		if entry.InvalidReason != "" || entry.Cluster.SecretName == "" {
+		value := claim(entry)
+		if entry.InvalidReason != "" || value == "" {
 			continue
 		}
-		claimants[entry.Cluster.SecretName] = append(claimants[entry.Cluster.SecretName], entry.Cluster.Name)
+		claimants[value] = append(claimants[value], entry.Cluster.Name)
 	}
 
 	for i := range entries {
-		contenders := claimants[entries[i].Cluster.SecretName]
-		if entries[i].InvalidReason != "" || len(contenders) < 2 {
+		if entries[i].InvalidReason != "" {
+			continue
+		}
+		contenders := claimants[claim(entries[i])]
+		if len(contenders) < 2 {
 			continue
 		}
 
@@ -159,10 +213,8 @@ func blockContestedSecrets(entries []Entry) {
 		// look like something changed.
 		sort.Strings(others)
 
-		entries[i].InvalidReason = fmt.Sprintf(
-			"secretName %q is also claimed by %s; none of them will be reconciled until one claim remains",
-			entries[i].Cluster.SecretName, strings.Join(quoted(others), ", "))
-		entries[i].InvalidCause = v1alpha1.ReasonSecretNameConflict
+		entries[i].InvalidReason = describe(claim(entries[i]), others)
+		entries[i].InvalidCause = cause
 	}
 }
 

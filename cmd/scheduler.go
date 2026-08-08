@@ -481,15 +481,24 @@ func rejectedStatus(status v1alpha1.ClusterConnectionStatus, state *clusterState
 	setRejectedCondition(&status, v1alpha1.ConditionReady, metav1.ConditionFalse, reason, state)
 
 	// Conflict is the one condition that names something outside this object, so it
-	// is set only for the conflict itself and removed as soon as the cause is
+	// is set only for a conflict itself and removed as soon as the cause is
 	// something else. Leaving it behind would have an object blaming a neighbour for
 	// a problem in its own spec.
-	if reason == v1alpha1.ReasonSecretNameConflict {
+	if namesAnotherConnection(reason) {
 		setRejectedCondition(&status, v1alpha1.ConditionConflict, metav1.ConditionTrue, reason, state)
 	} else {
 		meta.RemoveStatusCondition(&status.Conditions, v1alpha1.ConditionConflict)
 	}
 	return status
+}
+
+// namesAnotherConnection reports whether a verdict is about a neighbour rather
+// than about this object's own spec, which is what the Conflict condition exists
+// to say. The reason is carried through rather than the condition itself, because
+// the two conflicts want different remedies: rename one Secret, or delete one
+// duplicate.
+func namesAnotherConnection(reason string) bool {
+	return reason == v1alpha1.ReasonSecretNameConflict || reason == v1alpha1.ReasonEndpointConflict
 }
 
 func setRejectedCondition(
