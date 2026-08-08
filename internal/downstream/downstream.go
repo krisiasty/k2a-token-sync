@@ -273,6 +273,30 @@ func selfRules() []rbacv1.PolicyRule {
 			Resources: []string{"clusterrolebindings"},
 			Verbs:     []string{"get", "create"},
 		},
+		// Creating that binding needs more than permission to create bindings.
+		// Kubernetes refuses any binding that would grant permissions the creator
+		// does not itself hold, unless it holds 'bind' on the referenced role — so
+		// without this rule, restoring a deleted argocd-manager binding fails with
+		// "attempting to grant RBAC permissions not currently held" on every pass,
+		// forever. The create above is the half that was already here; this is the
+		// half that makes it work.
+		//
+		// It reads like a privilege escalation and is very nearly not one. The rule
+		// immediately above this comment already lets this identity mint a token for
+		// argocd-manager, which is bound to cluster-admin — so, as the note at the
+		// top of this function says, it is cluster-admin-equivalent already. What
+		// this adds is the ability to re-point that one named role at the same
+		// subject it was pointed at before.
+		//
+		// ResourceNames is what keeps that true, and is not optional: 'bind' without
+		// it would let this identity grant *any* role in the cluster to any subject,
+		// which is a genuinely larger power than the one being repaired.
+		{
+			APIGroups:     []string{rbacv1.GroupName},
+			Resources:     []string{"clusterroles"},
+			ResourceNames: []string{clusterAdminRole},
+			Verbs:         []string{"bind"},
+		},
 		{
 			APIGroups:     []string{""},
 			Resources:     []string{"configmaps"},

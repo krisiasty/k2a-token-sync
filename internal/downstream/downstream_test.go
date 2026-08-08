@@ -2,6 +2,7 @@ package downstream
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -372,5 +373,46 @@ func TestCanActAsClusterAdminAsksTheBroadestQuestion(t *testing.T) {
 	}
 	if asked.Verb != "*" || asked.Group != "*" || asked.Resource != "*" {
 		t.Errorf("asked about %+v, want every verb on every resource in every group", asked)
+	}
+}
+
+// Creating ArgoCD's binding needs 'bind' on the role it references, not just
+// permission to create bindings: Kubernetes refuses any binding granting
+// permissions the creator does not hold. Without this rule, restoring a deleted
+// argocd-manager binding fails on every pass with "attempting to grant RBAC
+// permissions not currently held" — which is what it did, in every released
+// version, because a fake clientset does not run the RBAC admission plugin and
+// so every test of that path passed against a create a real API server refuses.
+//
+// This cannot reproduce that: it asserts the rule is present and correctly
+// scoped, and the behaviour itself is verified against a live cluster.
+func TestSelfRulesCanBindTheRoleItHasToRestore(t *testing.T) {
+	t.Parallel()
+
+	var bind *rbacv1.PolicyRule
+	for i, rule := range selfRules() {
+		if slices.Contains(rule.Resources, "clusterroles") && slices.Contains(rule.Verbs, "bind") {
+			bind = &selfRules()[i]
+			break
+		}
+	}
+	if bind == nil {
+		t.Fatal("selfRules grants no 'bind' on clusterroles, so restoring ArgoCD's binding " +
+			"is refused by the API server on every pass")
+	}
+
+	// Not decoration. 'bind' without resourceNames would let this identity grant
+	// any role in the cluster to any subject — a materially larger power than
+	// re-pointing the one role it already manages, and the difference between a
+	// repair and an escalation primitive.
+	if len(bind.ResourceNames) == 0 {
+		t.Error("the bind rule has no resourceNames, so it permits binding every role in the cluster")
+	}
+	if !slices.Contains(bind.ResourceNames, clusterAdminRole) {
+		t.Errorf("bind rule resourceNames = %v, which does not include %q — the role "+
+			"EnsureArgoCDIdentity actually binds", bind.ResourceNames, clusterAdminRole)
+	}
+	if !slices.Contains(bind.APIGroups, rbacv1.GroupName) {
+		t.Errorf("bind rule apiGroups = %v, want %q", bind.APIGroups, rbacv1.GroupName)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -515,7 +516,20 @@ func setCondition(
 
 // reasonFor maps a failure onto the condition reason that best describes it, so
 // 'kubectl get ccon' distinguishes "never bootstrapped" from "cannot connect".
+//
+// The reason is the first thing anyone reads and the thing they act on, so a
+// wrong one costs a whole round of debugging: the message beside it is only seen
+// by someone who already ran 'describe'. That is why errCredentialRejected has a
+// reason of its own — as its own comment says, EndpointUnreachable there "would
+// be actively misleading: the endpoint answered, and said no."
+//
+// Which is exactly why the default cannot be EndpointUnreachable either. Every
+// failure nobody thought to classify used to claim the endpoint was unreachable,
+// including RBAC refusals from an API server that had just answered two other
+// calls in the same pass. An unrecognised failure now says only that the pass
+// failed; naming a cause is reserved for the cases that establish one.
 func reasonFor(err error) string {
+	var urlErr *url.Error
 	switch {
 	case errors.Is(err, errNoCredential):
 		return v1alpha1.ReasonAwaitingCredential
@@ -527,8 +541,19 @@ func reasonFor(err error) string {
 		return v1alpha1.ReasonCredentialRejected
 	case errors.Is(err, errCredentialReplaced):
 		return v1alpha1.ReasonCredentialReplaced
-	default:
+	case apierrors.IsForbidden(err):
+		// The API server answered and refused. Worth its own reason rather than
+		// the neutral default: a permission failure has a specific remedy, and
+		// this is the reason a downstream RBAC refusal now reports.
+		return v1alpha1.ReasonPermissionDenied
+	case errors.As(err, &urlErr):
+		// A transport-level failure — client-go wraps dial timeouts, refused
+		// connections and DNS failures in *url.Error. This is the one shape of
+		// error that genuinely establishes the endpoint could not be reached, so
+		// it is the only thing that now claims so.
 		return v1alpha1.ReasonEndpointUnreachable
+	default:
+		return v1alpha1.ReasonReconcileFailed
 	}
 }
 
