@@ -494,10 +494,18 @@ func (s *scheduler) updateSchedule(entries []inventory.Entry) (resumed []string)
 			continue
 		}
 		delete(s.state, name)
-		// The generated Secret is deliberately left behind: k2a-token-sync holds
-		// no delete permission in ArgoCD's namespace, and removing a
-		// registration is an operator's decision.
-		s.logger.Info("cluster removed from the inventory; its ArgoCD Secret is left in place",
+		// The generated Secret is deliberately not deleted here: k2a-token-sync
+		// holds no delete permission in ArgoCD's namespace, and removing a
+		// registration is an operator's decision — 'k2a-token-sync remove' is
+		// the supported way to make it.
+		//
+		// Worded as what this process will not do, rather than as a claim about
+		// what the Secret's state now is. Holding no read permission on it, this
+		// cannot know: the usual reason a cluster leaves the inventory is that
+		// 'remove' deleted the ClusterConnection, and it deletes the Secret too.
+		// Saying it "is left in place" then reads as a contradiction of the
+		// command the operator just ran.
+		s.logger.Info("cluster removed from the inventory; k2a-token-sync will not delete its ArgoCD Secret",
 			"cluster", name)
 	}
 	return resumed

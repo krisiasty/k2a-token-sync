@@ -514,12 +514,16 @@ Downstream cluster — standalone-1
   verified              the new credential works against the endpoint
 
 Cluster running ArgoCD — context gitops (https://gitops.example.com:6443)
+  registration          argocd/cluster-standalone-1 does not exist yet
   credential            k2a-token-sync/standalone-1-credentials, expires 2026-10-30
-  registration          k2a-token-sync/standalone-1
+  connection            k2a-token-sync/standalone-1
 
 Done. k2a-token-sync publishes ArgoCD's credential within 30 seconds:
   kubectl -n k2a-token-sync get ccon standalone-1
 ```
+
+`registration` is ArgoCD's cluster Secret and `connection` is the ClusterConnection — two objects, in two
+namespaces, and the same two labels `remove` uses.
 
 Output is grouped by cluster, because "where did that happen" is the first question when one command writes to two of
 them. Registering the cluster ArgoCD itself runs on is a normal case, and the second heading then says "the same cluster
