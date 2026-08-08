@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
+	"github.com/krisiasty/k2a-token-sync/internal/config"
 	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 )
 
@@ -356,5 +357,89 @@ func TestTheSchemaCheckIsRateLimited(t *testing.T) {
 	s.checkSchema(t.Context())
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2: the check should run again once the interval elapsed", calls)
+	}
+}
+
+// The finding this test exists for was only visible on a live cluster: the
+// schema verdict changed, /status and the metric followed, and the condition on
+// the object did not — because a status is written when a pass or a rejection
+// has something to say, and a schema going stale or being fixed is neither. On
+// a healthy cluster that meant never, so a warning raised once could not clear
+// and a fix went unacknowledged.
+func TestAChangedSchemaVerdictIsPushedOntoTheObjects(t *testing.T) {
+	t.Parallel()
+
+	inv := newFakeInventory("one", "two")
+	now := time.Now()
+	stale := true
+
+	s := newScheduler(inv, nil, nil, slog.New(slog.DiscardHandler), newHealthState())
+	s.now = func() time.Time { return now }
+	s.schema = func(context.Context) inventory.SchemaCheck {
+		if stale {
+			return inventory.SchemaCheck{MissingSpecFields: []string{"clusterRole"}}
+		}
+		return inventory.SchemaCheck{}
+	}
+	s.state = map[string]*clusterState{
+		"one": {cluster: config.Cluster{Name: "one"}},
+		"two": {cluster: config.Cluster{Name: "two"}},
+	}
+
+	// First verdict: stale. Both objects should be told.
+	s.checkSchema(t.Context())
+	assertSchemaCondition(t, inv, "one", metav1.ConditionFalse, v1alpha1.ReasonSchemaOutdated)
+	assertSchemaCondition(t, inv, "two", metav1.ConditionFalse, v1alpha1.ReasonSchemaOutdated)
+
+	// The schema is fixed. Nothing else about either cluster has changed, so
+	// without an explicit push the objects would keep claiming it is broken.
+	stale = false
+	now = now.Add(schemaCheckInterval + time.Second)
+	s.checkSchema(t.Context())
+	assertSchemaCondition(t, inv, "one", metav1.ConditionTrue, v1alpha1.ReasonReady)
+	assertSchemaCondition(t, inv, "two", metav1.ConditionTrue, v1alpha1.ReasonReady)
+}
+
+// A cluster mid-pass writes its own status when it finishes, and picks the
+// verdict up on the way through writeStatus. Writing underneath it would be
+// overwritten moments later.
+func TestAClusterMidPassIsLeftToWriteItsOwnVerdict(t *testing.T) {
+	t.Parallel()
+
+	inv := newFakeInventory("running")
+	s := newScheduler(inv, nil, nil, slog.New(slog.DiscardHandler), newHealthState())
+	s.now = time.Now
+	s.schema = func(context.Context) inventory.SchemaCheck {
+		return inventory.SchemaCheck{MissingSpecFields: []string{"clusterRole"}}
+	}
+	s.state = map[string]*clusterState{
+		"running": {cluster: config.Cluster{Name: "running"}, running: true},
+	}
+
+	s.checkSchema(t.Context())
+
+	inv.mu.Lock()
+	defer inv.mu.Unlock()
+	if _, written := inv.written["running"]; written {
+		t.Error("a status was written underneath a pass that is still in flight")
+	}
+}
+
+func assertSchemaCondition(t *testing.T, inv *fakeInventory, name string, want metav1.ConditionStatus, reason string) {
+	t.Helper()
+
+	inv.mu.Lock()
+	status, ok := inv.written[name]
+	inv.mu.Unlock()
+	if !ok {
+		t.Fatalf("no status was written for %q, so the verdict never reached the object", name)
+	}
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSchemaCurrent)
+	if cond == nil {
+		t.Fatalf("%q carries no SchemaCurrent condition", name)
+	}
+	if cond.Status != want || cond.Reason != reason {
+		t.Errorf("%q: condition = %v/%s, want %v/%s", name, cond.Status, cond.Reason, want, reason)
 	}
 }

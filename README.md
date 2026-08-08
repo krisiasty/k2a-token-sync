@@ -294,6 +294,24 @@ Nothing is deleted or recreated either way, and no ClusterConnection is disturbe
 Helm believes owns the object. Order matters here too — doing step 2 first would leave the application chart
 briefly managing a CRD the new chart also claims.
 
+**The first upgrade of the CRD chart afterwards may need `--force-conflicts`.** Earlier releases told you to
+apply the schema with `kubectl apply -f charts/k2a-token-sync/crds/`, which leaves a
+`kubectl-client-side-apply` field manager owning `.spec.versions`. Helm applies server-side, so it will not
+overwrite fields another manager owns:
+
+```console
+Error: UPGRADE FAILED: conflict occurred while applying object ... Apply failed with 1 conflict:
+conflict with "kubectl-client-side-apply" using apiextensions.k8s.io/v1: .spec.versions
+```
+
+```bash
+helm upgrade k2a-token-sync-crds oci://ghcr.io/krisiasty/charts/k2a-token-sync-crds \
+  --namespace k2a-token-sync --force-conflicts
+```
+
+Needed once, on the first upgrade after adoption: it hands `.spec.versions` to Helm, and later upgrades find
+no conflict. It affects anyone who followed the documented upgrade path, which is to say most installs.
+
 **Downstream permissions upgrade differently.** The ClusterRole k2a-token-sync holds on each managed cluster is written
 by `bootstrap`, not by the chart, and nothing revisits it afterwards — the daemon cannot update its own role, since
 granting itself a permission it does not hold is the very thing Kubernetes refuses. So a release that changes those

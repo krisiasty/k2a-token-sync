@@ -275,6 +275,17 @@ func (s *scheduler) checkSchema(ctx context.Context) {
 	check := s.schema(ctx)
 	s.health.recordSchema(check)
 
+	// A verdict that changed has to reach the objects, and nothing else will
+	// carry it there: a status is written when a pass or a rejection has
+	// something to say, and a schema going stale — or being fixed — changes
+	// neither. Without this the condition would be stamped whenever the next
+	// unrelated write happened to occur, which on a healthy cluster is never.
+	// A warning that cannot clear is one people learn to ignore, so clearing
+	// matters as much as raising.
+	if check.Stale() != s.schemaStale || check.Unverifiable != nil {
+		s.restampSchemaCondition(ctx)
+	}
+
 	switch {
 	case check.Unverifiable != nil:
 		// Not staleness, and deliberately not an error: an operator who upgraded
@@ -291,6 +302,33 @@ func (s *scheduler) checkSchema(ctx context.Context) {
 		s.logger.Info("the ClusterConnection CRD now matches this build; nothing is being discarded")
 	}
 	s.schemaStale = check.Stale()
+}
+
+// restampSchemaCondition rewrites the status of every known cluster so the
+// schema verdict on each object matches the one just reached.
+//
+// Failures are logged and stepped over rather than retried: the next change of
+// verdict comes back through here, and the log and the metric already carry the
+// same finding for anyone watching either.
+func (s *scheduler) restampSchemaCondition(ctx context.Context) {
+	s.mu.Lock()
+	pending := make(map[string]v1alpha1.ClusterConnectionStatus, len(s.state))
+	for name, state := range s.state {
+		// A pass in flight writes its own status when it finishes, and will pick
+		// up the new verdict on the way through writeStatus. Writing underneath
+		// it here would be overwritten moments later anyway.
+		if !state.running {
+			pending[name] = state.status
+		}
+	}
+	s.mu.Unlock()
+
+	for name, status := range pending {
+		if err := s.writeStatus(ctx, name, status); err != nil {
+			s.logger.Warn("recording the CRD schema verdict on a cluster failed",
+				"cluster", name, "error", err)
+		}
+	}
 }
 
 // tick refreshes the inventory and starts whatever is due.

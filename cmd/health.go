@@ -208,7 +208,9 @@ func (s *healthState) report() statusReport {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	schema := schemaReport{Current: s.schemaChecked && !s.schema.Stale()}
+	// Unverifiable is not current. Reporting true alongside an "unverified"
+	// message would be a claim the check explicitly did not make.
+	schema := schemaReport{Current: s.schemaChecked && s.schema.Unverifiable == nil && !s.schema.Stale()}
 	if s.schema.Stale() {
 		schema.MissingFields = append(append([]string{}, s.schema.MissingSpecFields...), s.schema.MissingStatusFields...)
 	}
