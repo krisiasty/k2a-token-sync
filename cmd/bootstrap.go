@@ -211,7 +211,11 @@ Flags:
 		out.sameClusterNote(downstreamCfg.Host, localCfg.Host)
 		target.report(out, *argocdNamespace, cluster.SecretName, adopted)
 		out.stepf("credential", "would write %s", *namespace+"/"+cluster.CredentialsSecretName())
-		out.stepf("registration", "would apply %s", *namespace+"/"+cluster.Name)
+		// "connection", not "registration": the line above from target.report
+		// already used that label for ArgoCD's cluster Secret, and two different
+		// objects in two different namespaces sharing one label is what made this
+		// output ambiguous. 'remove' has always drawn the distinction this way.
+		out.stepf("connection", "would apply %s", *namespace+"/"+cluster.Name)
 		out.blank()
 		out.notef("Nothing was changed. The manifest below is what would be applied.")
 		out.blank()
@@ -264,7 +268,7 @@ Flags:
 	if err := applyConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext, adopted); err != nil {
 		return err
 	}
-	out.stepf("registration", "%s", *namespace+"/"+cluster.Name)
+	out.stepf("connection", "%s", *namespace+"/"+cluster.Name)
 	out.blank()
 	out.notef("Done. k2a-token-sync publishes ArgoCD's credential within 30 seconds:")
 	out.notef("  kubectl -n %s get ccon %s", *namespace, cluster.Name)
