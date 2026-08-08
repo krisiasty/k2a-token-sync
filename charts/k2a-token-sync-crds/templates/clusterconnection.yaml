@@ -1,0 +1,22 @@
+{{/*
+The generated CRD, with the deletion protections merged in.
+
+The schema itself lives in files/ rather than here, and is written by
+hack/gen-crd.sh straight from the Go types. Keeping it out of templates/ is what
+lets CI regenerate it and diff the tree: a file carrying Helm directives could
+not be compared against controller-gen's output, so the check that the schema
+cannot drift from the types would have to be given up.
+
+Reading it back with fromYaml and re-emitting it is therefore deliberate. The
+alternative — baking the annotations in with a +kubebuilder:metadata marker —
+would make them unconditional, and removing the CRD would mean editing a
+generated file rather than setting a value.
+*/}}
+{{- $crd := .Files.Get "files/k2a-token-sync.io_clusterconnections.yaml" | fromYaml }}
+{{- if .Values.crds.keep }}
+{{- $annotations := default dict $crd.metadata.annotations }}
+{{- $_ := set $annotations "helm.sh/resource-policy" "keep" }}
+{{- $_ := set $annotations "argocd.argoproj.io/sync-options" "Delete=false,Prune=false" }}
+{{- $_ := set $crd.metadata "annotations" $annotations }}
+{{- end }}
+{{- toYaml $crd }}

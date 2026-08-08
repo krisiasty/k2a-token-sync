@@ -184,15 +184,31 @@ distribution — and restart or reissue it.
 
 ### Helm
 
-The chart installs k2a-token-sync, its RBAC and the ClusterConnection CRD. It does not
-manage cluster objects — those are separate manifests, see
+Two charts, published as OCI artifacts to the same registry as the images.
+
+`k2a-token-sync-crds` carries the ClusterConnection CRD and nothing else. `k2a-token-sync` installs the
+application and its RBAC. Neither manages cluster objects — those come from bootstrap, see
 [Adding a cluster](#adding-a-cluster).
 
 ```bash
-helm install k2a-token-sync ./charts/k2a-token-sync \
-  --namespace k2a-token-sync --create-namespace \
-  --set image.tag=v0.11.0
+# 1. the schema, once per cluster
+helm install k2a-token-sync-crds oci://ghcr.io/krisiasty/charts/k2a-token-sync-crds \
+  --namespace k2a-token-sync --create-namespace
+
+# 2. the application
+helm install k2a-token-sync oci://ghcr.io/krisiasty/charts/k2a-token-sync \
+  --namespace k2a-token-sync \
+  --set image.tag=v0.14.0
 ```
+
+**Two charts because the CRD is cluster-scoped and the application is not.** One instance serves one ArgoCD, so
+a second ArgoCD means a second release of the application chart — but they share one CRD, and a chart installed
+twice would fight itself over a single cluster-scoped object. Separating them also puts the schema back inside
+Helm's upgrade path: Helm applies a `crds/` directory at install and never touches it again, so a CRD shipped
+that way is applied by hand on every release that changes it.
+
+Order matters only in that the application cannot read an inventory whose schema is absent. It does not fail if
+you get it wrong — it reports the missing CRD, names the remedy, and recovers on its own within one poll.
 
 #### Key chart values
 
@@ -209,20 +225,34 @@ release upgrade.
 #### Upgrading
 
 ```bash
-# 1. the CRD, if this release changed it — Helm installs crds/ and never touches it again
-kubectl apply -f charts/k2a-token-sync/crds/
+# 1. the schema
+helm upgrade k2a-token-sync-crds oci://ghcr.io/krisiasty/charts/k2a-token-sync-crds \
+  --namespace k2a-token-sync
 
-# 2. the release
-helm upgrade k2a-token-sync ./charts/k2a-token-sync \
+# 2. the application
+helm upgrade k2a-token-sync oci://ghcr.io/krisiasty/charts/k2a-token-sync \
   --namespace k2a-token-sync \
-  --set image.tag=v0.11.0 --wait --timeout 5m
+  --set image.tag=v0.14.0 --wait --timeout 5m
 ```
 
-**The CRD comes first, and only when it changed.** Helm applies `crds/` at install and ignores it ever after, so a
-schema change is yours to apply. Order matters whenever a release adds status fields: the API server prunes anything the
-schema does not know, so a new binary writing to an old CRD loses exactly the state it just computed, and loses it
-silently. `kubectl diff -f charts/k2a-token-sync/crds/` answers whether there is anything to do — it exits 0 when there
-is not, which is the common case.
+**The CRD comes first.** The API server prunes anything its schema does not know, so a new binary against an old
+schema loses exactly the fields it was just given — a connection asking to be scoped below `cluster-admin`
+silently resolves to `cluster-admin`, reports itself Ready, and nothing anywhere disagrees.
+
+That used to be undetectable. It no longer is: k2a-token-sync compares the served schema against the fields it
+knows and reports what would be discarded, as a `SchemaCurrent` condition on every connection, a log line, and
+the `k2a_token_sync_crd_schema_current` metric. `kubectl describe ccon` names the fields.
+
+```console
+$ kubectl get ccon
+NAME         ENDPOINT               READY   ...
+standalone-1 10.1.0.10:6443         True    ...
+
+$ kubectl describe ccon standalone-1
+  SchemaCurrent  False  SchemaOutdated
+    the CRD is older than this build, so the API server discards these fields when they are set:
+    spec.clusterRole, spec.namespaces, spec.clusterResources. Upgrade the k2a-token-sync-crds chart
+```
 
 **Upgrade the chart, not just the tag.** k2a-token-sync's permissions live in the chart, so a release that needs a new one
 gets it from `helm upgrade` and not from changing `image.tag` where you deploy. The signal is the chart's own `version`
@@ -232,6 +262,55 @@ be applied. Chart 0.5.0 added `create` on Events, for instance.
 A permission that never arrives is not fatal — nothing in this tool treats its own observability as load-bearing — but it
 is quiet. A missing `events` grant costs one warning per attempted write and an Events section that stays empty, which
 reads as a feature that does not work rather than as RBAC that was not applied.
+
+#### Migrating an install made before the split
+
+Releases up to v0.14.0 shipped the CRD inside the application chart's `crds/` directory, where Helm installs it
+without any ownership metadata of its own. The new chart therefore cannot simply claim it — Helm refuses with
+`invalid ownership metadata` rather than adopt an object it does not believe it owns.
+
+```bash
+# 1. the application chart, which no longer carries a CRD.
+#    The existing CRD is untouched: Helm never managed it, so it has nothing to remove.
+helm upgrade k2a-token-sync oci://ghcr.io/krisiasty/charts/k2a-token-sync \
+  --namespace k2a-token-sync --set image.tag=v0.14.0
+
+# 2. adopt the existing CRD into the new chart
+helm install k2a-token-sync-crds oci://ghcr.io/krisiasty/charts/k2a-token-sync-crds \
+  --namespace k2a-token-sync --take-ownership
+```
+
+`--take-ownership` needs Helm 3.17 or newer. On anything older, label and annotate the CRD by hand first and
+then install without the flag:
+
+```bash
+kubectl annotate crd clusterconnections.k2a-token-sync.io \
+  meta.helm.sh/release-name=k2a-token-sync-crds \
+  meta.helm.sh/release-namespace=k2a-token-sync
+kubectl label crd clusterconnections.k2a-token-sync.io app.kubernetes.io/managed-by=Helm
+```
+
+Nothing is deleted or recreated either way, and no ClusterConnection is disturbed: adoption changes only who
+Helm believes owns the object. Order matters here too — doing step 2 first would leave the application chart
+briefly managing a CRD the new chart also claims.
+
+**The first upgrade of the CRD chart afterwards may need `--force-conflicts`.** Earlier releases told you to
+apply the schema with `kubectl apply -f charts/k2a-token-sync/crds/`, which leaves a
+`kubectl-client-side-apply` field manager owning `.spec.versions`. Helm applies server-side, so it will not
+overwrite fields another manager owns:
+
+```console
+Error: UPGRADE FAILED: conflict occurred while applying object ... Apply failed with 1 conflict:
+conflict with "kubectl-client-side-apply" using apiextensions.k8s.io/v1: .spec.versions
+```
+
+```bash
+helm upgrade k2a-token-sync-crds oci://ghcr.io/krisiasty/charts/k2a-token-sync-crds \
+  --namespace k2a-token-sync --force-conflicts
+```
+
+Needed once, on the first upgrade after adoption: it hands `.spec.versions` to Helm, and later upgrades find
+no conflict. It affects anyone who followed the documented upgrade path, which is to say most installs.
 
 **Downstream permissions upgrade differently.** The ClusterRole k2a-token-sync holds on each managed cluster is written
 by `bootstrap`, not by the chart, and nothing revisits it afterwards — the daemon cannot update its own role, since
@@ -302,7 +381,30 @@ spec:
       - CreateNamespace=true
 ```
 
-A second Application can own the ClusterConnection objects if you want the fleet declared in git — optional, and
+**The CRD needs a second Application**, pointing at `charts/k2a-token-sync-crds`, because it is a separate chart:
+
+```yaml
+  source:
+    repoURL: https://github.com/krisiasty/k2a-token-sync
+    targetRevision: HEAD
+    path: charts/k2a-token-sync-crds
+```
+
+Nothing orders the two. Sync waves order resources within an Application, not between them, so the application
+may well sync first — which is harmless: it reports the missing CRD, names the remedy, and recovers on its own
+within one poll. No app-of-apps arrangement is needed to make that safe.
+
+**Deleting the CRD Application must not delete the CRD**, and the chart handles that for you. The CRD carries
+`argocd.argoproj.io/sync-options: Delete=false,Prune=false` whenever `crds.keep` is set, which it is by
+default. That matters because `prune: true` above would otherwise take the CRD with the Application, and every
+ClusterConnection with the CRD — each one the only record of a cluster's registration, recoverable only by
+re-running bootstrap against every downstream cluster.
+
+The Helm annotation alone would not save you here. `helm.sh/resource-policy: keep` is read by `helm uninstall`,
+which ArgoCD never runs: it renders with `helm template`, applies the output, and prunes from its own tracking.
+Both annotations are set, because the two deployment paths honour different ones.
+
+A third Application can own the ClusterConnection objects if you want the fleet declared in git — optional, and
 discussed under [Deployment paths](#deployment-paths).
 
 ### Without Helm
@@ -691,13 +793,14 @@ the administrative kubeconfig bootstrap consumes — which you should already ma
 
 ## Deployment paths
 
-Two methods work, and they differ only in who applies the chart.
+Two methods work, and they differ only in who applies the charts.
 
-**Helm or Ansible, then bootstrap.** Install the chart, then run bootstrap once per cluster. Nothing per-cluster lives in
-git; the inventory lives in the API.
+**Helm or Ansible, then bootstrap.** Install both charts, then run bootstrap once per cluster. Nothing
+per-cluster lives in git; the inventory lives in the API.
 
-**ArgoCD owns the chart, then bootstrap.** An Application deploys the chart from git — CRD, RBAC, Deployment, no secrets,
-fully declarative. Bootstrap still runs out-of-band, because the credential cannot be in git.
+**ArgoCD owns the charts, then bootstrap.** One Application per chart — the schema in one, RBAC and Deployment
+in the other, no secrets, fully declarative. Bootstrap still runs out-of-band, because the credential cannot be
+in git.
 
 So the part GitOps cannot express is exactly **one credential per cluster**, and the natural place to create it is
 wherever administrative access already exists: the automation that builds the cluster. Implement the contract above in
@@ -891,9 +994,17 @@ state lives: conditions and `lastAction` remain authoritative for how a connecti
 
 ## Security notes
 
-k2a-token-sync holds no cluster-scoped permissions on the cluster it runs in. Its objects are namespaced and only its own
-namespace is listed, so a Role suffices everywhere. In that namespace it also holds `create` on Events, and only
-`create`: each one is a new object, and it neither reads them back nor aggregates them into a series.
+k2a-token-sync holds exactly one cluster-scoped permission on the cluster it runs in: `get` on the
+ClusterConnection CRD, named explicitly by `resourceNames`. Everything else is namespaced — its objects live in
+its own namespace and only that namespace is listed, so a Role suffices. In that namespace it also holds
+`create` on Events, and only `create`: each one is a new object, and it neither reads them back nor aggregates
+them into a series.
+
+That one read exists so the tool can tell whether its CRD still matches the build reconciling it, which is
+otherwise invisible: a field the API server pruned is indistinguishable from one nobody set. Its marginal
+exposure is nil — the built-in `system:discovery` role already lets every authenticated identity read the same
+schema through `/openapi` — so what `resourceNames` buys is not secrecy but the difference between reading one
+object and reading every CRD in the cluster.
 
 **In ArgoCD's namespace it holds `create` and `patch` on Secrets, and nothing else.** It cannot read — not the Secrets it
 writes, and not ArgoCD's own. It learns the result of its own writes from what an apply returns, and keeps everything

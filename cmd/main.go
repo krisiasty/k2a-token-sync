@@ -131,13 +131,20 @@ func runSync(logger *slog.Logger) error {
 	inv := inventory.NewClient(dyn, cfg.Namespace)
 	recorder := events.New(local, cfg.Namespace, inv, logger)
 
-	newScheduler(
+	scheduler := newScheduler(
 		inv,
 		reconcile.New(cfg, local, recorder, logger),
 		recorder,
 		logger,
 		state,
-	).run(ctx)
+	)
+	// Supplied here rather than taken as a constructor argument so that every
+	// existing test building a scheduler keeps working unchanged, and so a test
+	// that wants to drive the check can substitute one.
+	scheduler.schema = func(ctx context.Context) inventory.SchemaCheck {
+		return inventory.CheckSchema(ctx, dyn)
+	}
+	scheduler.run(ctx)
 
 	return nil
 }

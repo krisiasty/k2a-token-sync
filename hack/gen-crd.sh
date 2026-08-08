@@ -16,6 +16,6 @@ cd "$(dirname "$0")/.."
 go run "sigs.k8s.io/controller-tools/cmd/controller-gen@${CONTROLLER_GEN_VERSION}" \
   crd \
   paths=./api/... \
-  output:crd:dir=charts/k2a-token-sync/crds
+  output:crd:dir=charts/k2a-token-sync-crds/files
 
-echo "wrote charts/k2a-token-sync/crds"
+echo "wrote charts/k2a-token-sync-crds/files"

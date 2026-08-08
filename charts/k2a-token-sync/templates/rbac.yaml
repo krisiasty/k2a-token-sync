@@ -103,3 +103,46 @@ subjects:
     name: {{ $name }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+---
+# The one cluster-scoped permission k2a-token-sync holds on the cluster it runs
+# in, and it is a single read.
+#
+# It is here so the tool can compare the CRD's schema against the fields this
+# binary knows about. Helm never upgraded a crds/ directory, so a schema could
+# fall behind the binary; the API server then prunes spec fields it does not
+# recognise, and a connection asking for a restricted clusterRole silently
+# resolves to cluster-admin instead. Nothing else can notice that: from inside,
+# a pruned field is indistinguishable from one nobody set.
+#
+# resourceNames is what keeps this narrow, and is not decoration: without it
+# this would read every CRD in the cluster rather than the one it owns. Even
+# so, the marginal exposure is nil — the built-in system:discovery role already
+# lets every authenticated identity read the same schema through /openapi, so
+# this grants access to nothing that was not already reachable. What it buys is
+# a stable API and no dependency on an OpenAPI naming convention.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    resourceNames: ["clusterconnections.k2a-token-sync.io"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "k2a-token-sync.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}

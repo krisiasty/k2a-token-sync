@@ -42,6 +42,17 @@ const (
 	// registration at a different cluster and looks exactly like the documented
 	// migration.
 	ConditionSecretExclusivelyOwned = "SecretExclusivelyOwned"
+
+	// ConditionSchemaCurrent reports whether the CRD serving this object matches
+	// the k2a-token-sync build reconciling it.
+	//
+	// It is process-wide rather than per-connection — one schema serves them all
+	// — but it is reported on every connection because that is where it is
+	// visible. Somebody who set a field and saw nothing happen looks at the
+	// object, not at the process, and a pruned field leaves no other trace: from
+	// inside, a field the API server discarded is indistinguishable from one
+	// nobody set.
+	ConditionSchemaCurrent = "SchemaCurrent"
 )
 
 // Reasons accompanying those conditions. They are read by operators far more
@@ -71,6 +82,16 @@ const (
 	// and nothing was refused: the cluster is working, and the spec is simply
 	// ahead of what has been applied to it.
 	ReasonRoleRefImmutable = "RoleRefImmutable"
+
+	// ReasonSchemaOutdated means the CRD predates this build, so the API server
+	// is discarding fields set on connections. The message names them: which
+	// settings are being ignored is the whole of what an operator needs.
+	ReasonSchemaOutdated = "SchemaOutdated"
+
+	// ReasonSchemaUnverified means the CRD could not be read, so whether it
+	// matches is unknown. Distinct from Outdated: the usual cause is an upgrade
+	// that reached the image before the chart, where nothing is wrong yet.
+	ReasonSchemaUnverified = "SchemaUnverified"
 
 	// ReasonReconcileFailed is the reason for a failure this tool cannot place.
 	//
