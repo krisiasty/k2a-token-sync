@@ -466,23 +466,39 @@ spec:
 [`examples/cluster-connection.yaml`](examples/cluster-connection.yaml) spells out every field, and the test suite parses
 it so it cannot drift from the API.
 
-Two things a schema cannot check are checked by k2a-token-sync and reported on the object: a name long enough to make the
-Secret names derived from it invalid, and two connections claiming one `secretName`, which would have them silently
-overwrite each other.
+Three things a schema cannot check are checked by k2a-token-sync and reported on the object: a name long enough to make
+the Secret names derived from it invalid, two connections claiming one `secretName`, and two connections naming one
+downstream cluster. The last two span objects, which is exactly what admission cannot see.
 
-A contested `secretName` stops **every** claimant, not just the newcomer. Picking one would mean picking by list order,
-which is alphabetical and has nothing to do with ownership: a connection added later but named earlier would take over a
-Secret another cluster is registered under, republish it against its own endpoint, and leave the dispossessed one
-excluded from reconciliation with its status frozen. ArgoCD would go on trusting a registration now pointing somewhere
-else. There is no answer to which claimant should win that this tool can safely invent, so it declines to choose and
-writes nothing until one claim remains. That stalls a cluster; the alternative misdirects one.
+**One cluster takes one ClusterConnection.** Two that resolve to the same `endpoint` are a duplicate rather than two
+configurations of one cluster: they drive the same downstream ServiceAccount and the same ClusterRoleBinding — whose
+`roleRef` cannot be changed once set — and leave ArgoCD holding two registrations for one server URL, which is not
+something ArgoCD supports. The comparison is on the resolved endpoint rather than the written one, so `10.1.0.10` and
+`10.1.0.10:6443` are recognised as one cluster — which matters, because a duplicate usually comes from a second person
+adding a cluster they did not know was there, and is likelier to be spelled differently than identically. (The schema
+constrains `spec.endpoint` to a host with an optional port, so that is the only variation a stored object can carry.
+`bootstrap --endpoint` additionally accepts a `https://host:port/` URL, and normalises it before comparing.)
 
-Both verdicts are written to the object rather than only to this process's `/status`, because the object is where you
-will look. A spec that does not resolve gets `Ready=False` with reason `InvalidSpec`; a contested `secretName` gets
-`Ready=False` with reason `SecretNameConflict` and a separate `Conflict` condition whose message names the other
-claimants. `observedGeneration` records the generation that was rejected, so a spec you have since edited is
-distinguishable from one the verdict still applies to. Fixing the object clears both — including the conflict case, where
-the fix is deleting the *other* object and this one's spec never changes at all.
+A contested `secretName` or endpoint stops **every** claimant, not just the newcomer. Picking one would mean picking by
+list order, which is alphabetical and has nothing to do with ownership: a connection added later but named earlier would
+take over a Secret another cluster is registered under, republish it against its own endpoint, and leave the dispossessed
+one excluded from reconciliation with its status frozen. ArgoCD would go on trusting a registration now pointing
+somewhere else. There is no answer to which claimant should win that this tool can safely invent, so it declines to
+choose and writes nothing until one claim remains. That stalls a cluster; the alternative misdirects one.
+
+Every verdict is written to the object rather than only to this process's `/status`, because the object is where you will
+look. A spec that does not resolve gets `Ready=False` with reason `InvalidSpec`. A contested `secretName` gets
+`SecretNameConflict`, and a duplicated cluster `EndpointConflict`, each with a separate `Conflict` condition whose
+message names the other claimants — they are distinct reasons because the remedies differ: rename one Secret, or delete
+one duplicate. A pair that collides on both is reported as the duplicate it is, since renaming a Secret there would leave
+two registrations for one cluster, which is the same bug spelled differently. `observedGeneration` records the generation
+that was rejected, so a spec you have since edited is distinguishable from one the verdict still applies to. Fixing the
+object clears all of them — including the conflict cases, where the fix is deleting the *other* object and this one's
+spec never changes at all.
+
+`bootstrap` refuses a duplicate before it provisions anything, so the usual way of adding a cluster cannot create one.
+That check is a convenience rather than the boundary: connections committed to git and applied by ArgoCD never pass
+through it, which is why the rule lives in the reconciler as well.
 
 ### Adding a cluster
 
@@ -881,9 +897,9 @@ symptom.
 When a cluster is not `Ready`, three things answer it, in this order. The listing above says which cluster and for how
 long. `kubectl describe ccon <name>` gives the reason — `AwaitingCredential` for one that has not been bootstrapped,
 `CredentialExpired` for one whose own credential lapsed, `CertificateInvalid` for an endpoint whose certificate cannot
-work, `InvalidSpec` or `SecretNameConflict` for one that is not being reconciled at all — alongside `lastAction`, which
-says what the most recent pass actually did, or why there was not one. The logs then carry the underlying error, usually
-the downstream API server's own words.
+work, `InvalidSpec`, `SecretNameConflict` or `EndpointConflict` for one that is not being reconciled at all — alongside
+`lastAction`, which says what the most recent pass actually did, or why there was not one. The logs then carry the
+underlying error, usually the downstream API server's own words.
 
 Generated cluster Secrets also carry annotations you can read with `kubectl`:
 
@@ -994,7 +1010,7 @@ rather than states are recorded there too.
 | `IdentityRestored` | Warning | ArgoCD's downstream ServiceAccount or its binding was missing and has been recreated |
 | `RenewalMintFailed`, `RenewalUnverified`, `RenewalNotStored` | Warning | This tool cannot renew its own credential |
 | `RenewalRecovered` | Normal | It can again, after one of those |
-| `InvalidSpec`, `SecretNameConflict` | Warning | The object is not being reconciled, and why |
+| `InvalidSpec`, `SecretNameConflict`, `EndpointConflict` | Warning | The object is not being reconciled, and why |
 | `ReconciliationResumed` | Normal | That reason is resolved |
 | `ForeignFieldManager` | Warning | Something else manages the cluster Secret and no adoption was recorded — see [Migrating from `argocd cluster add`](#migrating-from-argocd-cluster-add) |
 

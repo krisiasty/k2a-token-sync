@@ -26,8 +26,9 @@ const (
 	// than at the end.
 	ConditionSelfCredentialValid = "SelfCredentialValid" //nolint:gosec // a condition type, not a credential
 
-	// ConditionConflict reports that another ClusterConnection claims the same
-	// secretName. Admission cannot see this, since it spans objects.
+	// ConditionConflict reports that another ClusterConnection claims something
+	// only one of them can own: the same secretName, or the same downstream
+	// cluster. Admission cannot see either, since both span objects.
 	ConditionConflict = "Conflict"
 
 	// ConditionSecretExclusivelyOwned reports whether k2a-token-sync is the only
@@ -67,6 +68,13 @@ const (
 	ReasonCredentialReplaced  = "CredentialReplaced" //nolint:gosec // a condition reason, not a credential
 	ReasonSecretNameConflict  = "SecretNameConflict"
 	ReasonInvalidSpec         = "InvalidSpec"
+
+	// ReasonEndpointConflict means two connections resolve to the same downstream
+	// cluster. Distinct from SecretNameConflict because the remedies differ: a
+	// contested Secret is two objects disagreeing about where to publish, and can
+	// be settled by renaming one, whereas two objects naming one cluster is a
+	// duplicate that has to be deleted.
+	ReasonEndpointConflict = "EndpointConflict"
 
 	// ReasonPermissionDenied means the API server answered and refused. It is
 	// distinct from EndpointUnreachable for the reason CredentialRejected is:

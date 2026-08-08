@@ -1,14 +1,23 @@
 package main
 
 import (
+	"io"
 	"reflect"
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/yaml"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
 	"github.com/krisiasty/k2a-token-sync/internal/config"
+	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 )
 
 // The rendered manifest is a user-facing artifact: --print writes it to stdout for
@@ -156,5 +165,103 @@ func TestAnUnscopedManifestStatesNoScoping(t *testing.T) {
 		if strings.Contains(string(raw), field) {
 			t.Errorf("the manifest states %q, which should be left to the schema's default:\n%s", field, raw)
 		}
+	}
+}
+
+// connectionAt builds a stored ClusterConnection for a named endpoint. Distinct
+// from remove_test.go's fixture, which pins every connection to one endpoint
+// because the endpoint is not what those tests vary.
+func connectionAt(name, endpoint string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "k2a-token-sync.io/v1alpha1",
+		"kind":       "ClusterConnection",
+		"metadata":   map[string]any{"name": name, "namespace": "k2a-token-sync"},
+		"spec":       map[string]any{"endpoint": endpoint},
+	}}
+}
+
+func inventoryOf(objects ...runtime.Object) dynamic.Interface {
+	return dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+		objects...,
+	)
+}
+
+func bootstrapClusterFor(t *testing.T, name, endpoint string) config.Cluster {
+	t.Helper()
+	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{Name: name, Endpoint: endpoint})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
+	}
+	return cluster
+}
+
+// Bootstrap is where a duplicate can still be prevented. Afterwards there is
+// nothing to prevent: both objects exist, k2a-token-sync stops both of them, and
+// the cluster that was working goes down with the one that was added by mistake.
+func TestBootstrapRefusesToRegisterAClusterTwice(t *testing.T) {
+	t.Parallel()
+
+	err := refuseDuplicateEndpoint(t.Context(),
+		inventoryOf(connectionAt("prod", "10.1.0.10:6443")),
+		"k2a-token-sync",
+		bootstrapClusterFor(t, "prod-copy", "10.1.0.10"),
+		&steps{w: io.Discard})
+	if err == nil {
+		t.Fatal("bootstrap accepted a second ClusterConnection for a cluster already registered")
+	}
+	// Naming the existing object is the whole value of refusing here: without it
+	// the operator knows only that something is in the way.
+	if !strings.Contains(err.Error(), "prod") {
+		t.Errorf("the refusal does not name the existing connection: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Nothing has been changed") {
+		t.Errorf("the refusal does not say the cluster was left alone: %v", err)
+	}
+}
+
+// Re-running bootstrap for a cluster already in the inventory is the documented
+// way to change one — to rotate a credential or re-scope a registration. It is
+// the same object, not a second claim, and treating it as a duplicate would make
+// every connection unmaintainable the moment it existed.
+func TestBootstrapStaysIdempotentForAClusterItAlreadyRegisters(t *testing.T) {
+	t.Parallel()
+
+	if err := refuseDuplicateEndpoint(t.Context(),
+		inventoryOf(connectionAt("prod", "10.1.0.10:6443")),
+		"k2a-token-sync",
+		bootstrapClusterFor(t, "prod", "10.1.0.10"),
+		&steps{w: io.Discard}); err != nil {
+		t.Errorf("re-running bootstrap for an existing cluster was refused: %v", err)
+	}
+}
+
+// An inventory that cannot be read is not evidence of a duplicate. The very first
+// bootstrap on an installation lands here whenever the CRD is not applied yet, and
+// refusing would make the tool impossible to start using. It warns and proceeds;
+// the daemon still catches what this misses.
+func TestBootstrapProceedsWhenTheInventoryCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{inventory.GroupVersionResource: "ClusterConnectionList"},
+	)
+	dyn.PrependReactor("list", "clusterconnections",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(
+				schema.GroupResource{Resource: "clusterconnections"}, "")
+		})
+
+	var out strings.Builder
+	if err := refuseDuplicateEndpoint(t.Context(), dyn, "k2a-token-sync",
+		bootstrapClusterFor(t, "first", "10.1.0.10"), &steps{w: &out}); err != nil {
+		t.Fatalf("bootstrap refused because it could not read the inventory: %v", err)
+	}
+	// Proceeding silently would be worse than refusing: the one check that could
+	// have caught a duplicate did not run, and nobody would know.
+	if !strings.Contains(out.String(), "unknown") {
+		t.Errorf("nothing was said about the check that could not run: %q", out.String())
 	}
 }

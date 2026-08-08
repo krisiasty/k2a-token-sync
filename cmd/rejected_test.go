@@ -108,6 +108,45 @@ func TestAContestedSecretIsWrittenAsAConflict(t *testing.T) {
 	}
 }
 
+// A duplicated cluster is the other verdict that names a neighbour, and it has to
+// reach the same condition. Written as Ready=False alone it would read as a
+// problem with this object's own spec, sending whoever finds it to edit a
+// perfectly correct endpoint.
+func TestADuplicatedClusterIsWrittenAsAConflict(t *testing.T) {
+	t.Parallel()
+
+	const reason = `endpoint "10.1.0.10:6443" is the same downstream cluster as "prod"; ` +
+		"one cluster takes one ClusterConnection, and none of them will be reconciled until one remains"
+
+	inv := newFakeInventory("prod-copy")
+	inv.invalid["prod-copy"] = reason
+	inv.cause["prod-copy"] = v1alpha1.ReasonEndpointConflict
+	s := testScheduler(t, inv, newFakeReconciler())
+
+	s.tick(t.Context())
+
+	written, ok := inv.written["prod-copy"]
+	if !ok {
+		t.Fatal("no status was written for a duplicated cluster")
+	}
+
+	conflict := condition(t, written, v1alpha1.ConditionConflict)
+	if conflict.Status != metav1.ConditionTrue {
+		t.Errorf("Conflict is %s, want True", conflict.Status)
+	}
+	if conflict.Reason != v1alpha1.ReasonEndpointConflict {
+		t.Errorf("Conflict reason is %q, want %q", conflict.Reason, v1alpha1.ReasonEndpointConflict)
+	}
+	if conflict.Message != reason {
+		t.Errorf("Conflict message is %q, want the message naming the duplicate", conflict.Message)
+	}
+
+	ready := condition(t, written, v1alpha1.ConditionReady)
+	if ready.Status != metav1.ConditionFalse || ready.Reason != v1alpha1.ReasonEndpointConflict {
+		t.Errorf("Ready is %s/%s, want False/%s", ready.Status, ready.Reason, v1alpha1.ReasonEndpointConflict)
+	}
+}
+
 // The verdict is written once, not every poll. A rejected object is a steady
 // state, and one that generated a write every thirty seconds would produce an
 // endless stream of resourceVersion churn and events for a cluster where nothing

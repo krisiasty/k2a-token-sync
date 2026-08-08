@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/yaml"
@@ -199,6 +200,10 @@ Flags:
 	if err != nil {
 		return err
 	}
+	localDyn, err := kubeclient.DynamicClientForContext(*kubeconfig, *kubeContext)
+	if err != nil {
+		return err
+	}
 
 	// Output is grouped by cluster, because "where did that happen" is the first
 	// question a reader has when a command touches two of them. Each heading names
@@ -256,6 +261,12 @@ Flags:
 		return err
 	}
 	adopted := target.recordsAdoption(*adopt)
+
+	// And for the same reason again, one object further out: a second connection
+	// for a cluster already registered is refused before anything is provisioned.
+	if err := refuseDuplicateEndpoint(ctx, localDyn, *namespace, cluster, out); err != nil {
+		return err
+	}
 
 	if *dryRun {
 		if replacing {
@@ -335,7 +346,7 @@ Flags:
 		return printConnection(cluster, *namespace, adopted)
 	}
 
-	if err := applyConnection(ctx, cluster, *namespace, *kubeconfig, *kubeContext, adopted); err != nil {
+	if err := applyConnection(ctx, localDyn, cluster, *namespace, adopted); err != nil {
 		return err
 	}
 	out.stepf("connection", "%s", *namespace+"/"+cluster.Name)
@@ -621,6 +632,54 @@ func printConnection(cluster config.Cluster, namespace string, adopted bool) err
 	return nil
 }
 
+// refuseDuplicateEndpoint stops a bootstrap that would put a second
+// ClusterConnection on a cluster one already registers.
+//
+// Here for the reason the registration check above is here: this is the point at
+// which a duplicate can be prevented rather than reported. k2a-token-sync notices
+// it too, but only once both objects exist — and then it stops both of them,
+// including the one that was working.
+//
+// The comparison goes through the inventory rather than over the raw spec, so
+// bootstrap and the daemon cannot disagree about which endpoints are one cluster:
+// "10.1.0.10" and "https://10.1.0.10:6443/" resolve identically, and a duplicate
+// written the other way round is still a duplicate.
+func refuseDuplicateEndpoint(
+	ctx context.Context,
+	dyn dynamic.Interface,
+	namespace string,
+	cluster config.Cluster,
+	out *steps,
+) error {
+	entries, err := inventory.NewClient(dyn, namespace).List(ctx)
+	if err != nil {
+		// An inventory that cannot be read is not evidence of a duplicate, and
+		// refusing on it would block the first bootstrap on an installation where the
+		// CRD has not been applied yet — which is every installation, once. The
+		// daemon still catches whatever this misses.
+		out.warnf("could not read the ClusterConnections in %s, so whether this cluster is already registered "+
+			"is unknown: %v", namespace, err)
+		return nil
+	}
+
+	for _, entry := range entries {
+		// Re-running bootstrap for a cluster already in the inventory is the
+		// documented way to change one, and has to stay idempotent. It is the same
+		// object, not a second claim on the same cluster.
+		if entry.Cluster.Name == cluster.Name || entry.Cluster.Endpoint != cluster.Endpoint {
+			continue
+		}
+		return fmt.Errorf("%s/%s already registers %s.\n"+
+			"  One cluster takes one ClusterConnection. Two contend over the same downstream ServiceAccount and "+
+			"ClusterRoleBinding, and leave ArgoCD holding two registrations for one server URL.\n"+
+			"  Re-run with --cluster %s to change that connection, or remove it first with "+
+			"'k2a-token-sync remove --cluster %s'.\n"+
+			"  Nothing has been changed",
+			namespace, entry.Cluster.Name, cluster.ServerURL(), entry.Cluster.Name, entry.Cluster.Name)
+	}
+	return nil
+}
+
 // applyConnection puts the object into the cluster. Server-side apply means this
 // both creates and updates, so re-running bootstrap for a cluster is safe.
 //
@@ -628,15 +687,11 @@ func printConnection(cluster config.Cluster, namespace string, adopted bool) err
 // generated clientset is needed to write one object.
 func applyConnection(
 	ctx context.Context,
+	dyn dynamic.Interface,
 	cluster config.Cluster,
-	namespace, kubeconfig, kubeContext string,
+	namespace string,
 	adopted bool,
 ) error {
-	dyn, err := kubeclient.DynamicClientForContext(kubeconfig, kubeContext)
-	if err != nil {
-		return err
-	}
-
 	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(connectionFor(cluster, namespace, adopted))
 	if err != nil {
 		return fmt.Errorf("encoding the ClusterConnection: %w", err)

@@ -211,15 +211,15 @@ func TestASecondConnectionSharingTheEndpointBlocksTheDownstreamHalf(t *testing.T
 	}
 }
 
-// Two ClusterConnections that share both a downstream endpoint and an
-// explicit secretName are marked InvalidReason by
-// inventory.Client.List's blockContestedSecrets — for the secretName
-// conflict, a problem of its own. That must not make the collision guard
-// blind to the endpoint the two also share: skipping an invalid entry here
-// would let the downstream half be torn down for a connection another,
-// still-endpoint-resolved spec depends on, which is exactly the outcome this
-// guard exists to prevent.
-func TestEndpointCollisionCatchesAContestedSecretPairEvenThoughBothAreInvalid(t *testing.T) {
+// Every pair this guard exists to catch is marked InvalidReason by
+// inventory.Client.List, which blocks both halves of a shared endpoint
+// outright — so filtering entries on InvalidReason rather than on a missing
+// endpoint would leave the guard permanently blind, and tear the downstream
+// half down for a connection another spec still depends on. That is the exact
+// case removing one of two duplicates is meant to fix, so it has to hold on a
+// pair contesting a secretName as well, where the verdict names the endpoint
+// and the Secret collision is never reported at all.
+func TestEndpointCollisionCatchesADuplicatePairEvenThoughBothAreInvalid(t *testing.T) {
 	t.Parallel()
 
 	inv := newTestInventory(
@@ -227,8 +227,8 @@ func TestEndpointCollisionCatchesAContestedSecretPairEvenThoughBothAreInvalid(t 
 		connectionObject("standalone-1-duplicate", "shared-secret", nil),
 	)
 
-	// Sanity check: both entries really are marked invalid by the
-	// secretName conflict, so this test is exercising the case it claims to.
+	// Sanity check: both entries really are marked invalid, so this test is
+	// exercising the case it claims to.
 	entries, err := inv.List(t.Context())
 	if err != nil {
 		t.Fatalf("List returned unexpected error: %v", err)
