@@ -136,9 +136,11 @@ func (c *Client) List(ctx context.Context) ([]Entry, error) {
 // preference, so it is refused rather than resolved.
 //
 // The comparison is on the resolved endpoint, not the written one: FromSpec has
-// already turned "10.1.0.10", "10.1.0.10:6443" and "https://10.1.0.10:6443/" into
-// one value, so two spellings of one cluster are caught along with two copies of
-// one spelling.
+// already defaulted the port, so "10.1.0.10" and "10.1.0.10:6443" are caught as
+// one cluster along with two copies of one spelling. That is the only variation
+// reachable here — the schema constrains spec.endpoint to a host with an optional
+// port, so the https:// form FromSpec also accepts is rejected at admission and
+// only bootstrap's --endpoint flag ever carries it.
 func blockContestedEndpoints(entries []Entry) {
 	blockContested(entries, v1alpha1.ReasonEndpointConflict,
 		func(e Entry) string { return e.Cluster.Endpoint },

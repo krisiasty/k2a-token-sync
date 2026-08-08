@@ -192,10 +192,16 @@ func TestBothClaimantsAreBlockedWhenTwoConnectionsNameOneCluster(t *testing.T) {
 	}
 }
 
-// The variant that a check on the written value would miss entirely. These three
-// spellings are one API server, and a duplicate is far more likely to be written
-// differently than identically — it is usually a second person adding a cluster
-// they did not know was there.
+// The variant a check on the written value would miss entirely. These spellings
+// are one API server, and a duplicate is far more likely to be written differently
+// than identically — it is usually a second person adding a cluster they did not
+// know was there.
+//
+// The bare and ported forms are what a stored object can carry; the schema
+// constrains spec.endpoint to a host with an optional port. The URL form is here
+// because FromSpec accepts it for 'bootstrap --endpoint', and this is the
+// resolution both paths share — a fixture goes straight to the resolver, so
+// nothing here is claiming the API server would accept that third object.
 func TestEndpointsThatDifferOnlyInSpellingAreOneCluster(t *testing.T) {
 	t.Parallel()
 

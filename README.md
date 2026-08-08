@@ -473,9 +473,11 @@ downstream cluster. The last two span objects, which is exactly what admission c
 **One cluster takes one ClusterConnection.** Two that resolve to the same `endpoint` are a duplicate rather than two
 configurations of one cluster: they drive the same downstream ServiceAccount and the same ClusterRoleBinding — whose
 `roleRef` cannot be changed once set — and leave ArgoCD holding two registrations for one server URL, which is not
-something ArgoCD supports. The comparison is on the resolved endpoint, so `10.1.0.10`, `10.1.0.10:6443` and
-`https://10.1.0.10:6443/` are recognised as one cluster; a duplicate is far likelier to be spelled differently than
-identically, since it usually comes from a second person adding a cluster they did not know was there.
+something ArgoCD supports. The comparison is on the resolved endpoint rather than the written one, so `10.1.0.10` and
+`10.1.0.10:6443` are recognised as one cluster — which matters, because a duplicate usually comes from a second person
+adding a cluster they did not know was there, and is likelier to be spelled differently than identically. (The schema
+constrains `spec.endpoint` to a host with an optional port, so that is the only variation a stored object can carry.
+`bootstrap --endpoint` additionally accepts a `https://host:port/` URL, and normalises it before comparing.)
 
 A contested `secretName` or endpoint stops **every** claimant, not just the newcomer. Picking one would mean picking by
 list order, which is alphabetical and has nothing to do with ownership: a connection added later but named earlier would
