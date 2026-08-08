@@ -61,7 +61,7 @@ jobs:
       - name: crd schema is current
         run: |
           ./hack/gen-crd.sh
-          git diff --exit-code -- charts/k2a-token-sync/crds
+          git diff --exit-code -- charts/k2a-token-sync-crds/files
 
       - name: shellcheck
         run: shellcheck hack/*.sh
@@ -146,12 +146,45 @@ jobs:
           # A here-string rather than a pipe into grep -q: grep exits on the first
           # match, the writer takes SIGPIPE, and under pipefail the pipeline reports
           # 141 for a check that actually succeeded.
-          for kind in CustomResourceDefinition Deployment Role RoleBinding Service ServiceAccount; do
+          for kind in ClusterRole ClusterRoleBinding Deployment Role RoleBinding Service ServiceAccount; do
             if ! grep -qx "kind: ${kind}" <<<"${rendered}"; then
-              echo "::error::the chart rendered no ${kind}"
+              echo "::error::the app chart rendered no ${kind}"
               exit 1
             fi
           done
+          # The CRD moved to its own chart, so the app chart must no longer
+          # carry one. Rendering both would mean two releases fighting over a
+          # cluster-scoped object.
+          if grep -qx "kind: CustomResourceDefinition" <<<"${rendered}"; then
+            echo "::error::the app chart still renders a CustomResourceDefinition"
+            exit 1
+          fi
+
+      # The schema now ships separately, so nothing above would notice it going
+      # missing — which is the same gap the check above exists to close.
+      - name: the crds chart ships the schema, and protects it
+        run: |
+          set -euo pipefail
+          rendered=$(helm template k2a-token-sync-crds charts/k2a-token-sync-crds)
+          if ! grep -qx "kind: CustomResourceDefinition" <<<"${rendered}"; then
+            echo "::error::the crds chart rendered no CustomResourceDefinition"
+            exit 1
+          fi
+          # Losing either annotation means a helm uninstall or a deleted ArgoCD
+          # Application takes every ClusterConnection with it, and each one is
+          # the only record of a cluster's registration.
+          for annotation in "helm.sh/resource-policy: keep" "argocd.argoproj.io/sync-options: Delete=false,Prune=false"; do
+            if ! grep -qF "${annotation}" <<<"${rendered}"; then
+              echo "::error::the CRD is missing its deletion guard: ${annotation}"
+              exit 1
+            fi
+          done
+          # And the toggle has to actually toggle, or the value is decoration.
+          off=$(helm template k2a-token-sync-crds charts/k2a-token-sync-crds --set crds.keep=false)
+          if grep -qF "helm.sh/resource-policy: keep" <<<"${off}"; then
+            echo "::error::crds.keep=false still rendered the keep policy"
+            exit 1
+          fi
 
       # The alert rules are off by default, so the step above cannot see them and
       # a template that was never committed would render fine locally and vanish

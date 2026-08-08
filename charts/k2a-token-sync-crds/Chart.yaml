@@ -1,0 +1,20 @@
+apiVersion: v2
+name: k2a-token-sync-crds
+description: The ClusterConnection CRD that k2a-token-sync reads its inventory from
+type: application
+# The version of this chart, which carries a schema rather than a binary — so
+# there is even less reason for an appVersion here than in the application
+# chart. Bump it when the schema changes, which is what tells an operator there
+# is something to apply.
+#
+# Deliberately a separate chart. Helm never upgrades a crds/ directory, so a
+# schema shipped that way is applied by hand on every release that changes it.
+# In templates/ it is an ordinary resource and 'helm upgrade' maintains it.
+version: 0.1.0
+home: https://github.com/krisiasty/k2a-token-sync
+sources:
+  - https://github.com/krisiasty/k2a-token-sync
+keywords:
+  - argocd
+  - kubernetes
+  - crd

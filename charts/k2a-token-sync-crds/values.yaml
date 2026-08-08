@@ -1,0 +1,16 @@
+crds:
+  # Keep the CustomResourceDefinition when this release is removed.
+  #
+  # Deleting it deletes every ClusterConnection with it, and each one is the
+  # only record of a cluster's registration: recovering means re-running
+  # bootstrap against every downstream cluster, with administrative credentials
+  # for each. That is not something a mistyped 'helm uninstall' or a deleted
+  # ArgoCD Application should be able to cause.
+  #
+  # Two annotations are needed, because the two deployment paths honour
+  # different ones. helm.sh/resource-policy is read by 'helm uninstall' and is
+  # invisible to ArgoCD, which never runs it — it renders with 'helm template',
+  # applies the output, and prunes from its own tracking.
+  #
+  # Turning this off is the deliberate act that makes the CRD removable.
+  keep: true
