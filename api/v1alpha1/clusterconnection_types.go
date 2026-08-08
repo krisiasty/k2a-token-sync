@@ -63,6 +63,15 @@ const (
 	// two send whoever reads it to opposite ends of the problem.
 	ReasonPermissionDenied = "PermissionDenied"
 
+	// ReasonRoleRefImmutable means spec.clusterRole was changed on a connection
+	// whose binding already exists. Kubernetes will not repoint a roleRef, and
+	// k2a-token-sync holds bind on the previous role only, so this is one of the
+	// few states it cannot reconcile its way out of — only bootstrap can, and the
+	// message says so. Distinct from PermissionDenied because nothing is broken
+	// and nothing was refused: the cluster is working, and the spec is simply
+	// ahead of what has been applied to it.
+	ReasonRoleRefImmutable = "RoleRefImmutable"
+
 	// ReasonReconcileFailed is the reason for a failure this tool cannot place.
 	//
 	// It deliberately names no cause. Every unclassified failure used to report
@@ -220,6 +229,55 @@ type ClusterConnectionSpec struct {
 	//
 	// +optional
 	Project string `json:"project,omitempty"`
+
+	// ClusterRole is the downstream ClusterRole ArgoCD's identity is bound to.
+	//
+	// The default is what `argocd cluster add` installs and what every
+	// registration held before this field existed. Naming a narrower role is the
+	// supported way to give ArgoCD less than cluster-admin — the role itself is
+	// yours to create and maintain, since only you know what your Applications
+	// need.
+	//
+	// Changing this on a live connection cannot be applied by k2a-token-sync.
+	// A ClusterRoleBinding's roleRef is immutable, so the binding has to be
+	// replaced, and k2a-token-sync holds bind on the previous role only. Re-run
+	// bootstrap with --replace-binding, which has the credentials to do both.
+	//
+	// +optional
+	// +kubebuilder:default="cluster-admin"
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9.:]*[a-z0-9])?$`
+	ClusterRole string `json:"clusterRole,omitempty"`
+
+	// Namespaces optionally restricts ArgoCD to these namespaces on this
+	// cluster. Empty — the default — means every namespace, which is what a
+	// registration meant before this field existed.
+	//
+	// This is ArgoCD's own scoping, written into the cluster Secret it reads. It
+	// is not a substitute for ClusterRole: it governs what ArgoCD will attempt,
+	// while the role governs what the API server will permit. Setting one
+	// without the other is legitimate, and they answer different questions.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespaces []string `json:"namespaces,omitempty"`
+
+	// ClusterResources permits ArgoCD to manage cluster-scoped resources on a
+	// connection restricted with Namespaces.
+	//
+	// A pointer rather than a plain bool so that "unset" and "false" stay
+	// distinguishable: the key is written into ArgoCD's Secret only when it was
+	// asked for, and a registration that never mentioned it must keep producing
+	// exactly the Secret it produced before.
+	//
+	// It means nothing without Namespaces — an unrestricted registration already
+	// covers cluster-scoped resources — and is rejected in that combination
+	// rather than written and silently ignored.
+	//
+	// +optional
+	ClusterResources *bool `json:"clusterResources,omitempty"`
 
 	// ServiceAccount is the downstream identity ArgoCD authenticates as. The
 	// default matches what `argocd cluster add` installs, so an existing

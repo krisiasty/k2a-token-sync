@@ -40,6 +40,12 @@ const (
 	defaultServiceAccountNS   = "kube-system"
 	defaultSelfServiceAccount = "k2a-token-sync"
 
+	// defaultClusterRole is what `argocd cluster add` binds, and what every
+	// registration bound before the role could be chosen. Keeping it as the
+	// default is what makes an existing ClusterConnection produce byte-identical
+	// output after this field was added.
+	defaultClusterRole = DefaultClusterRole
+
 	minTokenTTL = 1 * time.Hour
 
 	// maxClusterNameLength keeps every name derived from a cluster's name a
@@ -47,6 +53,14 @@ const (
 	// both Secret names.
 	maxClusterNameLength = 63
 )
+
+// DefaultClusterRole is what `argocd cluster add` binds and what a connection
+// binds unless it names something narrower.
+//
+// Exported because bootstrap compares against it: a printed manifest must not
+// state the default explicitly, or it freezes today's value into a file that
+// outlives it.
+const DefaultClusterRole = "cluster-admin"
 
 // Config is the resolved process configuration.
 type Config struct {
@@ -107,6 +121,21 @@ type Cluster struct {
 
 	// Project optionally scopes the cluster to a single ArgoCD project.
 	Project string
+
+	// ClusterRole is the downstream ClusterRole ArgoCD's identity is bound to,
+	// and the role k2a-token-sync holds bind on so it can restore that binding.
+	// Defaults to cluster-admin, which is what every registration had before it
+	// could be chosen.
+	ClusterRole string
+
+	// Namespaces optionally restricts ArgoCD to these namespaces, written into
+	// the cluster Secret ArgoCD reads. Empty means every namespace.
+	Namespaces []string
+
+	// ClusterResources permits cluster-scoped resources on a namespace-scoped
+	// registration. Nil means the operator never mentioned it, which is not the
+	// same as false: only a value that was asked for reaches ArgoCD's Secret.
+	ClusterResources *bool
 
 	// AdoptedRegistration records that this connection's ArgoCD cluster Secret was
 	// deliberately taken over rather than created, so that a co-owner found on it is
@@ -194,6 +223,18 @@ func FromSpec(name string, spec v1alpha1.ClusterConnectionSpec) (Cluster, error)
 	out.Labels = spec.Labels
 	out.Annotations = spec.Annotations
 	out.Project = spec.Project
+	out.ClusterRole = orDefault(spec.ClusterRole, defaultClusterRole)
+	out.Namespaces = spec.Namespaces
+	out.ClusterResources = spec.ClusterResources
+
+	// Rejected rather than written and ignored. ArgoCD reads clusterResources
+	// only for a namespace-scoped registration; on an unrestricted one it is
+	// already implied, so accepting it would hand back a Secret that quietly
+	// disagrees with the spec that produced it.
+	if out.ClusterResources != nil && len(out.Namespaces) == 0 {
+		return out, errors.New("clusterResources has no meaning without namespaces: " +
+			"a registration that is not restricted to namespaces already covers cluster-scoped resources")
+	}
 
 	out.ServiceAccount = ServiceAccountRef{Name: defaultServiceAccountName, Namespace: defaultServiceAccountNS}
 	if spec.ServiceAccount != nil {

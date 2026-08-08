@@ -92,6 +92,38 @@ spec:
                   writes only the values it observed while continuing to reconcile the
                   connection.
                 type: object
+              clusterResources:
+                description: |-
+                  ClusterResources permits ArgoCD to manage cluster-scoped resources on a
+                  connection restricted with Namespaces.
+
+                  A pointer rather than a plain bool so that "unset" and "false" stay
+                  distinguishable: the key is written into ArgoCD's Secret only when it was
+                  asked for, and a registration that never mentioned it must keep producing
+                  exactly the Secret it produced before.
+
+                  It means nothing without Namespaces — an unrestricted registration already
+                  covers cluster-scoped resources — and is rejected in that combination
+                  rather than written and silently ignored.
+                type: boolean
+              clusterRole:
+                default: cluster-admin
+                description: |-
+                  ClusterRole is the downstream ClusterRole ArgoCD's identity is bound to.
+
+                  The default is what `argocd cluster add` installs and what every
+                  registration held before this field existed. Naming a narrower role is the
+                  supported way to give ArgoCD less than cluster-admin — the role itself is
+                  yours to create and maintain, since only you know what your Applications
+                  need.
+
+                  Changing this on a live connection cannot be applied by k2a-token-sync.
+                  A ClusterRoleBinding's roleRef is immutable, so the binding has to be
+                  replaced, and k2a-token-sync holds bind on the previous role only. Re-run
+                  bootstrap with --replace-binding, which has the credentials to do both.
+                maxLength: 253
+                pattern: ^[a-z0-9]([-a-z0-9.:]*[a-z0-9])?$
+                type: string
               displayName:
                 description: DisplayName is the name ArgoCD shows. Defaults to the
                   object's name.
@@ -122,6 +154,22 @@ spec:
                   app.kubernetes.io/managed-by keys are ignored; k2a-token-sync always writes
                   its required values while continuing to reconcile the connection.
                 type: object
+              namespaces:
+                description: |-
+                  Namespaces optionally restricts ArgoCD to these namespaces on this
+                  cluster. Empty — the default — means every namespace, which is what a
+                  registration meant before this field existed.
+
+                  This is ArgoCD's own scoping, written into the cluster Secret it reads. It
+                  is not a substitute for ClusterRole: it governs what ArgoCD will attempt,
+                  while the role governs what the API server will permit. Setting one
+                  without the other is legitimate, and they answer different questions.
+                items:
+                  maxLength: 63
+                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                  type: string
+                maxItems: 100
+                type: array
               project:
                 description: Project optionally scopes the cluster to a single ArgoCD
                   project.

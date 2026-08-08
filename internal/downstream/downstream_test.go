@@ -2,6 +2,7 @@ package downstream
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -24,7 +25,7 @@ func TestEnsureArgoCDIdentityIsIdempotent(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
 
-	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager", clusterAdminRole)
 	if err != nil {
 		t.Fatalf("first call returned unexpected error: %v", err)
 	}
@@ -51,7 +52,7 @@ func TestEnsureArgoCDIdentityIsIdempotent(t *testing.T) {
 	// A second pass must be a no-op, and this now runs on every single pass rather
 	// than only when a credential is due — so a spurious "repaired" here would
 	// reissue ArgoCD's credential every five minutes, forever.
-	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager", clusterAdminRole)
 	if err != nil {
 		t.Fatalf("second call returned unexpected error: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestEnsureArgoCDIdentityDistinguishesWhatItRepaired(t *testing.T) {
 	ctx := context.Background()
 	client := fake.NewSimpleClientset()
 
-	if _, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager"); err != nil {
+	if _, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager", clusterAdminRole); err != nil {
 		t.Fatalf("setup returned unexpected error: %v", err)
 	}
 
@@ -80,7 +81,7 @@ func TestEnsureArgoCDIdentityDistinguishesWhatItRepaired(t *testing.T) {
 		t.Fatalf("deleting the binding: %v", err)
 	}
 
-	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	repairs, err := EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager", clusterAdminRole)
 	if err != nil {
 		t.Fatalf("EnsureArgoCDIdentity returned unexpected error: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestEnsureArgoCDIdentityDistinguishesWhatItRepaired(t *testing.T) {
 		t.Fatalf("deleting the serviceaccount: %v", err)
 	}
 
-	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager")
+	repairs, err = EnsureArgoCDIdentity(ctx, client, "kube-system", "argocd-manager", clusterAdminRole)
 	if err != nil {
 		t.Fatalf("EnsureArgoCDIdentity returned unexpected error: %v", err)
 	}
@@ -128,8 +129,18 @@ func TestEnsureClusterRoleBindingRefusesToRewriteForeignBinding(t *testing.T) {
 	if err == nil {
 		t.Fatal("EnsureClusterRoleBinding overwrote a binding pointing at another role")
 	}
-	if !strings.Contains(err.Error(), "already binds") {
-		t.Errorf("error = %q, want it to explain the conflicting role", err)
+	// The message is what an operator acts on, so it has to name both roles and
+	// the remedy. "Resolve manually" was true and useless: nothing in it said
+	// that a roleRef cannot be edited, or that k2a-token-sync holds bind on the
+	// old role only, which together are why bootstrap is the one thing that can
+	// finish the job.
+	if !errors.Is(err, ErrRoleRefImmutable) {
+		t.Errorf("error = %v, want it to wrap ErrRoleRefImmutable so the caller can name a condition reason", err)
+	}
+	for _, want := range []string{"view", clusterAdminRole, "immutable", "--replace-binding"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q:\n%v", want, err)
+		}
 	}
 }
 
@@ -241,7 +252,7 @@ func TestEnsureSelfIdentityGrantsOnlyWhatIsNeeded(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	ctx := context.Background()
 
-	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
+	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync", clusterAdminRole); err != nil {
 		t.Fatalf("EnsureSelfIdentity returned unexpected error: %v", err)
 	}
 
@@ -268,7 +279,7 @@ func TestEnsureSelfIdentityGrantsOnlyWhatIsNeeded(t *testing.T) {
 	}
 
 	// Idempotent: this runs on the bootstrap path and must tolerate re-runs.
-	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync"); err != nil {
+	if err := EnsureSelfIdentity(ctx, client, "kube-system", "k2a-token-sync", clusterAdminRole); err != nil {
 		t.Fatalf("second EnsureSelfIdentity returned unexpected error: %v", err)
 	}
 }
@@ -390,9 +401,10 @@ func TestSelfRulesCanBindTheRoleItHasToRestore(t *testing.T) {
 	t.Parallel()
 
 	var bind *rbacv1.PolicyRule
-	for i, rule := range selfRules() {
+	rules := selfRules(clusterAdminRole)
+	for i, rule := range rules {
 		if slices.Contains(rule.Resources, "clusterroles") && slices.Contains(rule.Verbs, "bind") {
-			bind = &selfRules()[i]
+			bind = &rules[i]
 			break
 		}
 	}
@@ -414,5 +426,51 @@ func TestSelfRulesCanBindTheRoleItHasToRestore(t *testing.T) {
 	}
 	if !slices.Contains(bind.APIGroups, rbacv1.GroupName) {
 		t.Errorf("bind rule apiGroups = %v, want %q", bind.APIGroups, rbacv1.GroupName)
+	}
+}
+
+// A connection may name a role narrower than cluster-admin, and the bind grant
+// has to follow it. Pinned to cluster-admin, a scoped registration would lose
+// the self-heal #57 restored: the identity could create no binding at all for
+// the role it was actually asked to bind, and would fail on every pass exactly
+// as it did before that fix.
+func TestSelfRulesBindFollowsTheConfiguredRole(t *testing.T) {
+	t.Parallel()
+
+	for _, role := range []string{clusterAdminRole, "argocd-restricted", "some.group:reader"} {
+		var found bool
+		for _, rule := range selfRules(role) {
+			if slices.Contains(rule.Verbs, "bind") {
+				found = true
+				if !slices.Contains(rule.ResourceNames, role) {
+					t.Errorf("selfRules(%q): bind resourceNames = %v, which does not name it",
+						role, rule.ResourceNames)
+				}
+				if len(rule.ResourceNames) != 1 {
+					t.Errorf("selfRules(%q): bind names %d roles, want exactly the one it binds",
+						role, len(rule.ResourceNames))
+				}
+			}
+		}
+		if !found {
+			t.Errorf("selfRules(%q) has no bind rule", role)
+		}
+	}
+}
+
+// Every configuration path defaults the role, so an empty one means a caller
+// left the field unset. Binding to "" would create a binding granting nothing,
+// and the failure would surface later as ArgoCD getting 403s against a
+// registration that still looks healthy — so it is refused where the bug is,
+// the way MintToken refuses a zero lifetime.
+func TestAnUnsetClusterRoleIsRefusedRatherThanBoundToNothing(t *testing.T) {
+	t.Parallel()
+
+	client := fake.NewClientset()
+	if _, err := EnsureArgoCDIdentity(t.Context(), client, "kube-system", "argocd-manager", ""); err == nil {
+		t.Error("EnsureArgoCDIdentity bound ArgoCD's identity to an empty ClusterRole")
+	}
+	if err := EnsureSelfIdentity(t.Context(), client, "kube-system", "k2a-token-sync", ""); err == nil {
+		t.Error("EnsureSelfIdentity provisioned a bind rule naming no role")
 	}
 }

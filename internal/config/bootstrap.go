@@ -15,6 +15,14 @@ type BootstrapClusterInput struct {
 	ServiceAccountName      string
 	ServiceAccountNamespace string
 	SelfServiceAccountName  string
+
+	// ClusterRole, Namespaces and ClusterResources carry the scoping flags. Each
+	// is left at its zero value unless the operator asked for it, so FromSpec
+	// applies exactly the defaults the schema would and a bootstrap that named
+	// none of them produces what it always produced.
+	ClusterRole      string
+	Namespaces       []string
+	ClusterResources *bool
 }
 
 // BootstrapCluster builds a Cluster from command-line input.
@@ -40,6 +48,9 @@ func BootstrapCluster(in BootstrapClusterInput) (Cluster, error) {
 	spec := v1alpha1.ClusterConnectionSpec{
 		Endpoint:               in.Endpoint,
 		SelfServiceAccountName: in.SelfServiceAccountName,
+		ClusterRole:            in.ClusterRole,
+		Namespaces:             in.Namespaces,
+		ClusterResources:       in.ClusterResources,
 	}
 	// Left nil unless asked for, so FromSpec applies the same default the schema
 	// would rather than a half-populated reference.
