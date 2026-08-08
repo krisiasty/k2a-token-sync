@@ -120,9 +120,15 @@ Two credentials exist per cluster, and they are not interchangeable.
 | Created by | k2a-token-sync | bootstrap |
 | On expiry | k2a-token-sync mints another | k2a-token-sync is locked out; bootstrap again |
 
-**Why two.** k2a-token-sync never needs `cluster-admin`. Its own identity holds four rules: get and create ServiceAccounts,
-create `serviceaccounts/token`, get and create ClusterRoleBindings, and get exactly one ConfigMap — `kube-root-ca.crt`.
-That is enough to maintain ArgoCD's identity and read the cluster CA, and nothing else.
+**Why two.** k2a-token-sync never needs `cluster-admin`. Its own identity holds five rules: get and create ServiceAccounts,
+create `serviceaccounts/token`, get and create ClusterRoleBindings, get exactly one ConfigMap — `kube-root-ca.crt` — and
+`bind` on `cluster-admin` alone. That is enough to maintain ArgoCD's identity and read the cluster CA, and nothing else.
+
+The last of those is the least obvious and the easiest to mistake for an escalation. Kubernetes refuses to create a
+binding granting permissions the creator does not hold, so without `bind` on the role it references, restoring a deleted
+`argocd-manager` binding is rejected on every pass. It grants nothing new in practice: minting a token for a
+`cluster-admin` ServiceAccount is already cluster-admin-equivalent, as the table above says. The `resourceNames`
+restriction to that one role is what keeps it that way — `bind` without it would permit granting *any* role to anyone.
 
 Reusing ArgoCD's token for both would be simpler and worse. k2a-token-sync would hold `cluster-admin` on every cluster
 permanently, and it would not even remove the permanence: a credential you can always renew *is* a permanent credential,
@@ -226,6 +232,21 @@ be applied. Chart 0.5.0 added `create` on Events, for instance.
 A permission that never arrives is not fatal — nothing in this tool treats its own observability as load-bearing — but it
 is quiet. A missing `events` grant costs one warning per attempted write and an Events section that stays empty, which
 reads as a feature that does not work rather than as RBAC that was not applied.
+
+**Downstream permissions upgrade differently.** The ClusterRole k2a-token-sync holds on each managed cluster is written
+by `bootstrap`, not by the chart, and nothing revisits it afterwards — the daemon cannot update its own role, since
+granting itself a permission it does not hold is the very thing Kubernetes refuses. So a release that changes those
+rules needs `bootstrap` re-run once per cluster, with administrative access, and `helm upgrade` will not do it:
+
+```bash
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig
+```
+
+Re-running is safe on a cluster already in service — it is idempotent, updates the ClusterRole in place, and issues a
+fresh credential. Until it is run, the cluster keeps working; what it loses is the ability to restore ArgoCD's identity
+if something deletes it, which is the `bind` permission described under [Credentials](#credentials).
 
 **Name the version.** `image.tag` has no default, so an upgrade that omits it fails to render rather than quietly
 keeping the running one. That is deliberate, and it is why `--reuse-values` is the wrong habit here: the version you are
@@ -588,7 +609,7 @@ The CLI is a convenience, not a requirement. Anything with administrative access
 same contract:
 
 - create the `argocd-manager` ServiceAccount and bind it to `cluster-admin`;
-- create the `k2a-token-sync` ServiceAccount and bind it to a ClusterRole with the four rules above;
+- create the `k2a-token-sync` ServiceAccount and bind it to a ClusterRole with the five rules above;
 - mint a token for the second one;
 - write `<name>-credentials` in k2a-token-sync's namespace with keys `token`, `ca.crt` and `expires-at`.
 

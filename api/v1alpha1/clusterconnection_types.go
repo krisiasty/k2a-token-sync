@@ -57,6 +57,21 @@ const (
 	ReasonSecretNameConflict  = "SecretNameConflict"
 	ReasonInvalidSpec         = "InvalidSpec"
 
+	// ReasonPermissionDenied means the API server answered and refused. It is
+	// distinct from EndpointUnreachable for the reason CredentialRejected is:
+	// something that answered is not something that could not be reached, and the
+	// two send whoever reads it to opposite ends of the problem.
+	ReasonPermissionDenied = "PermissionDenied"
+
+	// ReasonReconcileFailed is the reason for a failure this tool cannot place.
+	//
+	// It deliberately names no cause. Every unclassified failure used to report
+	// EndpointUnreachable, so a pass that reached the endpoint twice and then hit
+	// an RBAC refusal told its reader to go and check the network. A reason that
+	// says only "the pass failed" is worth more than a confident wrong one: the
+	// message carries the detail, and nobody is sent the wrong way.
+	ReasonReconcileFailed = "ReconcileFailed"
+
 	// The three ways renewing k2a-token-sync's own credential can fail. They are
 	// distinct because they point at different places: the downstream cluster's
 	// RBAC or API server, the credential the API server just issued, and this
