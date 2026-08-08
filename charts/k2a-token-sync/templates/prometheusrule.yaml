@@ -118,6 +118,28 @@ spec:
               until a person fixes it. 'kubectl describe ccon {{ "{{ $labels.cluster }}" }}' names the
               reason in its conditions and events.
 
+        # The one rule here that is not about a deadline. A CRD older than the
+        # running build makes the API server discard fields set on connections,
+        # and every other signal keeps reporting healthy: the connection is Ready,
+        # the credential is current, and a setting that was applied is simply
+        # not in effect. Nothing else notices, which is why it is alerted on.
+        #
+        # No 'for': the answer changes only when someone upgrades something, so
+        # there is nothing to debounce, and the series is absent rather than 1
+        # while the check has not run.
+        - alert: K2aTokenSyncCRDOutdated
+          expr: k2a_token_sync_crd_schema_current == 0
+          labels:
+            severity: warning
+          annotations:
+            summary: The ClusterConnection CRD is older than the running k2a-token-sync
+            description: >-
+              The API server is discarding fields set on ClusterConnections because its schema does not
+              know them, so a connection may be running with settings it appears to have been given —
+              a registration scoped below cluster-admin silently reverts to cluster-admin. Upgrade the
+              k2a-token-sync-crds chart; 'kubectl describe ccon' names the discarded fields under the
+              SchemaCurrent condition.
+
         # This tool observes the serving certificate but never rotates one:
         # that needs node access and restarts control-plane components, so it
         # belongs to whatever manages the cluster. Thirty days is the escalation

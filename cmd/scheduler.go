@@ -191,8 +191,28 @@ type scheduler struct {
 	slots chan struct{}
 	wg    sync.WaitGroup
 
+	// schema checks whether the CRD still matches this binary, and lastSchemaAt
+	// is when it last did. Nil when nothing supplied one, which keeps every
+	// existing test constructing a scheduler unchanged.
+	schema       func(context.Context) inventory.SchemaCheck
+	lastSchemaAt time.Time
+
+	// schemaStale is what was last reported, so the log line fires on a change
+	// rather than every ten minutes. A warning repeated forever is one people
+	// filter out, and the condition on each object carries the standing state.
+	schemaStale bool
+
 	now func() time.Time
 }
+
+// schemaCheckInterval is how often the CRD is compared against this binary.
+//
+// Far slower than the poll: a schema changes about once a release, and the
+// check exists to catch an upgrade that was half-applied rather than to watch
+// for drift. Slow enough to be free, often enough that applying the CRD clears
+// the warning without anyone restarting anything — a warning that only a
+// restart can clear is one that gets ignored.
+const schemaCheckInterval = 10 * time.Minute
 
 func newScheduler(
 	inv clusterInventory,
@@ -235,8 +255,48 @@ func (s *scheduler) run(ctx context.Context) {
 	}
 }
 
+// checkSchema re-reads the CRD when the interval has elapsed, and reports a
+// change in what it found.
+//
+// Only a change is logged. The standing state lives on each ClusterConnection
+// as a condition, which is where somebody looking at a connection will see it;
+// repeating it in the log every ten minutes would add nothing and cost the
+// attention of whoever is reading.
+func (s *scheduler) checkSchema(ctx context.Context) {
+	if s.schema == nil {
+		return
+	}
+	now := s.now()
+	if !s.lastSchemaAt.IsZero() && now.Sub(s.lastSchemaAt) < schemaCheckInterval {
+		return
+	}
+	s.lastSchemaAt = now
+
+	check := s.schema(ctx)
+	s.health.recordSchema(check)
+
+	switch {
+	case check.Unverifiable != nil:
+		// Not staleness, and deliberately not an error: an operator who upgraded
+		// the image before the chart has no ClusterRole yet and lands here, with
+		// nothing broken and everything still working.
+		s.logger.Warn("could not check whether the ClusterConnection CRD matches this build; "+
+			"apply the k2a-token-sync-crds chart and the app chart's RBAC",
+			"error", check.Unverifiable)
+	case check.Stale() && !s.schemaStale:
+		s.logger.Error("the ClusterConnection CRD is older than this build, so the API server is discarding "+
+			"fields set on connections; upgrade the k2a-token-sync-crds chart",
+			"discarded_fields", check.Missing())
+	case !check.Stale() && s.schemaStale:
+		s.logger.Info("the ClusterConnection CRD now matches this build; nothing is being discarded")
+	}
+	s.schemaStale = check.Stale()
+}
+
 // tick refreshes the inventory and starts whatever is due.
 func (s *scheduler) tick(ctx context.Context) {
+	s.checkSchema(ctx)
+
 	if err := s.refresh(ctx); err != nil {
 		if inventory.IsCRDMissing(err) {
 			s.logger.Error("the ClusterConnection CRD is not installed; apply the chart's crds/ directory",
@@ -285,7 +345,7 @@ func (s *scheduler) reportRejected(ctx context.Context) {
 			continue
 		}
 
-		if err := s.inv.UpdateStatus(ctx, name, desired); err != nil {
+		if err := s.writeStatus(ctx, name, desired); err != nil {
 			// Logged and stepped over: one object the API server will not accept must
 			// not stop the others from being told why they are stuck.
 			s.logger.Warn("writing the reason a cluster is not being reconciled failed",
@@ -765,9 +825,49 @@ func (s *scheduler) settleVerdict(
 // still has something worth writing down, and that is precisely the pass whose
 // deadline has already gone.
 func (s *scheduler) writeStatus(ctx context.Context, name string, status v1alpha1.ClusterConnectionStatus) error {
+	s.setSchemaCondition(&status)
+
 	writeCtx, cancel := context.WithTimeout(ctx, inventoryTimeout)
 	defer cancel()
 	return s.inv.UpdateStatus(writeCtx, name, status)
+}
+
+// setSchemaCondition stamps the CRD verdict onto a status about to be written.
+//
+// Done here, at the single point every status write passes through, rather than
+// in the reconciler: the verdict is a fact about the process and the same for
+// every connection, while a pass is about one cluster and does not read the CRD.
+// Putting it here also means a connection the reconciler never got to — one
+// rejected for an invalid spec — still carries it.
+//
+// Nothing is written before the first check completes. A condition claiming the
+// schema is current because nothing has looked yet would be worse than none, for
+// the same reason the metric is not exported until then.
+func (s *scheduler) setSchemaCondition(status *v1alpha1.ClusterConnectionStatus) {
+	check, checked := s.health.schemaCheck()
+	if !checked {
+		return
+	}
+
+	state, reason, message := metav1.ConditionTrue, v1alpha1.ReasonReady,
+		"the ClusterConnection CRD matches this build"
+	switch {
+	case check.Unverifiable != nil:
+		state, reason = metav1.ConditionUnknown, v1alpha1.ReasonSchemaUnverified
+		message = "could not read the CRD to check it matches this build, so whether fields set here " +
+			"are being discarded is unknown: " + check.Unverifiable.Error()
+	case check.Stale():
+		state, reason = metav1.ConditionFalse, v1alpha1.ReasonSchemaOutdated
+		message = "the CRD is older than this build, so the API server discards these fields when they are " +
+			"set: " + check.Missing() + ". Upgrade the k2a-token-sync-crds chart"
+	}
+
+	// ObservedGeneration is deliberately left at zero: this says nothing about
+	// the generation of the object it is written on, and claiming otherwise
+	// would make it look settled by a pass that never considered it.
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type: v1alpha1.ConditionSchemaCurrent, Status: state, Reason: reason, Message: message,
+	})
 }
 
 // dueAfterPass is when a cluster whose pass just succeeded is next due.

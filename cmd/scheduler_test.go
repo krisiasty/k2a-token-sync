@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/krisiasty/k2a-token-sync/api/v1alpha1"
+	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 )
 
 func TestNextInterval(t *testing.T) {
@@ -245,5 +251,110 @@ func TestHealthLivenessDoesNotExcuseAPassThatNeverEnds(t *testing.T) {
 	state.passFinished("slow")
 	if !state.isLive() {
 		t.Error("still stalled after the pass ended")
+	}
+}
+
+// The condition is the primary report, because it is the only one attached to
+// the thing an operator is looking at. Somebody who set clusterRole and saw
+// nothing happen opens the connection, not the process — and a pruned field
+// leaves no other trace on it, being indistinguishable from one nobody set.
+func TestAStaleSchemaIsReportedOnEveryConnection(t *testing.T) {
+	t.Parallel()
+
+	s := &scheduler{health: newHealthState()}
+	s.health.recordSchema(inventory.SchemaCheck{
+		MissingSpecFields: []string{"clusterRole", "namespaces"},
+	})
+
+	var status v1alpha1.ClusterConnectionStatus
+	s.setSchemaCondition(&status)
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSchemaCurrent)
+	if cond == nil {
+		t.Fatal("no SchemaCurrent condition was written")
+	}
+	if cond.Status != metav1.ConditionFalse {
+		t.Errorf("Status = %v, want False", cond.Status)
+	}
+	if cond.Reason != v1alpha1.ReasonSchemaOutdated {
+		t.Errorf("Reason = %q, want %q", cond.Reason, v1alpha1.ReasonSchemaOutdated)
+	}
+	// Naming the fields is the whole value: "something is stale" sends the
+	// reader looking, "these are discarded" tells them what to fix.
+	for _, want := range []string{"spec.clusterRole", "spec.namespaces", "k2a-token-sync-crds"} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("message does not mention %q: %s", want, cond.Message)
+		}
+	}
+}
+
+// Being unable to read the CRD is Unknown, not False. An operator who upgraded
+// the image before the chart lands here with nothing actually wrong, and
+// reporting it as a stale schema would send them to fix the wrong thing.
+func TestAnUnreadableSchemaIsUnknownRatherThanFalse(t *testing.T) {
+	t.Parallel()
+
+	s := &scheduler{health: newHealthState()}
+	s.health.recordSchema(inventory.SchemaCheck{Unverifiable: errors.New("forbidden")})
+
+	var status v1alpha1.ClusterConnectionStatus
+	s.setSchemaCondition(&status)
+
+	cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSchemaCurrent)
+	if cond == nil {
+		t.Fatal("no SchemaCurrent condition was written")
+	}
+	if cond.Status != metav1.ConditionUnknown {
+		t.Errorf("Status = %v, want Unknown for a schema that could not be read", cond.Status)
+	}
+	if cond.Reason != v1alpha1.ReasonSchemaUnverified {
+		t.Errorf("Reason = %q, want %q", cond.Reason, v1alpha1.ReasonSchemaUnverified)
+	}
+}
+
+// Before the first check completes there is no verdict, and inventing one would
+// claim the schema is current on the strength of nothing having looked. That is
+// worse than silence: it is a healthy-looking answer to a question nobody asked.
+func TestNoConditionIsWrittenBeforeTheFirstCheck(t *testing.T) {
+	t.Parallel()
+
+	s := &scheduler{health: newHealthState()}
+
+	var status v1alpha1.ClusterConnectionStatus
+	s.setSchemaCondition(&status)
+
+	if cond := meta.FindStatusCondition(status.Conditions, v1alpha1.ConditionSchemaCurrent); cond != nil {
+		t.Errorf("a condition was written before any check ran: %+v", cond)
+	}
+}
+
+// The check is far slower than the poll on purpose. Running it every tick would
+// be a request every thirty seconds to answer a question whose answer changes
+// about once a release.
+func TestTheSchemaCheckIsRateLimited(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	now := time.Now()
+	s := &scheduler{
+		health: newHealthState(),
+		logger: slog.New(slog.DiscardHandler),
+		now:    func() time.Time { return now },
+		schema: func(context.Context) inventory.SchemaCheck {
+			calls++
+			return inventory.SchemaCheck{}
+		},
+	}
+
+	s.checkSchema(t.Context())
+	s.checkSchema(t.Context())
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1: a second check inside the interval should be skipped", calls)
+	}
+
+	now = now.Add(schemaCheckInterval + time.Second)
+	s.checkSchema(t.Context())
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2: the check should run again once the interval elapsed", calls)
 	}
 }

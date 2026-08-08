@@ -24,6 +24,7 @@ type clusterCollector struct {
 	state *healthState
 
 	ready         *prometheus.Desc
+	schemaCurrent *prometheus.Desc
 	tokenExpiry   *prometheus.Desc
 	selfExpiry    *prometheus.Desc
 	servingExpiry *prometheus.Desc
@@ -34,6 +35,14 @@ func newClusterCollector(state *healthState) *clusterCollector {
 	label := []string{"cluster"}
 	return &clusterCollector{
 		state: state,
+		// No cluster label: one CRD serves every connection, so a stale schema
+		// is a fact about the process rather than about any one cluster.
+		schemaCurrent: prometheus.NewDesc(
+			"k2a_token_sync_crd_schema_current",
+			"Whether the ClusterConnection CRD matches this binary, 1 or 0. "+
+				"0 means the API server is discarding spec fields it does not recognise, so a connection may be "+
+				"running with settings it appears to have been given. Absent when the schema could not be read.",
+			nil, nil),
 		ready: prometheus.NewDesc(
 			"k2a_token_sync_cluster_ready",
 			"Whether ArgoCD holds a current registration for this cluster, 1 or 0.",
@@ -58,12 +67,23 @@ func newClusterCollector(state *healthState) *clusterCollector {
 }
 
 func (c *clusterCollector) Describe(ch chan<- *prometheus.Desc) {
-	for _, d := range []*prometheus.Desc{c.ready, c.tokenExpiry, c.selfExpiry, c.servingExpiry, c.lastSync} {
+	for _, d := range []*prometheus.Desc{
+		c.ready, c.schemaCurrent, c.tokenExpiry, c.selfExpiry, c.servingExpiry, c.lastSync,
+	} {
 		ch <- d
 	}
 }
 
 func (c *clusterCollector) Collect(ch chan<- prometheus.Metric) {
+	// Exported only once the schema has actually been checked. A gauge reading 1
+	// because nothing has run yet would be indistinguishable from one reading 1
+	// because the schema is current, and the difference matters most in the
+	// seconds after a rollout — the same reason an unknown deadline is omitted
+	// rather than exported as zero.
+	if check, checked := c.state.schemaCheck(); checked && check.Unverifiable == nil {
+		gauge(ch, c.schemaCurrent, boolAsFloat(!check.Stale()))
+	}
+
 	for _, report := range c.state.report().Clusters {
 		gauge(ch, c.ready, boolAsFloat(report.Synced), report.Name)
 		timestamp(ch, c.tokenExpiry, report.TokenExpiresAt, report.Name)

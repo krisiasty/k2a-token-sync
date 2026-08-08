@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/krisiasty/k2a-token-sync/internal/inventory"
 )
 
 // clusterReport is one cluster's line in /status. It carries no credential
@@ -65,7 +67,33 @@ type healthState struct {
 	polledAt time.Time
 	passes   map[string]time.Time
 
+	// schema is the last verdict on whether the CRD matches this binary. It is
+	// process-wide rather than per-cluster: one schema serves every connection,
+	// and a stale one discards the same fields on all of them.
+	//
+	// schemaChecked distinguishes "checked, and current" from "not checked yet",
+	// which the zero value cannot. Without it the metric would read 1 from the
+	// moment the process started, and a healthy-looking gauge that only means
+	// "nothing has run" is worse than no gauge at all.
+	schema        inventory.SchemaCheck
+	schemaChecked bool
+
 	now func() time.Time
+}
+
+// recordSchema stores the latest schema verdict for /status and /metrics.
+func (s *healthState) recordSchema(check inventory.SchemaCheck) {
+	s.mu.Lock()
+	s.schema = check
+	s.schemaChecked = true
+	s.mu.Unlock()
+}
+
+// schemaCheck returns the last verdict, and whether one has been reached at all.
+func (s *healthState) schemaCheck() (inventory.SchemaCheck, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.schema, s.schemaChecked
 }
 
 func newHealthState() *healthState {
@@ -155,16 +183,44 @@ type statusReport struct {
 	Ready         bool            `json:"ready"`
 	LastSuccessAt time.Time       `json:"lastSuccessAt,omitzero"`
 	NextAttemptAt time.Time       `json:"nextAttemptAt,omitzero"`
+	Schema        schemaReport    `json:"schema"`
 	Clusters      []clusterReport `json:"clusters"`
+}
+
+// schemaReport says whether the CRD matches this binary.
+//
+// Always present rather than omitted when healthy: "the schema is current" is
+// an answer somebody may be looking for, and a field that appears only when
+// something is wrong cannot be used to confirm that nothing is.
+type schemaReport struct {
+	Current bool `json:"current"`
+
+	// MissingFields names what the API server would discard, so /status says
+	// which settings are being ignored rather than only that some are.
+	MissingFields []string `json:"missingFields,omitempty"`
+
+	// Unverified is set when the CRD could not be read — distinct from stale,
+	// and usually meaning the chart's ClusterRole has not been applied yet.
+	Unverified string `json:"unverified,omitempty"`
 }
 
 func (s *healthState) report() statusReport {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	schema := schemaReport{Current: s.schemaChecked && !s.schema.Stale()}
+	if s.schema.Stale() {
+		schema.MissingFields = append(append([]string{}, s.schema.MissingSpecFields...), s.schema.MissingStatusFields...)
+	}
+	if s.schema.Unverifiable != nil {
+		schema.Unverified = s.schema.Unverifiable.Error()
+	}
+
 	return statusReport{
 		Ready:         s.ready,
 		LastSuccessAt: s.lastSuccessAt,
 		NextAttemptAt: s.nextAttemptAt,
+		Schema:        schema,
 		Clusters:      s.clusters,
 	}
 }
