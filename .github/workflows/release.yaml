@@ -72,6 +72,39 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: setup helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      # Charts are versioned independently of the application, so most releases
+      # carry an unchanged chart. Pushing regardless would either overwrite a
+      # published artifact or fail the release on a tag that changed no chart —
+      # so each is published only if its version is not already in the registry.
+      #
+      # The docker/login-action above already authenticated to ghcr.io, and Helm
+      # reads the same credential store, so no second login is needed.
+      - name: publish charts
+        run: |
+          set -euo pipefail
+          repo="oci://ghcr.io/${{ github.repository_owner }}/charts"
+          published=0
+          for chart in charts/*/; do
+            name=$(helm show chart "${chart}" | yq '.name')
+            version=$(helm show chart "${chart}" | yq '.version')
+            if helm show chart "${repo}/${name}" --version "${version}" >/dev/null 2>&1; then
+              echo "::notice::${name} ${version} is already published, skipping"
+              continue
+            fi
+            helm package "${chart}" --destination dist/charts
+            helm push "dist/charts/${name}-${version}.tgz" "${repo}"
+            echo "::notice::published ${name} ${version}"
+            published=$((published + 1))
+          done
+          # A release that published nothing is a legitimate outcome, but it
+          # should be visible rather than inferred from the absence of output.
+          echo "::notice::${published} chart(s) published"
+
   # Everything the release job does short of publishing: the same checkout, the
   # same pinned tools, the same binaries and the same multi-arch image builds
   # through the pinned Buildx and BuildKit. Snapshot mode needs no tag, and the
