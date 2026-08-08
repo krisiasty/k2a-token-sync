@@ -7,10 +7,19 @@ crds:
   # for each. That is not something a mistyped 'helm uninstall' or a deleted
   # ArgoCD Application should be able to cause.
   #
-  # Two annotations are needed, because the two deployment paths honour
-  # different ones. helm.sh/resource-policy is read by 'helm uninstall' and is
-  # invisible to ArgoCD, which never runs it — it renders with 'helm template',
-  # applies the output, and prunes from its own tracking.
+  # Two annotations, because the two deployment paths read different ones.
+  # helm.sh/resource-policy is interpreted by 'helm uninstall' and is invisible
+  # to ArgoCD, which never runs it — it renders with 'helm template', applies
+  # the output, and prunes from its own resource tracking.
+  #
+  # The helm half is verified: uninstalling this release leaves the CRD and
+  # every ClusterConnection in place. The ArgoCD half is not. Deleting an
+  # Application that had synced this chart deleted nothing either way, with the
+  # annotation and without it — ArgoCD stamped a tracking marker on namespaced
+  # resources it managed but never on the cluster-scoped CRD, so cascade
+  # deletion had nothing of its own to act on. It is kept because it is correct
+  # practice and costs nothing, not because it has been shown to be
+  # load-bearing — see the README's ArgoCD section.
   #
   # Turning this off is the deliberate act that makes the CRD removable.
   keep: true
