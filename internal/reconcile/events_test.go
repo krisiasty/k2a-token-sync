@@ -357,6 +357,7 @@ func newPassHarness(t *testing.T) *passHarness {
 		SelfTokenTTL:           2160 * time.Hour,
 		ExpiryWarnThreshold:    2160 * time.Hour,
 		ServiceAccount:         config.ServiceAccountRef{Name: "argocd-manager", Namespace: "kube-system"},
+		ClusterRole:            "cluster-admin",
 	}
 
 	// ArgoCD's identity is already in place, so a healthy pass has nothing to

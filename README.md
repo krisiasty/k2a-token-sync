@@ -385,6 +385,59 @@ git](#keeping-the-objects-in-git). Order never matters either way: an object app
 Editing works the same way: `kubectl edit ccon standalone-1`, and the change takes effect within a poll. k2a-token-sync
 compares the spec's generation against the one recorded in status, so an edit made while it was down is noticed too.
 
+### Scoping a registration below cluster-admin
+
+By default ArgoCD is bound to `cluster-admin` over every namespace — what `argocd cluster add` installs, and what
+every registration meant before these fields existed. Three optional fields narrow it:
+
+```yaml
+spec:
+  clusterRole: argocd-restricted   # a role you create on the downstream cluster
+  namespaces: [team-a, team-b]     # what ArgoCD will manage there
+  clusterResources: false          # cluster-scoped resources within that scope
+```
+
+Or at bootstrap: `--cluster-role`, `--namespaces` (comma-separated) and `--cluster-resources`.
+
+**`clusterRole` and `namespaces` answer different questions**, and neither substitutes for the other. The role
+governs what the API server will *permit*; `namespaces` governs what ArgoCD will *attempt*, and is written into
+the cluster Secret ArgoCD reads. Restricting namespaces alone leaves an identity that could still do anything if
+something else used its token. Setting a narrower role alone is enforced but lets ArgoCD keep trying things it
+will be refused. Most people want both.
+
+The role itself is yours to create and maintain — only you know what your Applications need. k2a-token-sync
+binds what you name and never edits it.
+
+`clusterResources` means nothing without `namespaces` — an unrestricted registration already covers
+cluster-scoped resources — and is rejected in that combination rather than written and quietly ignored.
+
+**Unset means exactly today's behaviour.** A connection that names none of the three produces byte-for-byte the
+Secret it produced before they existed, so nothing changes on upgrade.
+
+#### Changing the role afterwards
+
+A `ClusterRoleBinding`'s `roleRef` is immutable, so the binding cannot be repointed — it has to be deleted and
+recreated. k2a-token-sync will not do that on its own, and could not if it wanted to: it holds `bind` on the
+previous role only. Editing `spec.clusterRole` therefore stops the pass with `RoleRefImmutable` and leaves the
+cluster exactly as it was, ArgoCD still working on its existing credential.
+
+Completing the change is a bootstrap job, because bootstrap has the administrative credentials and a person
+present:
+
+```bash
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig \
+  --cluster-role argocd-restricted --replace-binding
+```
+
+**ArgoCD is unauthorised between the delete and the create.** Its token still authenticates, so requests are not
+rejected as unauthenticated — they fail as forbidden, on everything, until the new binding lands. The gap is two
+sequential API calls, but it is not zero, and it is why this is an explicit flag rather than something either
+the daemon or a plain re-run does silently.
+
+Without `--replace-binding`, bootstrap refuses before provisioning anything and names both roles.
+
 ### Migrating from `argocd cluster add`
 
 Taking over a registration `argocd cluster add` made is the supported path, and the point of the tool: it replaces that

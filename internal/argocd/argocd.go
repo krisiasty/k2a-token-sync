@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -68,6 +70,14 @@ const (
 	serverKey  = "server"
 	configKey  = "config"
 	projectKey = "project"
+
+	// namespacesKey and clusterResourcesKey are ArgoCD's own scoping, read from
+	// the same Secret. Both are written only when the connection asked for them:
+	// ArgoCD treats an absent namespaces key as "every namespace", which is what
+	// every registration meant before they could be set, so writing an empty one
+	// would change the meaning of every existing Secret.
+	namespacesKey       = "namespaces"
+	clusterResourcesKey = "clusterResources"
 )
 
 // clusterConfig is ArgoCD's cluster credential payload, stored JSON-encoded
@@ -107,6 +117,14 @@ type ClusterSecret struct {
 
 	// Project optionally scopes the cluster to one ArgoCD project.
 	Project string
+
+	// Namespaces restricts ArgoCD to these namespaces. Empty means every
+	// namespace, and writes no key at all.
+	Namespaces []string
+
+	// ClusterResources permits cluster-scoped resources on a namespace-scoped
+	// registration. Nil writes no key, which is not the same as writing "false".
+	ClusterResources *bool
 
 	// TokenExpiresAt and ServingCertExpiresAt are recorded as annotations.
 	TokenExpiresAt       time.Time
@@ -170,6 +188,12 @@ func (c ClusterSecret) registrationConfig() *applycorev1.SecretApplyConfiguratio
 	}
 	if c.Project != "" {
 		data[projectKey] = []byte(c.Project)
+	}
+	if len(c.Namespaces) > 0 {
+		data[namespacesKey] = []byte(strings.Join(c.Namespaces, ","))
+	}
+	if c.ClusterResources != nil {
+		data[clusterResourcesKey] = []byte(strconv.FormatBool(*c.ClusterResources))
 	}
 
 	return applycorev1.Secret(c.Name, c.Namespace).

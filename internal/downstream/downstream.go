@@ -110,9 +110,24 @@ func EnsureServiceAccount(ctx context.Context, client kubernetes.Interface, name
 	return true, nil
 }
 
+// ErrRoleRefImmutable means the binding exists but references a different
+// ClusterRole than the connection asks for.
+//
+// It is a sentinel so the caller can report it as its own condition reason
+// rather than as an unclassified failure: the remedy is specific, and an
+// operator who has just edited spec.clusterRole deserves to be told exactly
+// what is required rather than left to read a raw API error.
+var ErrRoleRefImmutable = errors.New("clusterrolebinding references a different role")
+
 // EnsureClusterRoleBinding binds a ServiceAccount to a ClusterRole, creating the
 // binding if absent. An existing binding that points elsewhere is reported
 // rather than silently rewritten — that would be an unexpected privilege change.
+//
+// It is also not something this process could do if it wanted to. A roleRef is
+// immutable, so the binding would have to be deleted and recreated, and this
+// identity holds bind on the previous role only — bootstrap wrote that grant
+// when the cluster was provisioned. Both halves of the remedy therefore need
+// bootstrap, which is what the error says.
 func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, bindingName, clusterRole, saNamespace, saName string) (bool, error) {
 	subject := rbacv1.Subject{
 		Kind:      rbacv1.ServiceAccountKind,
@@ -123,8 +138,11 @@ func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, 
 	existing, err := client.RbacV1().ClusterRoleBindings().Get(ctx, bindingName, metav1.GetOptions{})
 	if err == nil {
 		if existing.RoleRef.Name != clusterRole {
-			return false, fmt.Errorf("clusterrolebinding %s already binds %q, not %q; resolve manually",
-				bindingName, existing.RoleRef.Name, clusterRole)
+			return false, fmt.Errorf("%w: %s binds %q but this connection asks for %q. "+
+				"A roleRef is immutable, so the binding has to be replaced, and k2a-token-sync holds "+
+				"bind on %q alone — re-run 'k2a-token-sync bootstrap --replace-binding' for this cluster, "+
+				"which has the credentials for both. ArgoCD keeps working until its credential expires",
+				ErrRoleRefImmutable, bindingName, existing.RoleRef.Name, clusterRole, existing.RoleRef.Name)
 		}
 		for _, s := range existing.Subjects {
 			if s.Kind == subject.Kind && s.Name == subject.Name && s.Namespace == subject.Namespace {
@@ -157,9 +175,27 @@ func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, 
 }
 
 // EnsureArgoCDIdentity provisions the ServiceAccount ArgoCD authenticates as and
-// grants it cluster-admin, mirroring what `argocd cluster add` installs.
-func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) (Repairs, error) {
+// binds it to clusterRole, which defaults to cluster-admin — what `argocd
+// cluster add` installs, and what every registration bound before the role
+// could be chosen.
+//
+// The role is a parameter rather than the constant because a connection may
+// name a narrower one. Note that changing it on a cluster already provisioned
+// is refused by EnsureClusterRoleBinding rather than applied: roleRef is
+// immutable, and this identity holds bind on the previous role only.
+func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, namespace, name, clusterRole string) (Repairs, error) {
 	var repairs Repairs
+
+	// An empty role means a caller left the field unset: no configuration path
+	// produces one, since the schema defaults it and FromSpec falls back. Binding
+	// to "" would create a ClusterRoleBinding granting nothing, and the failure
+	// would surface much later as ArgoCD getting 403s against a registration that
+	// looks perfectly healthy. Refusing here names the bug instead, the way
+	// MintToken refuses a zero lifetime.
+	if clusterRole == "" {
+		return repairs, fmt.Errorf("refusing to bind %s/%s to an empty ClusterRole: "+
+			"the role to bind was never set", namespace, name)
+	}
 
 	created, err := EnsureServiceAccount(ctx, client, namespace, name)
 	if err != nil {
@@ -167,7 +203,7 @@ func EnsureArgoCDIdentity(ctx context.Context, client kubernetes.Interface, name
 	}
 	repairs.ServiceAccount = created
 
-	bound, err := EnsureClusterRoleBinding(ctx, client, name+"-role-binding", clusterAdminRole, namespace, name)
+	bound, err := EnsureClusterRoleBinding(ctx, client, name+"-role-binding", clusterRole, namespace, name)
 	if err != nil {
 		return repairs, err
 	}
@@ -256,7 +292,7 @@ func CanActAsClusterAdmin(ctx context.Context, client kubernetes.Interface) (boo
 //
 // These are ClusterRole rules, so they carry no namespace: the binding needs to
 // cover kube-root-ca.crt in whichever namespace the ServiceAccounts live in.
-func selfRules() []rbacv1.PolicyRule {
+func selfRules(clusterRole string) []rbacv1.PolicyRule {
 	return []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{""},
@@ -294,7 +330,7 @@ func selfRules() []rbacv1.PolicyRule {
 		{
 			APIGroups:     []string{rbacv1.GroupName},
 			Resources:     []string{"clusterroles"},
-			ResourceNames: []string{clusterAdminRole},
+			ResourceNames: []string{clusterRole},
 			Verbs:         []string{"bind"},
 		},
 		{
@@ -308,14 +344,22 @@ func selfRules() []rbacv1.PolicyRule {
 
 // EnsureSelfIdentity provisions the identity k2a-token-sync itself uses in a
 // standalone cluster, together with its ClusterRole and binding.
-func EnsureSelfIdentity(ctx context.Context, client kubernetes.Interface, namespace, name string) error {
+func EnsureSelfIdentity(ctx context.Context, client kubernetes.Interface, namespace, name, clusterRole string) error {
+	// Same reasoning as EnsureArgoCDIdentity: an empty role here would write a
+	// bind rule naming no role, which grants nothing and fails only later, when
+	// something deletes ArgoCD's binding and it cannot be restored.
+	if clusterRole == "" {
+		return fmt.Errorf("refusing to provision %s/%s with an empty ClusterRole: "+
+			"the role it must be able to bind was never set", namespace, name)
+	}
+
 	if _, err := EnsureServiceAccount(ctx, client, namespace, name); err != nil {
 		return err
 	}
 
 	role := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: ManagedByLabel},
-		Rules:      selfRules(),
+		Rules:      selfRules(clusterRole),
 	}
 	if _, err := client.RbacV1().ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {

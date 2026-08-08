@@ -91,3 +91,70 @@ func TestPrintedManifestMatchesWhatWouldBeApplied(t *testing.T) {
 		t.Errorf("spec differs:\nprinted %+v\napplied %+v", printed.Spec, applied.Spec)
 	}
 }
+
+// A scoped registration's manifest has to carry its scoping. --print exists so
+// the object can live in git, and one that silently dropped the fields would
+// apply as an unscoped, cluster-admin registration — the exact thing the
+// operator was avoiding, arriving as a surprise the first time the manifest is
+// re-applied rather than at the moment it was written.
+func TestARenderedManifestCarriesItsScoping(t *testing.T) {
+	t.Parallel()
+
+	yes := true
+	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{
+		Name:             "standalone-1",
+		Endpoint:         "10.1.0.10",
+		ClusterRole:      "argocd-restricted",
+		Namespaces:       []string{"team-a", "team-b"},
+		ClusterResources: &yes,
+	})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
+	}
+
+	raw, err := renderConnection(cluster, "k2a-token-sync", false)
+	if err != nil {
+		t.Fatalf("renderConnection returned unexpected error: %v", err)
+	}
+	got := string(raw)
+
+	for _, want := range []string{"clusterRole: argocd-restricted", "team-a", "team-b", "clusterResources: true"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the manifest does not carry %q:\n%s", want, got)
+		}
+	}
+
+	// What is printed must still be what would be applied.
+	var printed v1alpha1.ClusterConnection
+	if err := yaml.UnmarshalStrict(raw, &printed); err != nil {
+		t.Fatalf("the rendered manifest does not decode into the API type: %v", err)
+	}
+	applied := connectionFor(cluster, "k2a-token-sync", false)
+	if !reflect.DeepEqual(printed.Spec, applied.Spec) {
+		t.Errorf("spec differs:\nprinted %+v\napplied %+v", printed.Spec, applied.Spec)
+	}
+}
+
+// The counterpart, and the reason clusterRole is emitted conditionally: an
+// unscoped bootstrap must produce exactly the manifest it always produced.
+// Naming cluster-admin explicitly would freeze today's default into a file that
+// outlives it, which is why tokenTTL and serviceAccount are left out too.
+func TestAnUnscopedManifestStatesNoScoping(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{
+		Name: "standalone-1", Endpoint: "10.1.0.10",
+	})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
+	}
+	raw, err := renderConnection(cluster, "k2a-token-sync", false)
+	if err != nil {
+		t.Fatalf("renderConnection returned unexpected error: %v", err)
+	}
+	for _, field := range []string{"clusterRole", "namespaces", "clusterResources"} {
+		if strings.Contains(string(raw), field) {
+			t.Errorf("the manifest states %q, which should be left to the schema's default:\n%s", field, raw)
+		}
+	}
+}

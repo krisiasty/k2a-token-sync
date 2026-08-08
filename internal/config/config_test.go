@@ -444,3 +444,91 @@ func TestRemovalClusterRejects(t *testing.T) {
 		}
 	})
 }
+
+// Every ClusterConnection written before these fields existed must resolve to
+// exactly what it resolved to before. This is the constraint the whole feature
+// turns on: a stray value here would republish every registration in service on
+// upgrade, which is a write per cluster and an ArgoCD cache churn for a change
+// nobody asked for.
+func TestScopingFieldsDefaultToTodaysBehaviour(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := FromSpec("standalone-1", v1alpha1.ClusterConnectionSpec{
+		Endpoint:    "10.1.0.10",
+		ClusterRole: defaultClusterRole, // what the schema's default supplies
+	})
+	if err != nil {
+		t.Fatalf("FromSpec returned unexpected error: %v", err)
+	}
+	if cluster.ClusterRole != defaultClusterRole {
+		t.Errorf("ClusterRole = %q, want %q", cluster.ClusterRole, defaultClusterRole)
+	}
+	if len(cluster.Namespaces) != 0 {
+		t.Errorf("Namespaces = %v, want none: an unset field must not scope the registration", cluster.Namespaces)
+	}
+	if cluster.ClusterResources != nil {
+		t.Errorf("ClusterResources = %v, want nil: unset and false are different, and only one is written",
+			*cluster.ClusterResources)
+	}
+}
+
+// The whole point of the feature: an operator naming a narrower role and a set
+// of namespaces gets exactly those, unmodified.
+func TestScopingFieldsAreCarriedThrough(t *testing.T) {
+	t.Parallel()
+
+	yes := true
+	cluster, err := FromSpec("standalone-1", v1alpha1.ClusterConnectionSpec{
+		Endpoint:         "10.1.0.10",
+		ClusterRole:      "argocd-restricted",
+		Namespaces:       []string{"team-a", "team-b"},
+		ClusterResources: &yes,
+	})
+	if err != nil {
+		t.Fatalf("FromSpec returned unexpected error: %v", err)
+	}
+	if cluster.ClusterRole != "argocd-restricted" {
+		t.Errorf("ClusterRole = %q, want %q", cluster.ClusterRole, "argocd-restricted")
+	}
+	if !reflect.DeepEqual(cluster.Namespaces, []string{"team-a", "team-b"}) {
+		t.Errorf("Namespaces = %v, want [team-a team-b]", cluster.Namespaces)
+	}
+	if cluster.ClusterResources == nil || !*cluster.ClusterResources {
+		t.Error("ClusterResources was not carried through")
+	}
+}
+
+// An empty clusterRole cannot reach FromSpec through the API — the schema
+// defaults it — but bootstrap and any direct caller can produce one, and a
+// binding to "" would be created and grant nothing.
+func TestAnEmptyClusterRoleFallsBackToTheDefault(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := FromSpec("standalone-1", v1alpha1.ClusterConnectionSpec{Endpoint: "10.1.0.10"})
+	if err != nil {
+		t.Fatalf("FromSpec returned unexpected error: %v", err)
+	}
+	if cluster.ClusterRole != defaultClusterRole {
+		t.Errorf("ClusterRole = %q, want %q for an unset field", cluster.ClusterRole, defaultClusterRole)
+	}
+}
+
+// clusterResources governs cluster-scoped resources *within* a namespace-scoped
+// registration. On an unrestricted one it is already implied, so accepting it
+// would produce a Secret that quietly disagrees with the spec that asked for it.
+// Refusing says so while the operator is still looking at the object.
+func TestClusterResourcesWithoutNamespacesIsRejected(t *testing.T) {
+	t.Parallel()
+
+	yes := true
+	_, err := FromSpec("standalone-1", v1alpha1.ClusterConnectionSpec{
+		Endpoint:         "10.1.0.10",
+		ClusterResources: &yes,
+	})
+	if err == nil {
+		t.Fatal("clusterResources without namespaces was accepted")
+	}
+	if !strings.Contains(err.Error(), "namespaces") {
+		t.Errorf("error does not name the field that is missing: %v", err)
+	}
+}

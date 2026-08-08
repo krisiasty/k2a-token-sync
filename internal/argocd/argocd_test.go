@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -687,5 +688,82 @@ func TestForeignManagersNamesOnlyOtherManagers(t *testing.T) {
 				t.Errorf("ForeignManagers = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The constraint the whole scoping feature turns on. A connection that never
+// mentioned namespaces or clusterResources must produce exactly the Secret it
+// produced before those fields existed — not one with empty keys added. An
+// extra key would be written on the next pass for every registration in
+// service, which is a write and an ArgoCD cache churn per cluster for a change
+// nobody asked for.
+//
+// ArgoCD also reads an absent namespaces key as "every namespace", so an empty
+// one would not merely be noise: it would change what the Secret means.
+func TestAnUnscopedRegistrationWritesNoScopingKeys(t *testing.T) {
+	t.Parallel()
+
+	desired := ClusterSecret{
+		Name: "cluster-downstream-1", Namespace: "argocd",
+		DisplayName: "downstream-1", Server: "https://10.0.0.10:6443",
+	}
+	config := desired.registrationConfig()
+
+	got := make([]string, 0, len(config.Data))
+	for k := range config.Data {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+
+	// Pinned exactly rather than checked for absence: a future key added
+	// unconditionally would pass an absence check and still churn every Secret.
+	if want := []string{"name", "server"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("data keys = %v, want exactly %v", got, want)
+	}
+}
+
+// The format is ArgoCD's, not ours: it reads namespaces as a comma-separated
+// list and clusterResources as a quoted boolean. Getting either shape wrong
+// produces a Secret ArgoCD accepts and silently misreads.
+func TestAScopedRegistrationWritesArgoCDsFormat(t *testing.T) {
+	t.Parallel()
+
+	yes := true
+	desired := ClusterSecret{
+		Name: "cluster-downstream-1", Namespace: "argocd",
+		DisplayName: "downstream-1", Server: "https://10.0.0.10:6443",
+		Namespaces: []string{"team-a", "team-b"}, ClusterResources: &yes,
+	}
+	config := desired.registrationConfig()
+
+	if got := string(config.Data["namespaces"]); got != "team-a,team-b" {
+		t.Errorf("namespaces = %q, want %q", got, "team-a,team-b")
+	}
+	if got := string(config.Data["clusterResources"]); got != "true" {
+		t.Errorf("clusterResources = %q, want %q", got, "true")
+	}
+}
+
+// false is a value the operator chose and must be written; only nil means they
+// never mentioned it. Collapsing the two would make it impossible to say
+// "these namespaces, and no cluster-scoped resources" — the tightest scoping
+// the feature can express, and the one most likely to be wanted.
+func TestClusterResourcesFalseIsWrittenRatherThanOmitted(t *testing.T) {
+	t.Parallel()
+
+	no := false
+	desired := ClusterSecret{
+		Name: "cluster-downstream-1", Namespace: "argocd",
+		DisplayName: "downstream-1", Server: "https://10.0.0.10:6443",
+		Namespaces: []string{"team-a"}, ClusterResources: &no,
+	}
+	config := desired.registrationConfig()
+
+	raw, ok := config.Data["clusterResources"]
+	if !ok {
+		t.Fatal("clusterResources was omitted, so an explicit false cannot be expressed")
+	}
+	if string(raw) != "false" {
+		t.Errorf("clusterResources = %q, want %q", raw, "false")
 	}
 }

@@ -39,6 +39,7 @@ func testCluster() config.Cluster {
 		SelfServiceAccountName: "k2a-token-sync",
 		SelfTokenTTL:           2160 * time.Hour,
 		ServiceAccount:         config.ServiceAccountRef{Name: "argocd-manager", Namespace: "kube-system"},
+		ClusterRole:            "cluster-admin",
 	}
 }
 

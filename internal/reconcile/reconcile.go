@@ -207,7 +207,7 @@ func (r *Reconciler) reconcile(
 	//
 	// Two reads when nothing is wrong, which is the whole cost.
 	repairs, err := downstream.EnsureArgoCDIdentity(ctx, access.client,
-		cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name)
+		cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name, cluster.ClusterRole)
 	if err != nil {
 		return err
 	}
@@ -235,6 +235,8 @@ func (r *Reconciler) reconcile(
 		Server:           cluster.ServerURL(),
 		CAData:           ca,
 		Project:          cluster.Project,
+		Namespaces:       cluster.Namespaces,
+		ClusterResources: cluster.ClusterResources,
 		ClusterName:      cluster.Name,
 		ExtraLabels:      cluster.Labels,
 		ExtraAnnotations: cluster.Annotations,
@@ -541,6 +543,10 @@ func reasonFor(err error) string {
 		return v1alpha1.ReasonCredentialRejected
 	case errors.Is(err, errCredentialReplaced):
 		return v1alpha1.ReasonCredentialReplaced
+	case errors.Is(err, downstream.ErrRoleRefImmutable):
+		// Not a failure of the cluster: the connection asks for a role its
+		// binding does not reference, which only bootstrap can change.
+		return v1alpha1.ReasonRoleRefImmutable
 	case apierrors.IsForbidden(err):
 		// The API server answered and refused. Worth its own reason rather than
 		// the neutral default: a permission failure has a specific remedy, and
@@ -709,10 +715,12 @@ func (r *Reconciler) access(ctx context.Context, cluster config.Cluster) (*clust
 func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
 	namespace := cluster.ServiceAccount.Namespace
 
-	if err := downstream.EnsureSelfIdentity(ctx, admin, namespace, cluster.SelfServiceAccountName); err != nil {
+	if err := downstream.EnsureSelfIdentity(ctx, admin, namespace, cluster.SelfServiceAccountName,
+		cluster.ClusterRole); err != nil {
 		return nil, err
 	}
-	if _, err := downstream.EnsureArgoCDIdentity(ctx, admin, namespace, cluster.ServiceAccount.Name); err != nil {
+	if _, err := downstream.EnsureArgoCDIdentity(ctx, admin, namespace, cluster.ServiceAccount.Name,
+		cluster.ClusterRole); err != nil {
 		return nil, err
 	}
 

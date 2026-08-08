@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -74,6 +75,16 @@ func runBootstrap(args []string) error {
 		saNamespace = fs.String("serviceaccount-namespace", "kube-system", "namespace for the downstream ServiceAccounts")
 		selfSAName  = fs.String("self-serviceaccount", "k2a-token-sync", "downstream ServiceAccount k2a-token-sync authenticates as")
 
+		clusterRole = fs.String("cluster-role", "",
+			"downstream ClusterRole ArgoCD's identity is bound to (default: cluster-admin)")
+		namespaces = fs.String("namespaces", "",
+			"comma-separated namespaces to restrict ArgoCD to on this cluster (default: all)")
+		clusterResources = fs.Bool("cluster-resources", false,
+			"allow ArgoCD to manage cluster-scoped resources; only meaningful with --namespaces")
+		replaceBinding = fs.Bool("replace-binding", false,
+			"replace an existing ClusterRoleBinding that names a different --cluster-role; "+
+				"ArgoCD is briefly unauthorised while it is recreated")
+
 		printOnly = fs.Bool("print", false, "write the ClusterConnection to stdout instead of applying it")
 		dryRun    = fs.Bool("dry-run", false, "report what would be done and change nothing")
 	)
@@ -109,6 +120,17 @@ would silently repoint an existing registration at a different cluster. Migratin
 from 'argocd cluster add' is the case where you do want that, and --adopt is how
 you say so.
 
+By default ArgoCD is bound to cluster-admin over every namespace, which is what
+'argocd cluster add' installs. --cluster-role names a narrower role you have
+created on the downstream cluster; --namespaces restricts what ArgoCD will
+manage there. The two are independent: the role governs what the API server
+permits, the namespaces govern what ArgoCD attempts.
+
+A ClusterRoleBinding's roleRef is immutable, so changing --cluster-role on a
+cluster already provisioned needs --replace-binding, which deletes and recreates
+it. ArgoCD is unauthorised for the moment in between: its token still
+authenticates, so every request it makes fails until the new binding lands.
+
 The credential never passes through your terminal, and the manifest contains
 nothing secret:
 
@@ -138,12 +160,24 @@ Flags:
 		return errors.New("one of --from-kubeconfig or --from-context is required, to reach the downstream cluster")
 	}
 
+	// Only passed on when the flag was actually given: --cluster-resources
+	// defaults to false, and false is a value FromSpec rejects without
+	// --namespaces. Reading it unconditionally would make every unscoped
+	// bootstrap fail.
+	var scopedResources *bool
+	if isFlagSet(fs, "cluster-resources") {
+		scopedResources = clusterResources
+	}
+
 	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{
 		Name:                    *clusterName,
 		Endpoint:                *endpoint,
 		ServiceAccountName:      *saName,
 		ServiceAccountNamespace: *saNamespace,
 		SelfServiceAccountName:  *selfSAName,
+		ClusterRole:             *clusterRole,
+		Namespaces:              splitNamespaces(*namespaces),
+		ClusterResources:        scopedResources,
 	})
 	if err != nil {
 		return err
@@ -186,6 +220,27 @@ Flags:
 	}
 	out.stepf("endpoint certificate", "valid until %s (%d days left)",
 		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
+	out.stepf("permissions", "%s", describeScope(cluster))
+
+	// Before provisioning, for the same reason the registration check is: a role
+	// change discovered afterwards would stop with identities already created,
+	// and this is the only point at which it can be prevented rather than
+	// reported. Reading the binding needs the administrative credentials that
+	// only exist here.
+	boundRole, err := downstream.BindingRole(ctx, downstreamClient, cluster.ServiceAccount.Name+"-role-binding")
+	if err != nil {
+		return err
+	}
+	replacing := boundRole != "" && boundRole != cluster.ClusterRole
+	if replacing && !*replaceBinding {
+		return fmt.Errorf("%s is bound to %q, but --cluster-role asks for %q.\n"+
+			"  A roleRef is immutable, so the binding has to be deleted and recreated. Re-run with "+
+			"--replace-binding to do that.\n"+
+			"  ArgoCD is unauthorised for the moment between the two — its token still authenticates, "+
+			"so every request it makes fails until the new binding lands.\n"+
+			"  Nothing has been changed",
+			cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
+	}
 
 	// Before provisioning, and before the dry-run branch, because this is the only
 	// point at which taking over somebody else's registration can be *prevented*
@@ -203,6 +258,11 @@ Flags:
 	adopted := target.recordsAdoption(*adopt)
 
 	if *dryRun {
+		if replacing {
+			out.stepf("binding", "would replace %s: %s -> %s",
+				cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
+			out.warnf("ArgoCD is unauthorised between the delete and the create")
+		}
 		out.stepf("identities", "would create %s and %s",
 			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
 			cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
@@ -220,6 +280,16 @@ Flags:
 		out.notef("Nothing was changed. The manifest below is what would be applied.")
 		out.blank()
 		return printConnection(cluster, *namespace, adopted)
+	}
+
+	if replacing {
+		if err := downstream.ReplaceClusterRoleBinding(ctx, downstreamClient,
+			cluster.ServiceAccount.Name+"-role-binding", cluster.ClusterRole,
+			cluster.ServiceAccount.Namespace, cluster.ServiceAccount.Name); err != nil {
+			return err
+		}
+		out.stepf("binding", "replaced %s: %s -> %s",
+			cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
 	}
 
 	provisioned, err := reconcile.Provision(ctx, downstreamClient, cluster)
@@ -483,6 +553,13 @@ func verifyCredential(ctx context.Context, cluster config.Cluster, creds *kubecl
 // because the pass that notices is a different process, days later: bootstrap is
 // the only place the intent exists, and the object is the only place it survives.
 func connectionFor(cluster config.Cluster, namespace string, adopted bool) *v1alpha1.ClusterConnection {
+	// Only when it differs from the schema's default, for the reason given on the
+	// spec below.
+	var clusterRole string
+	if cluster.ClusterRole != config.DefaultClusterRole {
+		clusterRole = cluster.ClusterRole
+	}
+
 	var annotations map[string]string
 	if adopted {
 		annotations = map[string]string{v1alpha1.AnnotationAdopted: "true"}
@@ -500,6 +577,15 @@ func connectionFor(cluster config.Cluster, namespace string, adopted bool) *v1al
 		Spec: v1alpha1.ClusterConnectionSpec{
 			Endpoint:   cluster.Endpoint,
 			SecretName: cluster.SecretName,
+			// Scoping is emitted only when it differs from what the schema would
+			// supply. A manifest naming cluster-admin explicitly would freeze
+			// today's default into a file that outlives it — the same reason
+			// tokenTTL and serviceAccount are left out — while a scoped
+			// registration that omitted them would apply as an unscoped one, which
+			// is the failure that actually matters.
+			ClusterRole:      clusterRole,
+			Namespaces:       cluster.Namespaces,
+			ClusterResources: cluster.ClusterResources,
 		},
 	}
 }
@@ -595,4 +681,57 @@ func describeCluster(contextName, host string) string {
 		return host
 	}
 	return fmt.Sprintf("context %s (%s)", contextName, host)
+}
+
+// isFlagSet reports whether a flag was given on the command line, as opposed to
+// left at its default.
+//
+// --cluster-resources needs the distinction that a bool flag cannot carry on its
+// own: false is a value an operator may deliberately want written into ArgoCD's
+// Secret, while an unmentioned flag must write nothing at all. Reading the bool
+// alone would make every bootstrap that never mentioned it ask for
+// clusterResources=false, which FromSpec rejects without --namespaces.
+func isFlagSet(fs *flag.FlagSet, name string) bool {
+	var set bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// splitNamespaces turns the comma-separated --namespaces value into the list the
+// spec carries, dropping empty entries so a trailing comma or a stray space does
+// not become a namespace named "".
+func splitNamespaces(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// describeScope summarises what ArgoCD will be permitted on this cluster, in one
+// line, at the point the identities are about to be created.
+//
+// Worth stating outright rather than leaving to the manifest: the difference
+// between cluster-admin everywhere and a narrow role in two namespaces is the
+// whole reason these flags exist, and it is the last moment before the binding
+// is created that anyone can notice they typed the wrong thing.
+func describeScope(cluster config.Cluster) string {
+	scope := "all namespaces"
+	if len(cluster.Namespaces) > 0 {
+		scope = "namespaces " + strings.Join(cluster.Namespaces, ", ")
+		if cluster.ClusterResources != nil && *cluster.ClusterResources {
+			scope += ", plus cluster-scoped resources"
+		}
+	}
+	return fmt.Sprintf("%s over %s", cluster.ClusterRole, scope)
 }
