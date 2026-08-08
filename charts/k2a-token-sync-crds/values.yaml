@@ -15,9 +15,10 @@ crds:
   # The helm half is verified: uninstalling this release leaves the CRD and
   # every ClusterConnection in place. The ArgoCD half is not. Deleting an
   # Application that had synced this chart deleted nothing either way, with the
-  # annotation and without it, because ArgoCD stamped no tracking marker on the
-  # CRD and so found nothing of its own to cascade to. It is kept because it is
-  # correct practice and costs nothing, not because it has been shown to be
+  # annotation and without it — ArgoCD stamped a tracking marker on namespaced
+  # resources it managed but never on the cluster-scoped CRD, so cascade
+  # deletion had nothing of its own to act on. It is kept because it is correct
+  # practice and costs nothing, not because it has been shown to be
   # load-bearing — see the README's ArgoCD section.
   #
   # Turning this off is the deliberate act that makes the CRD removable.

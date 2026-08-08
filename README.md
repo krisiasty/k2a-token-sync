@@ -404,17 +404,23 @@ Both annotations are set because the two deployment paths read different ones: `
 interpreted by `helm uninstall`, which ArgoCD never runs — it renders with `helm template`, applies the output,
 and prunes from its own resource tracking.
 
-**How much the ArgoCD half is doing is unverified.** Testing against ArgoCD 3.x — both `core-install` and the
-full install, with `resourceTrackingMethod` left at its default and set to `annotation` — deleting an
-Application that had synced this chart reported `Successfully deleted 0 resources` and left the CRD in place,
-**with the guard removed as well as with it set**. ArgoCD never stamped a tracking marker on the CRD in any of
-those configurations, so cascade deletion found nothing it considered its own, and there was nothing for the
-annotation to prevent.
+**How much the ArgoCD half is doing is unverified.** Testing against ArgoCD 3.x — `core-install` and the full
+install, `resourceTrackingMethod` at its default and set to `annotation`, the CRD adopted from Helm and created
+from scratch by a dedicated Application with no Helm involved — deleting an Application that had synced this
+chart reported `Successfully deleted 0 resources` and left the CRD in place every time, **with the guard
+removed as well as with it set**. Every Application carried the `resources-finalizer.argocd.argoproj.io`
+finalizer, so cascade deletion was genuinely armed.
+
+The reason appears to be that ArgoCD did not treat the CRD as one of its own resources. It stamped
+`argocd.argoproj.io/tracking-id` on namespaced resources it managed in the same cluster — a Deployment it had
+created carried one — but never on the cluster-scoped CRD, in any configuration tried. With nothing tracked,
+cascade deletion had nothing to cascade to, and the annotation had nothing to prevent.
 
 So the honest position is that the annotation is correct practice and costs nothing, but it has not been shown
-to change ArgoCD's behaviour here, and the risk it guards against did not reproduce. Treat it as a safeguard
-rather than as the thing standing between you and a deleted inventory — and if you are relying on it, verify it
-against your own ArgoCD configuration rather than this note.
+to change ArgoCD's behaviour, and the hazard it guards against did not reproduce. Treat it as a safeguard
+rather than as the thing standing between you and a deleted inventory. If you are relying on it, verify it
+against your own ArgoCD version and configuration rather than this note — resource tracking is exactly the sort
+of behaviour that varies between them.
 
 A third Application can own the ClusterConnection objects if you want the fleet declared in git — optional, and
 discussed under [Deployment paths](#deployment-paths).
