@@ -1,5 +1,8 @@
 {{- $name := include "k2a-token-sync.name" . }}
 {{- $argocdNamespace := include "k2a-token-sync.argocdNamespace" . }}
+{{- if and .Values.restrictedRBAC.enabled (eq $argocdNamespace .Release.Namespace) }}
+{{- fail "restrictedRBAC.enabled cannot be used when argocdNamespace equals the release namespace: the same-namespace Role already has broad Secret access" }}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -64,17 +67,16 @@ subjects:
 ---
 # ArgoCD's namespace, where the generated cluster Secrets live.
 #
-# k2a-token-sync holds create and patch here, and nothing else. In particular it
-# cannot read: not the Secrets it writes, not ArgoCD's own. It learns the result
-# of its own writes from what an apply returns, and records everything else in
-# each ClusterConnection's status.
+# k2a-token-sync holds create and, in ordinary mode, patch here, and nothing else.
+# In particular it cannot read: not the Secrets it writes, not ArgoCD's own. It
+# learns the result of its own writes from what an apply returns, and records
+# everything else in each ClusterConnection's status.
 #
-# These verbs are namespace-wide because they have to be. Cluster names are not
-# known when this Role is created — that is the entire point of an inventory that
-# changes at runtime — and RBAC cannot scope resourceNames by prefix. Two things
-# limit what that permits: secretName must begin with "cluster-", so a connection
-# cannot be aimed at ArgoCD's own Secrets, and the absence of delete means nothing
-# here can be removed by k2a-token-sync.
+# In ordinary mode both verbs are namespace-wide because cluster names are not
+# known when this Role is created and RBAC cannot scope create by resourceNames.
+# In restricted mode the operator-managed Role created by `restrict-rbac` carries
+# patch for exact names, while this Helm-owned baseline retains create alone. That
+# split is deliberate: putting create beside resourceNames would not restrict it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -85,7 +87,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "patch"]
+    verbs: ["create"{{ if not .Values.restrictedRBAC.enabled }}, "patch"{{ end }}]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
