@@ -101,6 +101,75 @@ func TestPrintedManifestMatchesWhatWouldBeApplied(t *testing.T) {
 	}
 }
 
+// Delegated bootstrap hands this artifact to a different team, so it must be a
+// complete, directly applicable contract rather than prose approximating what
+// the ordinary bootstrap path would create.
+func TestRenderedDownstreamManifestIsCompleteAndManaged(t *testing.T) {
+	t.Parallel()
+
+	cluster, err := config.BootstrapCluster(config.BootstrapClusterInput{
+		Name:                    "delegated-1",
+		Endpoint:                "delegated-1.example.com",
+		ServiceAccountName:      "argocd-delegated",
+		ServiceAccountNamespace: "cluster-access",
+		SelfServiceAccountName:  "token-sync-delegated",
+		ClusterRole:             "argocd-restricted",
+	})
+	if err != nil {
+		t.Fatalf("BootstrapCluster returned unexpected error: %v", err)
+	}
+
+	raw, err := renderDownstreamManifest(cluster)
+	if err != nil {
+		t.Fatalf("renderDownstreamManifest returned unexpected error: %v", err)
+	}
+	documents := strings.Split(strings.TrimSpace(string(raw)), "\n---\n")
+	want := []struct {
+		apiVersion string
+		kind       string
+		name       string
+		namespace  string
+	}{
+		{"v1", "ServiceAccount", "argocd-delegated", "cluster-access"},
+		{"rbac.authorization.k8s.io/v1", "ClusterRoleBinding", "argocd-delegated-role-binding", ""},
+		{"v1", "ServiceAccount", "token-sync-delegated", "cluster-access"},
+		{"rbac.authorization.k8s.io/v1", "ClusterRole", "token-sync-delegated", ""},
+		{"rbac.authorization.k8s.io/v1", "ClusterRoleBinding", "token-sync-delegated", ""},
+	}
+	if len(documents) != len(want) {
+		t.Fatalf("manifest has %d YAML documents, want %d:\n%s", len(documents), len(want), raw)
+	}
+
+	for i, document := range documents {
+		var object unstructured.Unstructured
+		if err := yaml.UnmarshalStrict([]byte(document), &object); err != nil {
+			t.Fatalf("document %d is not valid Kubernetes YAML: %v\n%s", i+1, err, document)
+		}
+		if object.GetAPIVersion() != want[i].apiVersion || object.GetKind() != want[i].kind ||
+			object.GetName() != want[i].name || object.GetNamespace() != want[i].namespace {
+			t.Errorf("document %d identity = %s %s %s/%s, want %s %s %s/%s",
+				i+1, object.GetAPIVersion(), object.GetKind(), object.GetNamespace(), object.GetName(),
+				want[i].apiVersion, want[i].kind, want[i].namespace, want[i].name)
+		}
+		if object.GetLabels()["app.kubernetes.io/managed-by"] != "k2a-token-sync" {
+			t.Errorf("document %d (%s) lacks the managed-by label", i+1, object.GetName())
+		}
+	}
+
+	// The chosen ArgoCD role has to reach both the ArgoCD binding and the self
+	// role's narrowly-scoped bind grant. Dropping either would apply cleanly but
+	// leave completion or the first repair unable to work.
+	for _, needle := range []string{
+		"name: argocd-restricted",
+		"resourceNames:\n  - argocd-restricted",
+		"resources:\n  - serviceaccounts/token",
+	} {
+		if !strings.Contains(string(raw), needle) {
+			t.Errorf("downstream manifest does not contain %q:\n%s", needle, raw)
+		}
+	}
+}
+
 // A scoped registration's manifest has to carry its scoping. --print exists so
 // the object can live in git, and one that silently dropped the fields would
 // apply as an unscoped, cluster-admin registration — the exact thing the

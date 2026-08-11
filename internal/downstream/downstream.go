@@ -19,6 +19,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -37,6 +38,55 @@ const (
 // ManagedByLabel marks every object this tool creates in a downstream cluster,
 // so an operator can find and remove them.
 var ManagedByLabel = map[string]string{"app.kubernetes.io/managed-by": "k2a-token-sync"}
+
+func serviceAccount(namespace, name string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    ManagedByLabel,
+		},
+	}
+}
+
+func clusterRoleBinding(bindingName, clusterRole, saNamespace, saName string) *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRoleBinding"},
+		ObjectMeta: metav1.ObjectMeta{Name: bindingName, Labels: ManagedByLabel},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     clusterRole,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      saName,
+			Namespace: saNamespace,
+		}},
+	}
+}
+
+func selfClusterRole(name, clusterRole string) *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta:   metav1.TypeMeta{APIVersion: rbacv1.SchemeGroupVersion.String(), Kind: "ClusterRole"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: ManagedByLabel},
+		Rules:      selfRules(clusterRole),
+	}
+}
+
+// IdentityObjects returns the complete downstream contract bootstrap installs.
+// The imperative and delegated bootstrap paths both use these constructors, so
+// the printable manifest cannot drift from what ordinary provisioning creates.
+func IdentityObjects(namespace, argocdName, selfName, clusterRole string) []runtime.Object {
+	return []runtime.Object{
+		serviceAccount(namespace, argocdName),
+		clusterRoleBinding(argocdName+"-role-binding", clusterRole, namespace, argocdName),
+		serviceAccount(namespace, selfName),
+		selfClusterRole(selfName, clusterRole),
+		clusterRoleBinding(selfName, selfName, namespace, selfName),
+	}
+}
 
 // Repairs records what EnsureArgoCDIdentity had to put back.
 //
@@ -98,9 +148,7 @@ func EnsureServiceAccount(ctx context.Context, client kubernetes.Interface, name
 		return false, fmt.Errorf("getting serviceaccount %s/%s: %w", namespace, name, err)
 	}
 
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: ManagedByLabel},
-	}
+	sa := serviceAccount(namespace, name)
 	if _, err := client.CoreV1().ServiceAccounts(namespace).Create(ctx, sa, metav1.CreateOptions{}); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return false, nil
@@ -129,11 +177,7 @@ var ErrRoleRefImmutable = errors.New("clusterrolebinding references a different 
 // when the cluster was provisioned. Both halves of the remedy therefore need
 // bootstrap, which is what the error says.
 func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, bindingName, clusterRole, saNamespace, saName string) (bool, error) {
-	subject := rbacv1.Subject{
-		Kind:      rbacv1.ServiceAccountKind,
-		Name:      saName,
-		Namespace: saNamespace,
-	}
+	subject := clusterRoleBinding(bindingName, clusterRole, saNamespace, saName).Subjects[0]
 
 	existing, err := client.RbacV1().ClusterRoleBindings().Get(ctx, bindingName, metav1.GetOptions{})
 	if err == nil {
@@ -156,15 +200,7 @@ func EnsureClusterRoleBinding(ctx context.Context, client kubernetes.Interface, 
 		return false, fmt.Errorf("getting clusterrolebinding %s: %w", bindingName, err)
 	}
 
-	binding := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: bindingName, Labels: ManagedByLabel},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "ClusterRole",
-			Name:     clusterRole,
-		},
-		Subjects: []rbacv1.Subject{subject},
-	}
+	binding := clusterRoleBinding(bindingName, clusterRole, saNamespace, saName)
 	if _, err := client.RbacV1().ClusterRoleBindings().Create(ctx, binding, metav1.CreateOptions{}); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			return false, nil
@@ -357,10 +393,7 @@ func EnsureSelfIdentity(ctx context.Context, client kubernetes.Interface, namesp
 		return err
 	}
 
-	role := &rbacv1.ClusterRole{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: ManagedByLabel},
-		Rules:      selfRules(clusterRole),
-	}
+	role := selfClusterRole(name, clusterRole)
 	if _, err := client.RbacV1().ClusterRoles().Create(ctx, role, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
 			return fmt.Errorf("creating clusterrole %s: %w", name, err)
