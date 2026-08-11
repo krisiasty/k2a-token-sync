@@ -723,13 +723,26 @@ func Provision(ctx context.Context, admin kubernetes.Interface, cluster config.C
 		cluster.ClusterRole); err != nil {
 		return nil, err
 	}
+	return provisionCredential(ctx, admin, cluster)
+}
 
-	token, err := downstream.MintToken(ctx, admin, namespace, cluster.SelfServiceAccountName, cluster.SelfTokenTTL)
+// ProvisionFromExisting completes a delegated bootstrap after an administrator
+// has applied downstream.IdentityObjects. It deliberately performs no repair or
+// provisioning: the only create request is the TokenRequest that mints the first
+// short-lived credential for k2a-token-sync's existing ServiceAccount.
+func ProvisionFromExisting(ctx context.Context, client kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
+	return provisionCredential(ctx, client, cluster)
+}
+
+func provisionCredential(ctx context.Context, client kubernetes.Interface, cluster config.Cluster) (*k8s.Credentials, error) {
+	namespace := cluster.ServiceAccount.Namespace
+
+	token, err := downstream.MintToken(ctx, client, namespace, cluster.SelfServiceAccountName, cluster.SelfTokenTTL)
 	if err != nil {
 		return nil, err
 	}
 
-	ca, err := downstream.ClusterCA(ctx, admin, namespace)
+	ca, err := downstream.ClusterCA(ctx, client, namespace)
 	if err != nil {
 		return nil, err
 	}

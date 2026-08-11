@@ -749,6 +749,11 @@ as above" rather than leaving you to compare two addresses.
 - use that credential once against the endpoint to prove the whole path works;
 - apply the ClusterConnection.
 
+The delegated path splits that same ordering after the probe. `--print-downstream`
+prints the identities and RBAC without contacting the cluster running ArgoCD;
+after an administrator applies them, `--complete` starts at the credential step
+and does not create, update or replace any downstream identity or RBAC object.
+
 The pre-flight is there because a certificate that does not cover the endpoint is the most common reason direct access
 fails, and it is far cheaper to learn before two identities exist than after. The verification is a warning rather than
 an error — the endpoint may be reachable from the cluster k2a-token-sync runs on but not from your desk.
@@ -763,11 +768,13 @@ directly. Progress goes to stderr, so `--print` can send the manifest to stdout 
 
 ### Modes
 
-| Mode | Prepares the cluster | Stores the credential | ClusterConnection |
+| Mode | Downstream identities and RBAC | Stores the credential | ClusterConnection |
 | --- | --- | --- | --- |
-| default | yes | yes | applied |
-| `--print` | yes | yes | written to stdout, not applied |
-| `--dry-run` | no | no | shown as a preview |
+| default | applied | yes | applied |
+| `--print` | applied | yes | written to stdout, not applied |
+| `--print-downstream` | written to stdout, not applied | no | untouched |
+| `--complete` | uses pre-applied objects without recreating them | yes | applied |
+| `--dry-run` | untouched | no | shown as a preview |
 
 Every mode checks the endpoint first: that a certificate is served there, that it covers the address ArgoCD will use, and
 that it verifies against the cluster's own CA. A missing SAN is the usual reason direct access fails, so `--dry-run` is
@@ -775,6 +782,51 @@ worth running against a new cluster before anything is created — it changes no
 along with when the certificate expires.
 
 `k2a-token-sync bootstrap --help` lists the rest.
+
+### Delegating downstream preparation
+
+Use this path when the person onboarding the cluster can reach its API endpoint
+but another team holds the administrative access. First, the onboarding side
+runs the same certificate pre-flight as an ordinary bootstrap and captures the
+downstream-only manifest:
+
+```bash
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig \
+  --print-downstream > standalone-1-downstream.yaml
+```
+
+Nothing is created in this step, and the cluster running ArgoCD is not contacted.
+The YAML contains the two ServiceAccounts, their two ClusterRoleBindings, and
+k2a-token-sync's ClusterRole. Every object carries
+`app.kubernetes.io/managed-by: k2a-token-sync`, exactly as it does when bootstrap
+applies the objects itself.
+
+Hand that file to the downstream administrator, who applies it:
+
+```bash
+kubectl --kubeconfig ./standalone-1-admin.kubeconfig \
+  apply -f standalone-1-downstream.yaml
+```
+
+Then complete the bootstrap from the onboarding side with the same names and
+scoping flags used to print the manifest:
+
+```bash
+k2a-token-sync bootstrap --cluster standalone-1 \
+  --endpoint standalone-1.example.com:6443 \
+  --from-kubeconfig ./standalone-1.kubeconfig \
+  --complete
+```
+
+The downstream credential used for `--complete` needs only enough access to read
+`kube-root-ca.crt` and create a TokenRequest for the pre-applied
+`kube-system/k2a-token-sync` ServiceAccount. It does not need permission to create
+or update ServiceAccounts, ClusterRoles, or ClusterRoleBindings. Completion mints
+and verifies the initial credential, stores it in the cluster running ArgoCD, and
+applies the ClusterConnection. From then on, k2a-token-sync renews through its own
+identity as usual.
 
 ### Keeping the objects in git
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -41,9 +42,10 @@ const bootstrapTimeout = 2 * time.Minute
 // and the same is true of `argocd cluster add`.
 //
 // By default it finishes the job: provisions the identities, stores the
-// credential, and applies the ClusterConnection. --print stops short of applying
-// and writes the manifest to stdout instead, for anyone keeping those objects in
-// git. Progress goes to stderr either way, so a redirect captures only YAML.
+// credential, and applies the ClusterConnection. The delegated modes split that
+// at the administrative boundary: --print-downstream emits the identities and
+// RBAC, and --complete carries on after somebody else has applied them. Progress
+// goes to stderr, so a redirect captures only YAML in either printing mode.
 func runBootstrap(args []string) error {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -53,7 +55,7 @@ func runBootstrap(args []string) error {
 		endpoint    = fs.String("endpoint", "", "the address ArgoCD will connect to, as host or host:port (required)")
 
 		fromKubeconfig = fs.String("from-kubeconfig", "",
-			"path to a kubeconfig granting admin access to the downstream cluster")
+			"path to a kubeconfig for the downstream cluster (admin except in delegated modes)")
 		fromContext = fs.String("from-context", "",
 			"context to use within --from-kubeconfig, or within the ambient kubeconfig when that is unset")
 
@@ -86,8 +88,12 @@ func runBootstrap(args []string) error {
 			"replace an existing ClusterRoleBinding that names a different --cluster-role; "+
 				"ArgoCD is briefly unauthorised while it is recreated")
 
-		printOnly = fs.Bool("print", false, "write the ClusterConnection to stdout instead of applying it")
-		dryRun    = fs.Bool("dry-run", false, "report what would be done and change nothing")
+		printOnly       = fs.Bool("print", false, "write the ClusterConnection to stdout instead of applying it")
+		printDownstream = fs.Bool("print-downstream", false,
+			"write the downstream identity and RBAC manifest to stdout, without creating anything")
+		complete = fs.Bool("complete", false,
+			"complete bootstrap after the --print-downstream manifest has been applied")
+		dryRun = fs.Bool("dry-run", false, "report what would be done and change nothing")
 	)
 
 	fs.Usage = func() {
@@ -108,10 +114,14 @@ both default to your usual kubeconfig and current context. --from-kubeconfig and
 required.
 
 Modes:
-  (default)    provision, store the credential, and apply the ClusterConnection
-  --print      provision and store the credential, but write the manifest to
-               stdout instead of applying it — for keeping those objects in git
-  --dry-run    change nothing; report the plan and show the manifest
+  (default)           provision, store the credential, and apply the ClusterConnection
+  --print             provision and store the credential, but write the
+                      ClusterConnection to stdout instead of applying it
+  --print-downstream  run the endpoint pre-flight, then write the downstream
+                      identities and RBAC to stdout without creating anything
+  --complete          mint, verify, store and publish after that downstream
+                      manifest has been applied; never recreates those objects
+  --dry-run           change nothing; report the plan and show the ClusterConnection
 
 Before provisioning anything, this checks whether ArgoCD already holds a cluster
 Secret under the name this cluster would claim, and refuses if one is there that
@@ -159,6 +169,16 @@ Flags:
 	case *fromKubeconfig == "" && *fromContext == "":
 		fs.Usage()
 		return errors.New("one of --from-kubeconfig or --from-context is required, to reach the downstream cluster")
+	case *printDownstream && (*printOnly || *complete || *dryRun):
+		return errors.New("--print-downstream is a mode and cannot be combined with --print, --complete, or --dry-run")
+	case *printDownstream && *replaceBinding:
+		return errors.New("--print-downstream never changes downstream objects and cannot be combined with --replace-binding")
+	case *complete && (*printOnly || *dryRun):
+		return errors.New("--complete is a mode and cannot be combined with --print or --dry-run")
+	case *printOnly && *dryRun:
+		return errors.New("--print and --dry-run are separate modes and cannot be combined")
+	case *complete && *replaceBinding:
+		return errors.New("--complete never recreates downstream objects and cannot be combined with --replace-binding")
 	}
 
 	// Only passed on when the flag was actually given: --cluster-resources
@@ -189,18 +209,10 @@ Flags:
 
 	out := &steps{w: os.Stderr}
 
-	// Both connections are resolved before anything is created. Provisioning a
-	// cluster and then discovering there is nowhere to put the result would leave
-	// identities behind with no credential stored for them.
+	// The downstream connection is the only one the manifest-only half needs.
+	// Its credential can be deliberately non-administrative: the pre-flight reads
+	// the projected CA ConfigMap, and rendering below is entirely local.
 	downstreamClient, downstreamCfg, err := kubeclient.ClientForContext(*fromKubeconfig, *fromContext)
-	if err != nil {
-		return err
-	}
-	localClient, localCfg, err := localClientFor(*kubeconfig, *kubeContext)
-	if err != nil {
-		return err
-	}
-	localDyn, err := kubeclient.DynamicClientForContext(*kubeconfig, *kubeContext)
 	if err != nil {
 		return err
 	}
@@ -227,24 +239,48 @@ Flags:
 		cert.NotAfter.UTC().Format(time.DateOnly), cert.DaysRemaining())
 	out.stepf("permissions", "%s", describeScope(cluster))
 
+	if *printDownstream {
+		out.blank()
+		out.notef("Apply the manifest below to %s, then re-run this command with --complete.", downstreamCfg.Host)
+		out.blank()
+		return printDownstreamManifest(cluster)
+	}
+
+	// Resolve the receiving cluster before minting or creating anything. Finding
+	// nowhere to store the result after provisioning would leave an unusable half
+	// bootstrap behind. The manifest-only mode intentionally returned before this:
+	// it neither reads nor changes the receiving cluster.
+	localClient, localCfg, err := localClientFor(*kubeconfig, *kubeContext)
+	if err != nil {
+		return err
+	}
+	localDyn, err := kubeclient.DynamicClientForContext(*kubeconfig, *kubeContext)
+	if err != nil {
+		return err
+	}
+
 	// Before provisioning, for the same reason the registration check is: a role
 	// change discovered afterwards would stop with identities already created,
 	// and this is the only point at which it can be prevented rather than
 	// reported. Reading the binding needs the administrative credentials that
 	// only exist here.
-	boundRole, err := downstream.BindingRole(ctx, downstreamClient, cluster.ServiceAccount.Name+"-role-binding")
-	if err != nil {
-		return err
-	}
-	replacing := boundRole != "" && boundRole != cluster.ClusterRole
-	if replacing && !*replaceBinding {
-		return fmt.Errorf("%s is bound to %q, but --cluster-role asks for %q.\n"+
-			"  A roleRef is immutable, so the binding has to be deleted and recreated. Re-run with "+
-			"--replace-binding to do that.\n"+
-			"  ArgoCD is unauthorised for the moment between the two — its token still authenticates, "+
-			"so every request it makes fails until the new binding lands.\n"+
-			"  Nothing has been changed",
-			cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
+	var boundRole string
+	replacing := false
+	if !*complete {
+		boundRole, err = downstream.BindingRole(ctx, downstreamClient, cluster.ServiceAccount.Name+"-role-binding")
+		if err != nil {
+			return err
+		}
+		replacing = boundRole != "" && boundRole != cluster.ClusterRole
+		if replacing && !*replaceBinding {
+			return fmt.Errorf("%s is bound to %q, but --cluster-role asks for %q.\n"+
+				"  A roleRef is immutable, so the binding has to be deleted and recreated. Re-run with "+
+				"--replace-binding to do that.\n"+
+				"  ArgoCD is unauthorised for the moment between the two — its token still authenticates, "+
+				"so every request it makes fails until the new binding lands.\n"+
+				"  Nothing has been changed",
+				cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
+		}
 	}
 
 	// Before provisioning, and before the dry-run branch, because this is the only
@@ -303,13 +339,24 @@ Flags:
 			cluster.ServiceAccount.Name+"-role-binding", boundRole, cluster.ClusterRole)
 	}
 
-	provisioned, err := reconcile.Provision(ctx, downstreamClient, cluster)
-	if err != nil {
-		return fmt.Errorf("provisioning the downstream cluster: %w", err)
+	var provisioned *kubeclient.Credentials
+	if *complete {
+		provisioned, err = reconcile.ProvisionFromExisting(ctx, downstreamClient, cluster)
+		if err != nil {
+			return fmt.Errorf("completing bootstrap from the pre-applied downstream identities: %w", err)
+		}
+		out.stepf("identities", "using pre-applied %s and %s",
+			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+			cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
+	} else {
+		provisioned, err = reconcile.Provision(ctx, downstreamClient, cluster)
+		if err != nil {
+			return fmt.Errorf("provisioning the downstream cluster: %w", err)
+		}
+		out.stepf("identities", "%s, %s",
+			cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
+			cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
 	}
-	out.stepf("identities", "%s, %s",
-		cluster.ServiceAccount.Namespace+"/"+cluster.ServiceAccount.Name,
-		cluster.ServiceAccount.Namespace+"/"+cluster.SelfServiceAccountName)
 
 	// Prove the path ArgoCD will use, with the credential just minted, before
 	// storing it. Reported here because it is the downstream endpoint being tested;
@@ -628,6 +675,42 @@ func printConnection(cluster config.Cluster, namespace string, adopted bool) err
 	}
 	if _, err := os.Stdout.Write(raw); err != nil {
 		return fmt.Errorf("writing the ClusterConnection: %w", err)
+	}
+	return nil
+}
+
+// renderDownstreamManifest encodes the exact objects ordinary provisioning
+// creates. Documents are ordered so a reader encounters each ServiceAccount
+// before the binding that names it, and are separated for direct kubectl apply.
+func renderDownstreamManifest(cluster config.Cluster) ([]byte, error) {
+	objects := downstream.IdentityObjects(
+		cluster.ServiceAccount.Namespace,
+		cluster.ServiceAccount.Name,
+		cluster.SelfServiceAccountName,
+		cluster.ClusterRole,
+	)
+
+	var out bytes.Buffer
+	for i, object := range objects {
+		if i > 0 {
+			out.WriteString("---\n")
+		}
+		raw, err := yaml.Marshal(object)
+		if err != nil {
+			return nil, fmt.Errorf("encoding downstream bootstrap object %d: %w", i+1, err)
+		}
+		out.Write(raw)
+	}
+	return out.Bytes(), nil
+}
+
+func printDownstreamManifest(cluster config.Cluster) error {
+	raw, err := renderDownstreamManifest(cluster)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stdout.Write(raw); err != nil {
+		return fmt.Errorf("writing the downstream bootstrap manifest: %w", err)
 	}
 	return nil
 }
