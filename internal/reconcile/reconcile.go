@@ -592,17 +592,19 @@ var (
 
 // argocdSecretError explains a permission failure on a generated cluster Secret.
 //
-// k2a-token-sync needs create and patch on Secrets in ArgoCD's namespace and holds
-// nothing else there. The raw API error names neither the Role nor the remedy, so
-// a missing or narrowed Role otherwise looks like a bug in k2a-token-sync.
+// k2a-token-sync needs create and patch on each managed Secret in ArgoCD's
+// namespace and holds nothing else there. The raw API error names neither the
+// Role nor the remedy, so a missing or stale restricted allowlist otherwise looks
+// like a bug in k2a-token-sync.
 //
 // Passing a nil error through keeps the call sites free of extra branching.
 func (r *Reconciler) argocdSecretError(cluster config.Cluster, err error) error {
 	if err == nil || !apierrors.IsForbidden(err) {
 		return err
 	}
-	return fmt.Errorf("%w; k2a-token-sync's Role in namespace %s must allow create and patch on secrets "+
-		"so it can maintain %q", err, r.cfg.ArgoCDNamespace, cluster.SecretName)
+	return fmt.Errorf("%w; k2a-token-sync's Role in namespace %s must allow create and patch on Secret %q; "+
+		"if restricted RBAC is enabled, rerun 'k2a-token-sync restrict-rbac' after inventory or secretName changes",
+		err, r.cfg.ArgoCDNamespace, cluster.SecretName)
 }
 
 // probe inspects the serving certificate at the endpoint and records what it

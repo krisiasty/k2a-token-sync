@@ -10,7 +10,7 @@ type: application
 # Deliberately a separate chart. Helm never upgrades a crds/ directory, so a
 # schema shipped that way is applied by hand on every release that changes it.
 # In templates/ it is an ordinary resource and 'helm upgrade' maintains it.
-version: 0.1.0
+version: 0.1.1
 home: https://github.com/krisiasty/k2a-token-sync
 sources:
   - https://github.com/krisiasty/k2a-token-sync

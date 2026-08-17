@@ -244,11 +244,12 @@ type ClusterConnectionSpec struct {
 	// SecretName is the ArgoCD cluster Secret this connection maintains, in the
 	// namespace k2a-token-sync serves. Defaults to "cluster-<name>".
 	//
-	// The cluster- prefix is required rather than conventional. k2a-token-sync holds
-	// namespace-wide patch on Secrets in ArgoCD's namespace, because cluster
-	// names are not known when its RBAC is created and RBAC cannot scope by
-	// prefix. The prefix is what keeps a connection from being pointed at
-	// ArgoCD's own Secrets.
+	// The cluster- prefix is required rather than conventional. By default,
+	// k2a-token-sync holds namespace-wide patch on Secrets in ArgoCD's namespace,
+	// because cluster names are not known when its RBAC is created and RBAC cannot
+	// scope by prefix. The optional restricted RBAC mode narrows that grant to the
+	// resolved inventory, but the prefix remains a defense on every installation:
+	// it keeps a connection from being pointed at ArgoCD's own Secrets.
 	//
 	// +optional
 	// +kubebuilder:validation:Pattern=`^cluster-[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
