@@ -54,6 +54,8 @@ func runSubcommand(name string, args []string) error {
 	switch name {
 	case "bootstrap":
 		return runBootstrap(args)
+	case "restrict-rbac":
+		return runRestrictRBAC(args)
 	case "remove":
 		return runRemove(args)
 	case "licenses":
@@ -76,11 +78,12 @@ func printUsage() {
 Usage:
   k2a-token-sync                 run the reconciliation loop (default)
   k2a-token-sync bootstrap ...   provision a standalone cluster for k2a-token-sync
+  k2a-token-sync restrict-rbac   restrict patch access to configured ArgoCD cluster Secrets
   k2a-token-sync remove ...      retire a cluster: delete its registration, credential and identities
   k2a-token-sync licenses        print third-party license notices
   k2a-token-sync version         print version information
 
-Run 'k2a-token-sync bootstrap --help' or 'k2a-token-sync remove --help' for their options.
+Run 'k2a-token-sync <command> --help' for command options.
 `)
 }
 

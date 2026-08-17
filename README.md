@@ -217,10 +217,98 @@ you get it wrong — it reports the missing CRD, names the remedy, and recovers 
 | `image.repository` | `ghcr.io/krisiasty/k2a-token-sync` | Image repository |
 | `image.tag` | **required** | Released version to deploy, e.g. `v0.11.0`. Rendering fails if unset |
 | `argocdNamespace` | `argocd` | Namespace of the ArgoCD instance served; all cluster Secrets go here |
+| `restrictedRBAC.enabled` | `false` | Make restricted Secret patch durable across Helm upgrades |
 | `health.port` | `8080` | Port for `/livez`, `/readyz`, `/status` and `/metrics` |
 
 There is nothing here about clusters, and that is the point: the inventory lives in the API, so adding one needs no
 release upgrade.
+
+#### Restricting patch access to configured cluster Secrets
+
+The default ArgoCD-namespace Role grants namespace-wide `create` and `patch` on Secrets. That is narrower than ordinary
+Secret administration, but `patch` is still a meaningful boundary: someone using a stolen controller token could patch
+any existing Secret whose name they know, and the successful response contains the resulting Secret. Application-level
+validation of `spec.secretName` does not constrain someone using that token directly.
+
+`restrict-rbac` moves that boundary into the Kubernetes authorizer. It resolves every `ClusterConnection` through the
+same defaulting and validation path as the controller, then creates a separate Role whose `patch` rule names only those
+resolved Secrets through `resourceNames`. It refuses the whole operation if any connection is invalid, if two objects
+claim one Secret or downstream endpoint, or if the live Roles and RoleBindings do not have the expected identities.
+It never reads or changes an ArgoCD Secret.
+
+Preview the exact clusters and Secret names first:
+
+```bash
+k2a-token-sync restrict-rbac --dry-run
+```
+
+Apply interactively, or use `--confirm` in controlled automation:
+
+```bash
+k2a-token-sync restrict-rbac
+k2a-token-sync restrict-rbac --confirm
+```
+
+The command uses the operator's kubeconfig and credentials, not the pod's ServiceAccount. By default it expects the
+standard release names (`k2a-token-sync`); installations using another Helm release name can set `--serviceaccount`,
+`--baseline-role`, `--baseline-rolebinding`, `--role`, and `--rolebinding`. `--kubeconfig`, `--context`, `--namespace`,
+and `--argocd-namespace` select the installation in the same way as the local half of `bootstrap`.
+
+Activation is ordered to avoid a reconciliation gap:
+
+1. `restrict-rbac` creates or updates the generated patch Role.
+2. It creates or updates the RoleBinding to the controller ServiceAccount.
+3. It changes the Helm baseline Role from `create,patch` to `create` only.
+4. It reads all three objects back and, when the caller may create `SubjectAccessReview` objects, verifies every allowed
+   name, one excluded name, and namespace-wide creation as the controller ServiceAccount.
+5. Set `restrictedRBAC.enabled=true` in the Helm release immediately, so a later Helm upgrade cannot restore broad
+   patch permission.
+
+The command hardens the live Role at step 3; the chart value makes that state durable. Do not enable the chart value on
+its own before installing the generated allowlist, because that would remove patch permission before its replacement
+exists.
+
+For GitOps, emit deterministic YAML instead of applying it:
+
+```bash
+k2a-token-sync restrict-rbac --print > k2a-token-sync-restricted-rbac.yaml
+```
+
+Commit that manifest together with `restrictedRBAC.enabled: true`. The generated Role and RoleBinding carry Argo CD
+sync waves `-2` and `-1`; the Helm baseline Role has the default wave, so the allowlist is installed before broad patch
+is removed in one sync. The empty-inventory manifest contains an explicit empty Role rule list, never a patch rule with
+empty or omitted `resourceNames`.
+
+Restricted mode deliberately turns inventory expansion into an administrative approval:
+
+- Adding a connection or changing `spec.secretName` fails closed until `restrict-rbac` is rerun.
+- Removing a connection leaves stale patch permission until the command is rerun; rerunning removes it.
+- Editing fields other than `secretName` needs no RBAC change.
+- An empty inventory removes all patch permission and is called out explicitly during confirmation.
+
+Namespace-wide `create` remains. Kubernetes authorizes a top-level create before the new object's name can be restricted
+through `resourceNames`, so putting `create` in the named patch rule would not constrain it. Keeping a separate create
+rule also preserves self-healing when a managed cluster Secret is deleted. The remaining risk is explicit: a compromised
+controller could create a previously nonexistent Secret, including an Argo CD-labelled one, but it cannot overwrite an
+existing excluded Secret.
+
+This mode refuses an installation where ArgoCD and k2a-token-sync share a namespace. The controller's same-namespace
+Role already needs broader Secret access for its dynamic credential Secrets, so narrowing the second Role would provide
+no useful isolation.
+
+To return deliberately to unrestricted mode, restore broad permission before deleting its replacement:
+
+```bash
+helm upgrade k2a-token-sync oci://ghcr.io/krisiasty/charts/k2a-token-sync \
+  --namespace k2a-token-sync \
+  --set image.tag=v0.14.0 \
+  --set restrictedRBAC.enabled=false
+kubectl -n argocd delete rolebinding k2a-token-sync-restricted
+kubectl -n argocd delete role k2a-token-sync-restricted
+```
+
+For GitOps, remove the generated objects only in the same change that sets `restrictedRBAC.enabled: false`; ensure the
+baseline Role is applied first if the reconciler does not preserve Argo CD's normal sync ordering.
 
 #### Upgrading
 
@@ -1092,15 +1180,21 @@ exposure is nil — the built-in `system:discovery` role already lets every auth
 schema through `/openapi` — so what `resourceNames` buys is not secrecy but the difference between reading one
 object and reading every CRD in the cluster.
 
-**In ArgoCD's namespace it holds `create` and `patch` on Secrets, and nothing else.** It cannot read — not the Secrets it
-writes, and not ArgoCD's own. It learns the result of its own writes from what an apply returns, and keeps everything
-else in each ClusterConnection's status.
+**In ArgoCD's namespace it holds `create` and `patch` on Secrets, and nothing else by default.** It cannot read — not the
+Secrets it writes, not ArgoCD's own. It learns the result of its own writes from what an apply returns, and keeps
+everything else in each ClusterConnection's status.
 
 Those two verbs are namespace-wide because they have to be: cluster names are not known when the Role is created, which
 is the whole point of an inventory that changes at runtime, and RBAC cannot scope `resourceNames` by prefix. Be
 clear-eyed about what that permits — `patch` on any Secret in that namespace means k2a-token-sync *could* overwrite ArgoCD's
 repository credentials. Two things bound it. `secretName` must begin with `cluster-`, so no connection can be aimed at
 them; and the absence of `delete` means nothing there can be removed.
+
+The optional [restricted RBAC mode](#restricting-patch-access-to-configured-cluster-secrets) replaces namespace-wide
+`patch` with an authorizer-enforced `resourceNames` allowlist derived from the current inventory. Namespace-wide
+`create` remains because Kubernetes cannot constrain create by object name and because deleted managed Secrets must
+remain self-healing. New and renamed targets therefore require an operator to regenerate the allowlist before they can
+be reconciled.
 
 The cost of that posture is stated under [Removing a cluster](#removing-a-cluster): with no `list`, k2a-token-sync cannot
 notice an orphaned Secret.

@@ -18,6 +18,14 @@ imagePullSecrets: []
 # One instance serves one ArgoCD; deploy a second release for a second.
 argocdNamespace: argocd
 
+# Keep the Helm-managed Role from restoring namespace-wide Secret patch after
+# the operator has installed the generated name-restricted Role and RoleBinding
+# with `k2a-token-sync restrict-rbac`. Enable this as part of that activation;
+# it deliberately leaves namespace-wide create so deleted managed Secrets remain
+# self-healing. This mode is refused when argocdNamespace is the release namespace.
+restrictedRBAC:
+  enabled: false
+
 health:
   port: 8080
 
