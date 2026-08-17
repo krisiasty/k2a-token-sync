@@ -226,6 +226,37 @@ jobs:
             fi
           done
 
+      - name: restricted RBAC remains restricted across renders
+        run: |
+          set -euo pipefail
+          unrestricted=$(helm template k2a-token-sync charts/k2a-token-sync \
+            --namespace k2a-token-sync --set "image.tag=${TAG}")
+          if ! grep -qF 'verbs: ["create", "patch"]' <<<"${unrestricted}"; then
+            echo "::error::the default chart no longer grants the existing create/patch policy"
+            exit 1
+          fi
+
+          for pass in first upgrade; do
+            restricted=$(helm template k2a-token-sync charts/k2a-token-sync \
+              --namespace k2a-token-sync --set "image.tag=${TAG}" \
+              --set restrictedRBAC.enabled=true)
+            if grep -qF 'verbs: ["create", "patch"]' <<<"${restricted}"; then
+              echo "::error::restricted render ${pass} restored namespace-wide patch"
+              exit 1
+            fi
+            if ! grep -qF 'verbs: ["create"]' <<<"${restricted}"; then
+              echo "::error::restricted render ${pass} lost namespace-wide create"
+              exit 1
+            fi
+          done
+
+          if helm template k2a-token-sync charts/k2a-token-sync \
+               --namespace argocd --set "image.tag=${TAG}" \
+               --set restrictedRBAC.enabled=true > /dev/null 2>&1; then
+            echo "::error::restricted mode rendered for a same-namespace deployment"
+            exit 1
+          fi
+
       - name: helm template
         run: |
           helm template k2a-token-sync charts/k2a-token-sync \
