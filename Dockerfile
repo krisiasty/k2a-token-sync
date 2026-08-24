@@ -10,6 +10,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o k2a-token-sy
 
 # distroless/static-nonroot includes CA certificates (needed for HTTPS to each
 # cluster's API server) and runs as uid 65532 (nonroot) by default.
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=builder /build/k2a-token-sync /k2a-token-sync
 ENTRYPOINT ["/k2a-token-sync"]
