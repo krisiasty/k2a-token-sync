@@ -266,7 +266,7 @@ func MintToken(ctx context.Context, client kubernetes.Interface, namespace, name
 	request := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
 			// ExpirationSeconds is a *int64 so the field can be left unset;
-			// Go 1.26's new(expr) covers that without a helper.
+			// The built-in new(expr) covers that without a helper.
 			ExpirationSeconds: new(int64(ttl.Seconds())),
 		},
 	}
