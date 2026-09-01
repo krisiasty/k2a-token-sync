@@ -35,3 +35,6 @@ go.work.sum
 dist/
 k2a-values.yaml
 /k2a-token-sync
+
+# graphify knowledge graph output
+graphify-out/
