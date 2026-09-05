@@ -9,7 +9,7 @@
 # twice a year should not get a vote on the versions k2a-token-sync is built with.
 set -euo pipefail
 
-CONTROLLER_GEN_VERSION=v0.19.0
+CONTROLLER_GEN_VERSION=v0.21.0
 
 cd "$(dirname "$0")/.."
 
