@@ -75,7 +75,7 @@ jobs:
       - name: setup helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: v4.2.3
+          version: v4.2.4
 
       # Charts are versioned independently of the application, so most releases
       # carry an unchanged chart. Pushing regardless would either overwrite a
@@ -191,11 +191,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.12.2
+          version: v2.13.2
           args: -v
 
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
       # Build Windows binary and verify command-line interfaces
       - name: build Windows binary
@@ -217,7 +217,7 @@ jobs:
       # Verify goreleaser produces Windows artifacts correctly
       - name: verify goreleaser Windows build
         run: |
-          go install github.com/goreleaser/goreleaser/v2@v2.17.1
+          go install github.com/goreleaser/goreleaser/v2@v2.18.0
           # `goreleaser build` only runs the build pipeline and never produces
           # archives — the zip/tar.gz output only comes out of `release`. Skip
           # docker: this runner has no Linux buildx backend to build the
