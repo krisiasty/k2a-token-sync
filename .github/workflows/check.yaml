@@ -84,7 +84,7 @@ jobs:
       # finds — the vulnerability database is fetched from vuln.go.dev at run time,
       # so only the analysis improves with a bump, never the data.
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
 
       - name: markdownlint
         uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24.2.0
