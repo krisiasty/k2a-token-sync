@@ -1,6 +1,6 @@
 module github.com/krisiasty/k2a-token-sync
 
-go 1.27.2
+go 1.27.4
 
 require (
 	github.com/prometheus/client_golang v1.25.0
